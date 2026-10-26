@@ -611,3 +611,143 @@ minus de HTTP-methoden tegen de gepubliceerde tarieven, gedeeld door de bytes) e
     today, confirmations with the two flags, the modes the daemons report), today's `engine_candidates` rows, and the
     last backup verification. The reports add "X-schaduw" (day and week) and "Waarom wel of geen observaties" (day).
 
+## Milestone 7 (26 oktober 2026)
+
+**Samenvatting voor Jim.** Mijlpaal 7 maakt van de X-bevestigingslaag een kostenbewuste planner die binnen jouw
+dagplafond van $10 tot $20 de meeste bevestigende informatie oplevert en niets uitgeeft wat geen informatie toevoegt.
+Geen regelbestand verandert: de vingerafdruk blijft `sha256:e3bf4320c45c` (dezelfde test bewaakt dat), `config/x.json`
+hoort niet bij de regelbestanden, dus het weekrapport blijft deze commit poolen met `150ca73cb354`. (1) **Sleutels en
+volgorde.** Bevestigingssleutels komen alleen nog van observaties: per `observe`-beslissing het mint-adres, de `$TICKER`
+(≥ 3 tekens, niet generiek) en de exacte naam van ≥ 2 woorden; van thema's alleen de 5 sterkste (`observe_meta`,
+gerangschikt op SOL-instroom en kopers; term ≥ 8 tekens, niet generiek). De volgorde is hard: jongste munt-observatie
+eerst, dan de oudere munten, dan de thema's; hoogstens 20 sleutels tegelijk (een jongere munt verdringt de laagste
+sleutel, reden `displaced`). Een sleutel verlaat de planning zodra hij beslist is, en de nieuwe tabel `x_keys` zegt
+waarom: `confirmed` (telling ≥ 10 in het laatste uur, daarna precies één zoekopdracht), `refuted` (drie opeenvolgende
+tellingen zonder groei van de 24-uurstelling: na 45 minuten en $0,02 bij een stille munt), `expired` (ouder dan 6 uur),
+`graduated`, `dead` (van de watchlist), `displaced`, `exhausted`. Elke sleutel wordt hoogstens één keer per 6 uur
+gepland. (2) **Adaptief schema.** Tellingen op 0, 15, 30, 45, 60, 75, 90, 105 en 120 minuten na de beslissing en
+daarna elk uur (180, 240, 300): hoogstens 12 tellingen en 1 zoekopdracht per sleutel; de zoekopdracht alleen bij een
+piek, hoogstens 10 posts, en de auteursopvraag (`GET /2/users`) voor hoogstens 3 auteurs (de meest gelezen posts
+eerst; auteurs van vandaag worden niet opnieuw betaald). Mega-watch elke 60 s in de piekuren (13:00 tot 02:00 UTC) en
+120 s daarbuiten, KOL-watch 180 s / 300 s; de verversing blijft 120 s. De droogloop rekent de volle belasting voor: 60
+sleutels per dag × (12 × $0,005 + 10 × $0,005 + 3 × $0,010) = 60 × $0,14 = **$8,40 per dag als plafond** voor de
+bevestigingslaag (een sleutel kan niet tegelijk al zijn tellingen én een zoekopdracht hebben: een bevestigde stopt met
+tellen, een weerlegde zoekt nooit, dus de echte dag blijft eronder; met de helft bevestigd na gemiddeld vier tellingen
+circa $4,80), plus $0,49 mega en $1,00 KOL = $9,89 = 66% van $15. De formule staat in `docs/UNVERIFIED.md`. In M6 kostte
+dezelfde laag circa $119 per dag (61 sleutels × 96 tellingen, een zoekopdracht met auteursuitbreiding bij 10% van de
+tellingen). (3) **Planner met plafond en reserve.** `XBudget` beoordeelt elke aanroep op twee bedragen: het plafondbedrag
+(wat hij hoogstens kan kosten) en het verwachte bedrag (het gemiddelde van vandaag). De harde regels (dagplafond,
+30%-reserve voor mega + KOL, KOL-plafond $1) toetsen het plafondbedrag, zodat het dagplafond nooit overschreden kan
+worden, en weigeren voor de rest van de dag (geboekt in het grootboek, zoals eerder). De uurenvelop toetst het verwachte
+bedrag en **stelt uit** in plaats van weigert: de aanroep blijft in het plan (de sleutel blijft due, `since_id` haalt de
+posts later op), het uitstel wordt geteld (kv) en eens per uur gelogd. Binnen een ronde gaat de zoekopdracht van een
+bevestigde sleutel voor (de meeste informatie per dollar), dan de tellingen (jongste munt eerst), dan de account-watches;
+een uitgestelde zoekopdracht houdt de goedkopere tellingen niet op. De standaardinstellingen zijn afgestemd op
+`X_DAILY_BUDGET_USD=15.00` (de deployer zet dat in `.env`); de code valt zonder die regel terug op $3,00, waaronder de
+volle belasting niet past, en de droogloop zegt dat. `fart social dryrun` en `fart status` tonen per soort het geplande
+en het werkelijke bedrag en het aandeel van het plafond. (4) **Kwaliteit per dollar, meetbaar in schaduw.** De sectie
+"X-schaduw" van dag- en weekrapport krijgt: de kosten per bevestigde observatie, het aandeel observaties dat binnen 1 uur
+na de beslissing bevestigd werd, de tellingen ná de eerste bevestiging (verspilling), de gestopte sleutels per reden met
+wat de weerlegde kostten, en de uitkomst (winnaar / geen winnaar / onbekend) van bevestigde tegenover niet-bevestigde en
+niet-getelde munt-observaties met dezelfde noemerregels als de trefkans. Het rapport geeft geen advies; dit zijn de
+cijfers waarop jij na de meetweek beslist of X live gaat. (5) **Werkelijke prijzen.** `fart social calibrate --day
+<dag> --console-usd <N>` zet het bedrag uit de X-developer-console naast de `x_spend`-rijen per soort en eenheid (post,
+telling, auteur; schema v7 bewaart de eenheid per rij), drukt de prijs per eenheid af die daarbij hoort (uniforme factor,
+of één component als alleen die fout is) en de `prices`-regels die een commit vereist; binnen 5% staan de prijzen vast.
+Zodra er echte aanroepen zijn (schaduwstand met sleutel) gebruikt de droogloop de waargenomen posts en auteurs per
+zoekopdracht, het bevestigde aandeel en de tellingen per sleutel (vanaf 5 gestopte sleutels en 3 zoekopdrachten) en
+meldt dat ("observed rates"). (6) **Uitrol**: `deploy/DEPLOY.md`, sectie "Upgrade to milestone 7": `X_DAILY_BUDGET_USD=15.00`,
+`X_MODE` leeg, schema v7, de droogloop als controle vóór de sleutel, de verwachte regels in `fart status`, de ijkstap met de
+console.
+
+99. **Branch and PR**: all work on the harness branch `claude/peaceful-fermi-9uh7nu`; the PR targets `main`.
+100. **Keys only from observations, in a hard order** (`fart/social/planner.py` → `candidates`): coin keys from the
+    latest `observe` decision per mint of the last `confirm.window_s` whose mint is on the active watchlist and has not
+    graduated, youngest first; the query is the milestone-2 one (mint, `$TICKER` of >= 3 characters that is not generic
+    and not a stopword, the exact name of >= 2 words). Theme keys only for the `max_meta_keys` (5) strongest
+    `observe_meta` decisions of the window (the decision's own `sol_inflow`, then `unique_buyers`, the engine's own
+    ranking order) whose term is >= `min_meta_term_len` (8) characters and not generic; the milestone-2 allowance for a
+    short bigram is gone. A theme that already had its episode still counts among the five, so a weaker theme is never
+    promoted in its place. Coins rank above every theme (`prio_class` 0 and 1), within a class by age or strength
+    (`prio_value`). `confirm.interval_s` and `max_keys_per_loop` are gone: the schedule is per key.
+101. **One episode per key per window** (`x_keys`, primary key (key, decision_id)): a candidate is admitted only when no
+    row of that key has a `decision_as_of` within the window before the candidate's decision, whatever its state; a later
+    decision of the same mint reuses the running episode and a stopped key is not re-opened by a decision inside the
+    window (a refuted coin that gets another observation half an hour later would otherwise be paid for twice). Once the
+    window has passed a new decision opens a new episode (a new row), so the report's accounting is per episode.
+102. **Admission and displacement** (`planner.sync`, one short write per round): first the keys the world decided are
+    stopped (window → `expired`, or `confirmed` when a confirmation was counted but the search never ran; graduation →
+    `graduated`; off the active watchlist → `dead`), then the candidates are admitted in order up to
+    `max_active_keys` (20). When the plan is full, a candidate that ranks above the lowest active key displaces it
+    (`displaced`; its counts stay in the tables) and a lower one waits. With ~60 keys a day and episodes of minutes to
+    hours the plan rarely fills; the rule only says who yields when it does: the youngest observation never waits.
+103. **Schedule and stop rules** (`planner.schedule_counts`, `next_due`, `record_count`): the first count as soon as a key
+    is admitted, then `fast_interval_s` (900) during `fast_phase_s` (7200) after the decision and `slow_interval_s` (3600)
+    after that, never beyond the window, at most `max_counts_per_key` (12): nine in the first two hours and three in the
+    four after. A key is `confirmed` when the last-hour count reaches `confirm.search_when_count_1h` (10); exactly one
+    search is then pending and no count follows. It is `refuted` after `refute_after_flat_counts` (3) consecutive counts
+    without growth of the 24 h count (`n_24h`: the last-hour count drops at every hour boundary because its buckets
+    roll, the 24 h count only grows for a coin younger than a day); the first count has no predecessor and never counts
+    as flat, so a silent coin costs four counts, 45 minutes, $0.02. A count whose body could not be parsed is paid and
+    counted but keeps the previous baseline. `exhausted` at the per-key maximum, `expired` when no further count fits in
+    the window. `confirmed_at`, `peak_n_1h`, `flat_streak`, `usd` and `usd_search` are kept on the row.
+104. **The confirmation search carries no author expansion** (`XClient._confirm_search`): `search/recent` with
+    `max_results` 10 and no `expansions`, then one `GET /2/users?ids=` for at most `search_max_authors` (3) distinct
+    authors (`pick_authors`: the most engaged posts first by likes + quotes + replies, newest on a tie, authors already
+    expanded today skipped), booked as kind `ca_authors` at `author_expansion_usd` per new user (the per-user price of
+    the pricing notes; whether the users endpoint bills the same is an UNVERIFIED item). The mega and KOL searches keep
+    `expansions=author_id`: their accounts are few and deduplicated per day. The search's money counts against its key
+    (`usd_search`); a lookup the planner defers is dropped for that key (the information lost is three follower
+    counts), the key still stops as `confirmed`.
+105. **Ceiling and expected cost** (`XBudget.admit`): every call carries the most it can cost at the configured prices
+    (search: every post and every account new, plus the author lookups for a confirmation search; count: one request;
+    refresh: free) and what it is expected to cost (the average actual cost of today's calls of the kind once there are
+    three, bounded by the ceiling; one new post plus one new author for the account watches before that, the ceiling for
+    the rest). The hard rules test the ceiling: the cap, the account-watch reserve (confirmation kinds together at most
+    70% of the cap) and the KOL sub-cap refuse for the rest of the UTC day, ledgered as blocked as before. The envelope
+    tests the expected cost and defers: `XVerdict.deferred` with `retry_at` the next hour, a kv counter
+    `x.planner.deferred.<kind>.<day>`, a log line once per hour per kind, nothing in `api_ledger`. The generic gate sees
+    the ceiling too (`cost=`), so the cap cannot be exceeded whatever a response contains; the milestone-2 "one call can
+    exceed the cap by max_results x prices" is gone. The check order is cap, reserve, KOL cap, envelope: a call that
+    cannot run today is not called deferred. A test admits random request streams at caps of $10 to $20 and proves the
+    spend never passes the cap, the reserve or the KOL cap, and that deferrals are counted while refusals are ledgered.
+106. **Admission order inside a round** (`XClient.confirm`, `planner.due_requests`): the pending search of every
+    confirmed key first (it completes a confirmation: the most information per dollar), then the due counts in plan
+    order, then (in `tick`) the account watches. A deferred count ends the round (the counts behind it cost the same and
+    stay due); a deferred search does not hold the counts behind it. The account watches run every 60 s (mega) / 180 s
+    (KOL) in the peak hours and 120 s / 300 s outside (`interval_peak_s` / `interval_off_s`; an old config with a single
+    `interval_s` keeps it); their money follows the new posts, not the requests, so the slower cadence saves requests
+    and latency budget, not dollars. The refresh stays at 120 s.
+107. **Ledger units** (`x_spend.unit`, schema v7): a row counts posts, requests or authors; a search books its posts and
+    its new authors in separate rows, so `fart social calibrate` can put the console's amount next to the units per price
+    component (post, request, author, refresh). Rows from before milestone 7 have no unit (`mixed`): they count in the
+    totals, not in the per-component hypotheses. `spend_by_kind()` returns the units apart next to the old `n` and `usd`.
+108. **The full-load formula** (`dryrun.full_load`): K keys a day × (C counts × p_count + P posts × p_post + A authors ×
+    p_author) with the defaults 60 × (12 × 0.005 + 10 × 0.005 + 3 × 0.010) = $8.40 for the confirmation layer, plus the
+    account watches (mega at its posts, KOL at its cap) = $9.89 against the cap. It is a ceiling that no real day reaches
+    (a confirmed key stops counting, a refuted key never searches); the expected load with the assumptions (half the
+    keys confirmed after four counts) is about $6.40. The dry run prints both, says whether they fit the cap and the
+    planner's target cap of $15.00, and notes when `.env` differs from the target. Observed rates replace the assumptions
+    from five stopped keys and three searches on (one refuted key is not a confirmed share of zero).
+109. **Calibration against the console** (`fart/social/calibrate.py`): one console amount cannot fix four prices, so the
+    command prints the uniform hypothesis (every price × console / booked) and one hypothesis per component (the price
+    that explains the whole gap if the other components are right), the units and calls per kind, and the config lines
+    of each; within 5% the prices are confirmed. The console's per-endpoint breakdown decides which hypothesis is true;
+    a unit that differs from ours (per request instead of per post) is a code change, not a price. It writes nothing.
+110. **Quality per dollar in the reports** (`report.x_quality_section`, `week.aggregate`): the day's spend on
+    `ca_counts` + `ca_search` + `ca_authors` per observation confirmed that day; the day's observations with a count,
+    those confirmed within one hour of the decision (the first confirming count at most 3600 s after `as_of`) and ever;
+    the counts after the first confirmation of the same observation (waste, valued at the day's average count cost: zero
+    by construction with the milestone-7 planner, the measure of the milestone-6 behaviour and of any regression); the
+    keys stopped per reason with what the refuted ones cost; and the 24 h outcome of the day's coin observations in
+    three groups (confirmed, counted but never confirmed, never counted) under the hit-rate rules of item 74 (unknown in
+    the denominator, pending apart; theme observations have no outcome of their own). The milestone-6 block keeps every
+    field. The report gives no advice: these are Jim's figures for the live decision after the week.
+111. **`fart status` lines added**: `x planner` (active keys by kind, searches pending, counts due, started today,
+    stopped today per reason with their cost, deferrals per kind today) and `x plan vs spend today` (per kind the planned
+    USD of the dry-run model, the actual USD, both as a share of the cap); `x spend today` keeps its line. The plan model
+    is read-only and a failure in it never fails the status (`x_plan_error`).
+112. **Defaults and `.env`**: `.env.example` says `X_DAILY_BUDGET_USD=15.00`; the code default stays 3.00 (a missing
+    line must not raise the spend), and the dry run and DEPLOY.md say that the full load does not fit $3.00. The planner's
+    constants live in `config/x.json` → `planner` and `dryrun`, not in a rule file, so the fingerprint test stays green
+    and a later tuning is a commit without a new segment in the week report.

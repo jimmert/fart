@@ -37,6 +37,15 @@ Milestone 6:
   graduation, have not elapsed. Nothing here is a real decision: `decisions` and `outcomes` are untouched.
 * "Waarom wel of geen observaties" (`fart/engine/explain.py`): the day's candidate maxima per threshold and the
   distribution per feature, the data availability of probation coins per hour next to the trade-stream gaps.
+
+Milestone 7 (`x_quality_section`, inside "X-schaduw"): what a confirmation costs and what it is worth: the day's spend
+on the confirmation kinds (`x_spend`: ca_counts, ca_search, ca_authors) per confirmed observation, the share of the
+day's observations with a count that were confirmed within one hour of the decision, the counts taken after the first
+confirmation of an observation (waste: the milestone-7 planner stops a confirmed key, so this measures the old
+behaviour and any regression), the keys the planner stopped per reason with what the refuted ones cost (`x_keys`),
+and the 24 h outcome of the day's coin observations split by confirmation (confirmed / counted but never confirmed /
+never counted) under the hit-rate denominator rules (unknown in the denominator, pending apart). The report gives no
+advice: these figures are what Jim decides on after the measurement week.
 """
 from __future__ import annotations
 
@@ -48,11 +57,12 @@ from typing import Any
 from .. import db
 from ..config import Settings
 from ..engine import explain as explain_mod
+from ..social import planner as xplanner
 from ..engine.meta import load_stopwords, tokenize
 from ..ingest import coverage as cov
 from ..ingest.sweep import enrich_backlog, enrich_daily_limit
 from ..log import get_logger
-from ..util import atomic_write_json, atomic_write_text, day_bounds, hour_key, now as wall_now, utc_iso
+from ..util import atomic_write_json, atomic_write_text, day_bounds, day_key, hour_key, now as wall_now, utc_iso
 from ..version import rules_version
 
 log = get_logger("report")
@@ -167,6 +177,85 @@ def shadow_decision_outcome(conn: sqlite3.Connection, as_of: float, mints: list[
     return {"status": status, "mints": per_mint}
 
 
+CONFIRM_SPEND_KINDS = ("ca_counts", "ca_search", "ca_authors")
+
+
+def _tally() -> dict[str, Any]:
+    return {"decisions": 0, "elapsed": 0, "winner": 0, "not_winner": 0, "unknown": 0, "pending": 0}
+
+
+def _rates(t: dict[str, Any]) -> dict[str, Any]:
+    t["rate"] = (t["winner"] / t["elapsed"]) if t["elapsed"] else None
+    t["rate_known"] = (t["winner"] / (t["winner"] + t["not_winner"])) if (t["winner"] + t["not_winner"]) else None
+    return t
+
+
+def x_quality_section(conn: sqlite3.Connection, start: float, end: float, now: float, h24: int, method_version: str) -> dict[str, Any]:
+    """Quality per dollar of the X confirmation layer for the decisions of the day (milestone 7, see the module docstring)."""
+    day = day_key(start)
+    spend = {str(r[0]): float(r[1]) for r in conn.execute(
+        "SELECT kind, COALESCE(SUM(usd), 0) FROM x_spend WHERE day=? AND kind IN ('ca_counts', 'ca_search', 'ca_authors') GROUP BY kind", (day,))}
+    spend_total = sum(spend.get(k, 0.0) for k in CONFIRM_SPEND_KINDS)
+    counts_taken = int(conn.execute("SELECT COUNT(*) FROM shadow_confirmations WHERE ts >= ? AND ts < ?", (start, end)).fetchone()[0])
+    avg_count_usd = (spend.get("ca_counts", 0.0) / counts_taken) if counts_taken else 0.0
+    confirmed_decisions = int(conn.execute(
+        "SELECT COUNT(DISTINCT COALESCE(decision_id, key)) FROM shadow_confirmations WHERE ts >= ? AND ts < ? AND confirmed_1h=1", (start, end)).fetchone()[0])
+    decs = conn.execute(
+        "SELECT id, kind, mint, as_of FROM decisions WHERE kind IN ('observe', 'observe_meta') AND verdict='observe' AND as_of >= ? AND as_of < ? ORDER BY as_of, id",
+        (start, end)).fetchall()
+    counted = confirmed_any = within_1h = waste = 0
+    groups = {"confirmed": _tally(), "unconfirmed": _tally(), "not_counted": _tally()}
+    for d in decs:
+        rows = conn.execute("SELECT ts, confirmed_1h FROM shadow_confirmations WHERE decision_id=? ORDER BY ts", (int(d["id"]),)).fetchall()
+        first_conf = next((float(r["ts"]) for r in rows if r["confirmed_1h"]), None)
+        if rows:
+            counted += 1
+        if first_conf is not None:
+            confirmed_any += 1
+            if first_conf <= float(d["as_of"]) + 3600.0:
+                within_1h += 1
+            waste += sum(1 for r in rows if float(r["ts"]) > first_conf)
+        if d["kind"] != "observe" or not d["mint"]:
+            continue  # a theme observation has no outcome of its own
+        g = groups["confirmed" if first_conf is not None else ("unconfirmed" if rows else "not_counted")]
+        g["decisions"] += 1
+        o = _latest_outcome(conn, "decision", d["mint"], h24, method_version, decision_id=int(d["id"]))
+        if o is None:
+            if float(d["as_of"]) + h24 > now:
+                g["pending"] += 1
+            else:
+                g["elapsed"] += 1
+                g["unknown"] += 1
+            continue
+        g["elapsed"] += 1
+        hit = _tri(o["hit_100k"])
+        g["winner" if hit is True else ("not_winner" if hit is False else "unknown")] += 1
+    for g in groups.values():
+        _rates(g)
+    stopped = xplanner.stopped_between(conn, start, end)
+    refuted = stopped.get("refuted") or {"n": 0, "usd": 0.0, "counts": 0, "searches": 0}
+    return {
+        "spend_usd": {**{k: spend.get(k, 0.0) for k in CONFIRM_SPEND_KINDS}, "total": spend_total},
+        "counts_taken": counts_taken,
+        "confirmed_observations": confirmed_decisions,
+        "usd_per_confirmed": (spend_total / confirmed_decisions) if confirmed_decisions else None,
+        "observations": len(decs),
+        "observations_counted": counted,
+        "confirmed_any": confirmed_any,
+        "confirmed_within_1h": within_1h,
+        "confirmed_within_1h_share": (within_1h / counted) if counted else None,
+        "counts_after_first_confirmation": waste,
+        "waste_usd": waste * avg_count_usd,
+        "keys_stopped": stopped,
+        "refuted": {"n": int(refuted["n"]), "usd": float(refuted["usd"])},
+        "outcomes_by_confirmation": groups,
+        "definition": ("kosten per bevestiging = de uitgaven van de dag aan tellingen, zoekopdrachten en auteursopvragingen gedeeld door de observaties die "
+                       "die dag een telling ≥ drempel kregen; binnen 1 u = de eerste bevestigende telling hoogstens een uur na de beslissing; verspilling = "
+                       "tellingen na de eerste bevestiging van dezelfde observatie; uitkomst per groep met dezelfde noemerregels als de trefkans "
+                       "(onbekend in de noemer, nog bezig apart); thema-observaties hebben geen eigen uitkomst"),
+    }
+
+
 def x_shadow_section(conn: sqlite3.Connection, start: float, end: float, now: float, h24: int, method_version: str, max_gap_s: float,
                      x_mode: str) -> dict[str, Any]:
     """The 'X-schaduw' block of the daily report (milestone 6). Reads only the shadow tables and the universe."""
@@ -200,9 +289,11 @@ def x_shadow_section(conn: sqlite3.Connection, start: float, end: float, now: fl
     obs = conn.execute(
         "SELECT COUNT(*) FROM decisions WHERE kind IN ('observe', 'observe_meta') AND verdict='observe' AND as_of >= ? AND as_of < ?", (start, end)).fetchone()[0]
     active = bool(decs) or int(conf["n"]) > 0
+    quality = x_quality_section(conn, start, end, now, h24, method_version)
     return {
         "x_mode_now": x_mode,
-        "active": active,
+        "active": active or bool(quality["keys_stopped"]),
+        "quality": quality,
         "decisions": {"total": len(decs), "by_would_kind": dict(sorted(by_kind.items()))},
         "confirmations": {"counts_taken": int(conf["n"]), "keys": int(conf["keys"]), "decisions_with_counts": int(conf["decisions"]),
                           "confirmed_1h": int(conf["c1h"]), "confirmed_24h": int(conf["c24h"]),
@@ -748,9 +839,41 @@ def x_shadow_markdown(xs: dict[str, Any]) -> list[str]:
         f"- Uitkomst schaduwbeslissingen: verstreken {o['elapsed']} (winnaar {o['winner']}, geen winnaar {o['not_winner']}, onbekend {o['unknown']}), "
         f"nog bezig {o['pending']}; trefkans {_pct(o['rate'])}, over bekende uitkomsten {_pct(o['rate_known'])}",
         f"- Definitie: {xs['definition']}.",
-        "",
     ]
+    q = xs.get("quality")
+    if q:
+        lines += x_quality_markdown(q)
+    lines.append("")
     return lines
+
+
+def _usd(x: Any) -> str:
+    return "onbekend" if x is None else f"${float(x):.2f}"
+
+
+def _group_line(label: str, g: dict[str, Any]) -> str:
+    return (f"{label}: {g['decisions']} observaties, verstreken {g['elapsed']} (winnaar {g['winner']}, geen winnaar {g['not_winner']}, onbekend {g['unknown']}), "
+            f"nog bezig {g['pending']}, trefkans {_pct(g.get('rate'))} (over bekende uitkomsten {_pct(g.get('rate_known'))})")
+
+
+def x_quality_markdown(q: dict[str, Any]) -> list[str]:
+    """The quality-per-dollar lines of the 'X-schaduw' section (milestone 7)."""
+    sp = q["spend_usd"]
+    st = q.get("keys_stopped") or {}
+    ob = q["outcomes_by_confirmation"]
+    stopped = ", ".join(f"{k} {v['n']}" + (f" (kosten {_usd(v['usd'])})" if k == "refuted" else "") for k, v in sorted(st.items())) or "geen"
+    return [
+        f"- Kosten van de X-bevestiging op deze dag: {_usd(sp['total'])} (tellingen {_usd(sp['ca_counts'])}, zoekopdrachten {_usd(sp['ca_search'])}, "
+        f"auteursopvragingen {_usd(sp['ca_authors'])}); {q['counts_taken']} tellingen; per bevestigde observatie: "
+        + (f"**{_usd(q['usd_per_confirmed'])}** ({q['confirmed_observations']} bevestigd)" if q["usd_per_confirmed"] is not None else "geen bevestiging op deze dag"),
+        f"- Observaties van deze dag met een telling: {q['observations_counted']} van {q['observations']}; bevestigd binnen 1 u na de beslissing: "
+        f"**{q['confirmed_within_1h']}** ({_pct(q['confirmed_within_1h_share'])}); ooit bevestigd: {q['confirmed_any']}",
+        f"- Tellingen ná de eerste bevestiging van dezelfde observatie (verspilling): {q['counts_after_first_confirmation']} (≈ {_usd(q['waste_usd'])})",
+        f"- Sleutels van de planner gestopt op deze dag: {stopped}" + (f"; weerlegd kostte samen {_usd(q['refuted']['usd'])}" if q["refuted"]["n"] else ""),
+        f"- Uitkomst van de munt-observaties van deze dag naar bevestiging: {_group_line('bevestigd', ob['confirmed'])}; "
+        f"{_group_line('geteld maar niet bevestigd', ob['unconfirmed'])}; {_group_line('zonder telling', ob['not_counted'])}",
+        f"- Definitie kwaliteit per dollar: {q['definition']}. Geen advies: dit zijn de cijfers voor het besluit over X live na de meetweek.",
+    ]
 
 
 def run_report(settings: Settings, day: str) -> int:

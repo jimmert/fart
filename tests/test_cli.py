@@ -102,4 +102,4 @@ def test_env_example_names_every_setting_without_values():
     assert set(ENV_KEYS) <= set(names), set(ENV_KEYS) - set(names)
     for k in ("RPC_HTTP_URL", "RPC_WSS_URL", "PUMPPORTAL_API_KEY", "X_BEARER_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_CHAT_ID"):
         assert names[k] == "", k  # secrets are named, never valued
-    assert names["TELEGRAM_NOTIFY_ENABLED"] == "0" and names["X_DAILY_BUDGET_USD"] == "3.00"
+    assert names["TELEGRAM_NOTIFY_ENABLED"] == "0" and names["X_DAILY_BUDGET_USD"] == "15.00"  # milestone 7: the planner's tuned cap

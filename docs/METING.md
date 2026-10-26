@@ -180,3 +180,46 @@ kandidaten er op hun beste moment aan voldeden, de verdeling (p50, p90, max) per
 aandeel probation-munten dat überhaupt een trade in onze data had (per uur, naast de gaten van de trade-stroom
 in dat uur en de pauzes van de uurenvelop), en hetzelfde voor thema's (`burst_ratio`, `sol_inflow`,
 `unique_buyers`). Het is een verdeling, geen advies: de drempels blijven wat ze zijn.
+
+## Mijlpaal 7: kwaliteit per dollar van de X-bevestiging
+
+**Wat gemeten wordt.** Sinds mijlpaal 7 plant de X-laag haar bevestigingen (`fart/social/planner.py`, tabel
+`x_keys`): een sleutel (mint-adres, `$TICKER`, exacte naam van een munt-observatie, of de term van een van de vijf
+sterkste thema-observaties) wordt geteld om de 15 minuten in de eerste twee uur na de beslissing en daarna elk uur,
+hoogstens twaalf keer, en stopt zodra hij **beslist** is: **bevestigd** (telling in het laatste uur ≥
+`search_when_count_1h`, 10; daarna precies één zoekopdracht van hoogstens 10 posts en een opvraag van hoogstens 3
+auteurs), **weerlegd** (drie opeenvolgende tellingen zonder groei van de 24-uurstelling), **verlopen** (ouder dan 6
+uur), **gegradueerd**, **dood** (van de watchlist), **verdrongen** (door een jongere observatie toen de 20 plekken vol
+waren) of **uitgeput** (twaalf tellingen zonder besluit). Elke uitgave staat op de sleutel die haar veroorzaakte
+(`x_keys.usd`), en elke sleutel staat bij de observatie die hem opleverde (`decision_id`). Zo is elke dollar
+herleidbaar tot een observatie die erdoor bevestigd of weerlegd kon worden.
+
+**Definities in de sectie "X-schaduw" (dag- en weekrapport).**
+
+* **Kosten per bevestigde observatie** = de uitgaven van de UTC-dag aan de bevestigingssoorten (`ca_counts`,
+  `ca_search`, `ca_authors` in `x_spend`) gedeeld door het aantal observaties dat die dag een bevestigende telling
+  kreeg (`shadow_confirmations.confirmed_1h`, één keer per observatie). Zonder bevestiging die dag: "geen
+  bevestiging", nooit nul.
+* **Aandeel binnen 1 uur bevestigd** = de observaties van de dag waarvan de eerste bevestigende telling hoogstens 3600
+  s na de beslissing viel, gedeeld door de observaties van de dag die minstens één telling kregen. Een observatie zonder
+  telling (geen plek in de planning, of een sleutel die niet geldig was) telt niet in de noemer en staat apart.
+* **Verspilling** = tellingen ná de eerste bevestigende telling van dezelfde observatie, gewaardeerd tegen de gemiddelde
+  tellingsprijs van de dag. De planner van mijlpaal 7 stopt een bevestigde sleutel, dus dit cijfer is nul van
+  constructie; het meet de werking van mijlpaal 6 en elke latere terugval.
+* **Gestopte sleutels per reden** met wat de weerlegde kostten: uit `x_keys` op de dag van stoppen.
+* **Uitkomst naar bevestiging**: de munt-observaties (`observe`) van de dag in drie groepen (bevestigd; geteld maar
+  nooit bevestigd; zonder telling) met hun 24-uursuitkomst volgens dezelfde noemerregels als de trefkans (mijlpaal 5):
+  raak = winnaar binnen 24 uur, de noemer = observaties waarvan de 24 uur verstreken zijn, onbekend telt mee in de
+  noemer, nog bezig staat apart. Thema-observaties hebben geen eigen uitkomst en tellen alleen in de bevestigingscijfers.
+  Het weekrapport sommeert de dagen en toont per dag een tabel.
+
+**Wat het rapport niet doet.** Het geeft geen advies over X live. Het verschil in trefkans tussen bevestigde en
+niet-bevestigde observaties, de kosten per bevestiging en het aandeel binnen een uur zijn de cijfers waarop Jim na de
+meetweek beslist; de go/no-go-toets van de community-alerts gebruikt ze niet. De regels zelf veranderen niet
+(`config/x.json` is geen regelbestand; de vingerafdruk blijft `sha256:e3bf4320c45c`).
+
+**Kosten vooraf.** De droogloop (`fart social dryrun`) toont de volle belasting als plafond: 60 sleutels per dag ×
+(12 tellingen × $0,005 + 10 posts × $0,005 + 3 auteurs × $0,010) = $8,40 per dag voor de bevestigingslaag, plus de
+account-watches ($0,49 mega, $1,00 KOL) = $9,89 = 66% van `X_DAILY_BUDGET_USD` 15,00. Een sleutel kan niet tegelijk al
+zijn tellingen en een zoekopdracht hebben, dus de echte dag blijft eronder; de prijzen zijn nog niet geverifieerd
+(`docs/UNVERIFIED.md`, `fart social calibrate`).

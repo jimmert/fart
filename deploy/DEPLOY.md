@@ -23,7 +23,7 @@ systemd units (all in `deploy/`, installed to `/etc/systemd/system/`):
 | `fart.slice` | MemoryMax=1G, CPUQuota=100% for everything below | - |
 | `fart-ingest.service` | PumpPortal (creates + migrations) + RPC streams (creates, migrations, per-mint trades before graduation), signature sweep, coverage, retention, Global check | daemon, Restart=always |
 | `fart-engine.service` | candidate engine v0, observations only | daemon, 15 s loop |
-| `fart-social.service` | X mega-account / KOL watch, CA/ticker confirmation counts (milestone 2; idle without `X_BEARER_TOKEN`; since milestone 6 in **shadow mode** by default: nothing of it reaches the decisions, `X_MODE`) | daemon, 15 s loop |
+| `fart-social.service` | X mega-account / KOL watch (60 s / 180 s in the peak hours, 120 s / 300 s outside), the confirmation planner (milestone 7: keys from observations, counts every 15 min then hourly, one search per confirmed key, within `X_DAILY_BUDGET_USD`; idle without `X_BEARER_TOKEN`; since milestone 6 in **shadow mode** by default: nothing of it reaches the decisions, `X_MODE`) | daemon, 15 s loop |
 | `fart-notify.service` | Telegram outbox to the owner chat (milestone 2; idle unless `TELEGRAM_NOTIFY_ENABLED=1`) | daemon, 20 s loop |
 | `fart-measure-track.timer` | price samples + due outcomes + paper trades | every 5 min |
 | `fart-measure-report.timer` | daily recall report for the previous UTC day | 06:00 UTC |
@@ -72,7 +72,7 @@ RPC_DAILY_BUDGET_CU=3000000
 PUMPPORTAL_WSS_URL=wss://pumpportal.fun/api/data
 PUMPPORTAL_API_KEY=                 # optional: funded PumpPortal key -> trade subscriptions via PumpPortal
 X_BEARER_TOKEN=                     # optional: X API v2 bearer token -> fart-social active (in shadow mode, see X_MODE)
-X_DAILY_BUDGET_USD=3.00             # hard daily cap for all X calls together
+X_DAILY_BUDGET_USD=15.00            # hard daily cap for all X calls together; milestone 7: the planner is tuned to 15.00 (Jim's $10 to $20) and never exceeds it
 X_MODE=                             # milestone 6: off | shadow | live; empty = off without a token, shadow with one; live needs the x_live rules key
 TELEGRAM_BOT_TOKEN=                 # optional: bot token from @BotFather
 TELEGRAM_OWNER_CHAT_ID=             # the owner's chat id (fart-notify sends nowhere else)
@@ -533,6 +533,124 @@ Step by step:
    ones); `fart-backup.service` on M5 code does not run the verify step. The pre-upgrade `.db` from step 1 is the
    clean way back if you want the tables gone.
 
+## 5f. Upgrade to milestone 7 (M7)
+
+M7 turns the X confirmation layer into a cost-aware planner that gets the most confirming information out of a daily cap
+of $10 to $20 and spends nothing that adds no information. No engine rule changes: the fingerprint of the rule-defining
+files stays `sha256:e3bf4320c45c` (the same test pins it; `config/x.json` is not a rule file), so the week report keeps
+pooling the new commit with `150ca73cb354`. What changes on the server:
+
+* **Keys and order**: confirmation keys come only from observations (per `observe` decision the mint, a non-generic
+  `$TICKER` of >= 3 characters, the exact multi-word name; of the themes only the 5 strongest `observe_meta` terms of
+  >= 8 characters), youngest coin observation first, themes last, at most 20 keys at once. A key stops as soon as it is
+  decided and `x_keys` (schema v7) says why: `confirmed` (last-hour count >= 10, then exactly one search), `refuted`
+  (three consecutive counts without growth: a silent coin costs 4 counts, 45 minutes, $0.02), `expired` (6 h),
+  `graduated`, `dead`, `displaced`, `exhausted`.
+* **Schedule**: counts at 0, 15, 30, ..., 120 minutes after the decision and hourly after that (at most 12), one search
+  of at most 10 posts with a user lookup of at most 3 authors (`GET /2/users`, kind `ca_authors`); mega watch 60 s in the
+  peak hours (13:00 to 02:00 UTC) and 120 s outside, KOL watch 180 s / 300 s, refresh unchanged. Full load: 60 keys a day
+  x (12 x $0.005 + 10 x $0.005 + 3 x $0.010) = **$8.40 a day** as the ceiling of the confirmation layer, $9.89 with the
+  account watches = 66% of a $15.00 cap (docs/UNVERIFIED.md has the formula; M6 would have cost about $119 a day).
+* **Planner**: the hard rules (the cap, the 30% reserve for mega + KOL, the $1 KOL sub-cap) are checked against the
+  ceiling cost of every call, so the cap can never be exceeded; the hourly envelope now **defers** a call to the next hour
+  instead of refusing it (counted in kv, logged once per hour, never a blocked row). Inside a round the search of a
+  confirmed key goes first, then the counts (youngest coin first), then the account watches.
+* **Reports**: the "X-schaduw" section of the daily and the week report gains the quality-per-dollar lines (cost per
+  confirmed observation, share confirmed within 1 h, counts after the first confirmation, keys stopped per reason with
+  the cost of the refuted ones, the 24 h outcome of confirmed versus unconfirmed coin observations under the hit-rate
+  rules). No advice: Jim decides on these figures after the week.
+* **New command**: `fart social calibrate --day D --console-usd N` (read-only). `fart social dryrun` prints the full-load
+  formula and the planned versus actual USD per kind; `fart status` gains `x planner` and `x plan vs spend today`.
+* **Schema v7**: the table `x_keys` and the column `x_spend.unit`; no cleanup, idempotent.
+
+Step by step:
+
+1. **Back up first** (the migration only adds a table and a column, but the habit stays):
+   ```bash
+   sudo systemctl start fart-backup.service; systemctl show -p Result fart-backup.service   # Result=success
+   ls -la /opt/fart/data/backup/
+   ```
+2. **Pull and install:**
+   ```bash
+   cd /opt/fart-src && git pull --ff-only && sudo deploy/install.sh
+   ```
+   The installer opens the database once as the `fart` user (schema migration 6 → 7; it prints `user_version 7`),
+   installs the units (unchanged) and restarts the daemons. `config/x.json` changes shape: `mega.interval_peak_s` /
+   `interval_off_s` and `kol.interval_peak_s` / `interval_off_s` replace the single intervals, `confirm` loses
+   `interval_s` and `max_keys_per_loop`, the new blocks `planner` and `dryrun` carry the planner's constants and the dry
+   run's assumptions. It is not a rule file. Rows in `x_spend` written before M7 keep working (no unit: `mixed`).
+3. **`.env`**: set the daily cap the planner is tuned to and leave the mode empty (the installer never edits the file):
+   ```
+   X_DAILY_BUDGET_USD=15.00
+   X_MODE=
+   ```
+   15.00 is inside Jim's $10 to $20; the planner never exceeds the cap and the full load is 66% of it. Any value between
+   10.00 and 20.00 works the same way (Jim adjusts it with his helper); below about 10.00 the dry run says the full load
+   does not fit, and without the line the code falls back to the milestone-2 default of 3.00, under which only a few keys
+   a day fit. `X_MODE` stays empty: `off` without a token, `shadow` as soon as `X_BEARER_TOKEN` is set (milestone 6:
+   nothing reaches the decisions during the week; `live` needs the `x_live` rules key, after the week). Then
+   `sudo systemctl restart fart-social fart-engine`.
+4. **Check the plan against the cap before the key goes in** (no HTTP, nothing written):
+   ```bash
+   sudo -u fart /opt/fart/bin/fart social dryrun
+   ```
+   Expected: `cap $15.00/day`; a `planner:` line with the count schedule `0, 15, 30, 45, 60, 75, 90, 105, 120, 180, 240,
+   300 min after the decision (max 12)`; the kinds table with `mega_search 60/120 s 1110` requests a day, `kol_search
+   180/300 s 392`, `ca_counts 900/3600 s`, `ca_search`, `ca_authors`; the `total` line ending in `fits the cap of
+   $15.00`; the `full load:` line `60 keys/day x (12 counts + 1 search of 10 posts and 3 authors) = $8.40/day for the
+   confirmation layer [60 x (12 x $0.005 + 10 x $0.005 + 3 x $0.010) = 60 x $0.140 = $8.40]` followed by
+   `+ account watches $1.49 ... = $9.89/day = 66% of the cap $15.00 -> fits; against the planner's target cap $15.00:
+   fits`; the hour table with `deferred` only in the morning hours (if at all) and `refused` empty; `observed rates:
+   none (assumptions used)` until the daemon ran with a token. A note `De planner is afgestemd op X_DAILY_BUDGET_USD
+   15.00; .env zegt ...` means step 3 was skipped.
+5. **Verify after 15 minutes:**
+   ```bash
+   sudo -u fart /opt/fart/bin/fart status
+   #   schema_version: 7
+   #   x: bearer token not configured, mode off (X_MODE unset; ...), daily budget $15.00
+   #   x planner: active keys 0, search pending 0, due now 0; started today 0; stopped today: none; deferred today: none
+   #     -> with the token set: active keys N (mint a, meta b) with a <= 20, stopped today: confirmed n ($..), refuted n ($..), expired ...;
+   #        deferred today: ca_counts N only in the morning hours; `blocked` must not grow in the x budget row
+   #   x plan vs spend today (planned/actual USD, % of the $15.00 cap): mega_search $0.49/$0.00 (3%/0%), refresh $0.00/$0.00 (0%/0%),
+   #     kol_search $1.13/$0.00 (8%/0%), ca_counts $.../$0.00 (..%/0%), ca_search $.../$0.00, ca_authors $.../$0.00
+   #     -> planned = the dry-run model for a day with the current keys and rates; actual = x_spend; both as a share of the cap
+   #   x spend today: (empty until the token runs) -> then per kind with the units: ca_counts $0.030 (6) ...
+   #   x shadow: decisions total=0 today=0; confirmations today=0 (...); daemons report social=off engine=off
+   #   failures: none; rules fingerprints (engine): <new commit>=sha256:e3bf4320c45c
+   journalctl -u fart-social -n 5 --no-pager                                       # social.started x_mode=off (or shadow with a token)
+   journalctl -u fart-engine --since -15min --no-pager | grep -c tick_failed      # 0
+   ```
+6. **When the token goes in** (Jim's rule: after a day of watching without X; `X_BEARER_TOKEN` in `.env`, `X_MODE` empty,
+   `sudo systemctl restart fart-social`): the watch runs in shadow, the planner admits the current observations as keys
+   (`x planner: active keys ...` in `fart status`, `x.key_confirmed` / `x.key_stopped` lines in `journalctl -u
+   fart-social`), and `x spend today` shows per kind what it costs. After the first full UTC day:
+   ```bash
+   sudo -u fart /opt/fart/bin/fart social dryrun          # "observed rates: ... stopped keys: ..% confirmed, ... counts/key" from 5 stopped keys on
+   sudo -u fart sqlite3 /opt/fart/data/fart.db "select stop_reason, count(*), round(avg(counts_n),1), round(sum(usd),2) from x_keys where stopped_at is not null group by 1"
+   ```
+   Expected: a day's spend well under the $8.40 ceiling of the confirmation layer; refuted keys with small `counts_n`
+   (4 to 6), confirmed keys with `searches_n` 1 and `counts_n` small; no `hourly_envelope` rows in `api_ledger`
+   (`select blocked_reason, count(*) from api_ledger where source='x' and blocked_reason is not null group by 1` shows
+   at most `kol_daily_cap` in the evening).
+7. **Calibrate the prices with the X developer console** (docs/UNVERIFIED.md, "X (Twitter) API v2", has the full
+   procedure): read the console's amount for one whole UTC day with the token and run
+   ```bash
+   sudo -u fart /opt/fart/bin/fart social calibrate --day 2026-10-28 --console-usd <N>
+   ```
+   It prints our `x_spend` rows per kind and unit next to the console's amount, the gap, the uniform factor and per
+   component the price that would explain the gap, each with the `config/x.json` → `prices` line it implies; `verdict:
+   confirmed` within 5% (write the console figures into docs/UNVERIFIED.md and tick the item), `verdict: adjust`
+   otherwise (a commit of `config/x.json`, not a rule file: the fingerprint stays; which lines, the console's
+   per-endpoint breakdown decides). It writes nothing.
+8. **The daily report** of the first shadow day carries the new "Kwaliteit per dollar" lines in its "X-schaduw" section
+   (cost per confirmed observation, share confirmed within 1 h, waste, stopped keys per reason, outcomes by confirmation);
+   the week report has the same as totals and a table per day. Neither gives advice; the go/no-go test does not use them.
+9. **Rollback** to M6 code after the migration: M6 ignores `x_keys` and `x_spend.unit`, but it reads `confirm.interval_s`
+   and `mega.interval_s` from `config/x.json`, which the M7 checkout no longer has: roll back the whole checkout
+   (`git checkout <M6 commit> && sudo deploy/install.sh`), never only the code. The pre-upgrade `.db` from step 1 is the
+   clean way back if you want the table gone. Put `X_DAILY_BUDGET_USD` back to 3.00 when rolling back: the M6 layer
+   spends up to the cap.
+
 ## 6. First-day checklist (docs/UNVERIFIED.md)
 
 1. `fart chain global`: reserves, supply, `fee_basis_points` 95 and `creator_fee_basis_points` 5 must
@@ -551,8 +669,10 @@ Step by step:
    Alchemy", step by step in section 5c).
 5. Watch `coverage --hours 24` for a day: `grads_without_create` should be close to zero.
 6. X: compare the prices in `config/x.json` with the developer console (docs/UNVERIFIED.md says how);
-   `fart social dryrun` shows what the watch would cost per day before the token goes in, `fart status` →
-   `x spend today` what it cost once it runs (in shadow mode, during the week).
+   `fart social dryrun` shows what the watch would cost per day before the token goes in (with the planner's full-load
+   ceiling against the cap), `fart status` → `x spend today` and `x plan vs spend today` what it costs once it runs (in
+   shadow mode, during the week), and `fart social calibrate --day D --console-usd N` which price fits the console's
+   amount (milestone 7).
 7. Telegram: `fart notify test`, then watch `fart notify outbox` for `sent` rows.
 8. Week report (M5): `fart measure week --end <yesterday> --days 1` after 06:30 UTC; compare its universe row with
    the daily report of the same day; the bootstrap says `te weinig data` until the window has 3 covered days and
@@ -656,6 +776,10 @@ old rows stay, new rows get the old version string again.
 | `fart-backup.service` `Result=exit-code` with `VERIFY FAILED` in the journal (M6) | the newest archive does not restore, or the live database has fewer rows than the archive in a table that only grows | `fart backup verify` by hand shows which; keep the older archives; a bad archive after a good backup line points at the disk, lost live rows at something that deleted (`decisions`/`outcomes` cannot be deleted: triggers) |
 | `x mode note: X_MODE=live refused` in `status` (M6) | `X_MODE=live` without `"x_live": true` in `config/engine.json` | expected during the measurement week: the watch runs in shadow; after the week the key is a commit (new fingerprint) |
 | `x shadow: ... daemons report social=shadow engine=off` (M6) | the two daemons read different `.env` states (one was not restarted) | `sudo systemctl restart fart-social fart-engine`; both must report the same mode |
+| `x planner: ... deferred today: ca_counts N` growing through the peak hours (M7) | the envelope paces more than the morning: the day's plan is bigger than the cap allows (many keys, or a cap under 10.00) | `fart social dryrun`: compare `total` and `full load` with the cap; raise `X_DAILY_BUDGET_USD` within 10.00 to 20.00, or lower `planner.max_active_keys` in a commit; a deferred count is done later, never lost until the key's window ends |
+| `budget x ... blocked N` growing with `daily_cost_cap` or `account_watch_reserve` rows in `api_ledger` (M7) | a hard rule refused calls: the cap or the 70% confirmation share is spent | not expected at 15.00 (the full load is 66% of it); check `x spend today` per kind and `select stop_reason, count(*) from x_keys ...`; a run of `exhausted` keys means the stop rules do not bite (docs/UNVERIFIED.md, "Milestone 7") |
+| `x planner: active keys 20` for hours and `stopped today: displaced N` (M7) | more observations than slots; the youngest keep displacing the oldest | expected only on a very busy day; `planner.max_active_keys` is a commit; the displaced keys' counts stay in `shadow_confirmations` |
+| `fart social calibrate` says `verdict: adjust` (M7) | the console's amount differs from our ledger by more than 5% | read the console's per-endpoint breakdown, change `config/x.json` → `prices` in a commit (not a rule file), write the figures into docs/UNVERIFIED.md; a unit mismatch (per request instead of per post) is a code change |
 | `ws_subscriptions.notifications` grows but `trades` with `source='rpc_trades'` stays 0 | TradeEvents do not arrive on the bonding-curve address | set `config/ingest.json` → `rpc_trades.mention` to `"mint"` and restart |
 | `decode.pump_amm_pool_mismatch` counting up | the pump-amm BuyEvent/SellEvent layout differs from `fart/chain/events.py` | inspect `raw_undecoded` / `fart events classify`; fix the layout (docs/PUMPFUN-EVENTS.md) |
 | `global.check_mismatch` at ingest start / `fart chain global` exit 1 | config/pumpfun.json differs from the chain | update the config (one commit = new `rules_version`); a mismatch never stops the daemons |
