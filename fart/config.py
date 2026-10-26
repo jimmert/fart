@@ -1,0 +1,137 @@
+"""Settings and paths. Loads $FART_ROOT/.env at runtime; values are never logged."""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+from .util import load_json
+from .version import REPO_ROOT
+
+PUBLIC_RPC_HTTP = "https://api.mainnet-beta.solana.com"
+PUBLIC_RPC_WSS = "wss://api.mainnet-beta.solana.com"
+DEFAULT_PUMPPORTAL_WSS = "wss://pumpportal.fun/api/data"
+
+ENV_KEYS = ("RPC_HTTP_URL", "RPC_WSS_URL", "RPC_DAILY_BUDGET_CU", "PUMPPORTAL_WSS_URL", "FART_ROOT")
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    """Minimal KEY=VALUE parser (no shell expansion). Missing file -> {}."""
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        if s.startswith("export "):
+            s = s[7:].strip()
+        k, v = s.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        out[k] = v
+    return out
+
+
+def redact_url(url: str | None) -> str:
+    """Host only; the path of an RPC URL usually carries the API key."""
+    if not url:
+        return "<none>"
+    try:
+        p = urlsplit(url)
+        return f"{p.scheme}://{p.hostname}"
+    except ValueError:
+        return "<unparseable>"
+
+
+@dataclass
+class Settings:
+    root: Path
+    rpc_http_url: str
+    rpc_wss_url: str
+    rpc_is_public: bool
+    rpc_daily_budget_cu: int
+    pumpportal_wss_url: str
+    configs: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def data_dir(self) -> Path:
+        return self.root / "data"
+
+    @property
+    def out_dir(self) -> Path:
+        return self.root / "out"
+
+    @property
+    def logs_dir(self) -> Path:
+        return self.root / "logs"
+
+    @property
+    def raw_dir(self) -> Path:
+        return self.data_dir / "raw"
+
+    @property
+    def archive_dir(self) -> Path:
+        return self.data_dir / "archive"
+
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / "fart.db"
+
+    @property
+    def lock_path(self) -> Path:
+        return self.data_dir / "budget.lock"
+
+    def config(self, name: str) -> Any:
+        return self.configs[name]
+
+    def ensure_dirs(self) -> None:
+        for d in (self.data_dir, self.out_dir, self.logs_dir, self.raw_dir, self.archive_dir):
+            d.mkdir(parents=True, exist_ok=True)
+
+    def describe(self) -> dict[str, Any]:
+        """Safe to log/print: no secret values."""
+        return {
+            "root": str(self.root),
+            "rpc_http": redact_url(self.rpc_http_url),
+            "rpc_wss": redact_url(self.rpc_wss_url),
+            "rpc_is_public": self.rpc_is_public,
+            "rpc_daily_budget_cu": self.rpc_daily_budget_cu,
+            "pumpportal": redact_url(self.pumpportal_wss_url),
+        }
+
+
+CONFIG_DIR = REPO_ROOT / "config"
+CONFIG_FILES = ("pumpfun", "budget", "engine", "measure", "stopwords", "ingest")
+
+
+def load_configs(config_dir: Path = CONFIG_DIR) -> dict[str, Any]:
+    return {name: load_json(config_dir / f"{name}.json") for name in CONFIG_FILES}
+
+
+def load_settings(root: str | os.PathLike | None = None, env: dict[str, str] | None = None) -> Settings:
+    """Resolve root -> read $root/.env -> overlay process env (process env wins)."""
+    penv = dict(os.environ if env is None else env)
+    root_s = root or penv.get("FART_ROOT") or str(REPO_ROOT)
+    root_p = Path(root_s).expanduser().resolve()
+    fenv = parse_env_file(root_p / ".env")
+    merged = {**fenv, **{k: v for k, v in penv.items() if k in ENV_KEYS and v}}
+    http = merged.get("RPC_HTTP_URL", "").strip()
+    wss = merged.get("RPC_WSS_URL", "").strip()
+    is_public = not http
+    try:
+        cu = int(merged.get("RPC_DAILY_BUDGET_CU", "") or 3_000_000)
+    except ValueError:
+        cu = 3_000_000
+    return Settings(
+        root=root_p,
+        rpc_http_url=http or PUBLIC_RPC_HTTP,
+        rpc_wss_url=wss or PUBLIC_RPC_WSS,
+        rpc_is_public=is_public,
+        rpc_daily_budget_cu=cu,
+        pumpportal_wss_url=merged.get("PUMPPORTAL_WSS_URL", "").strip() or DEFAULT_PUMPPORTAL_WSS,
+        configs=load_configs(),
+    )

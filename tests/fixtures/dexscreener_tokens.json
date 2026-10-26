@@ -1,0 +1,16 @@
+{
+ "_note": "SYNTHETIC DexScreener /tokens/v1/solana response shape (unverified). Two pairs for MINTA (pick deepest), one WSOL/USDC pair, nothing for MINTC.",
+ "pairs": [
+  {"chainId": "solana", "dexId": "pumpswap", "pairAddress": "PAIRA1", "baseToken": {"address": "MINTA", "symbol": "A"}, "quoteToken": {"address": "So11111111111111111111111111111111111111112", "symbol": "SOL"},
+   "priceUsd": "0.00015", "txns": {"h24": {"buys": 1200, "sells": 900}}, "volume": {"h24": 250000.5, "h6": 90000, "h1": 20000, "m5": 1000},
+   "liquidity": {"usd": 45000}, "fdv": 150000, "marketCap": 150000, "pairCreatedAt": 1761480090000},
+  {"chainId": "solana", "dexId": "raydium", "pairAddress": "PAIRA2", "baseToken": {"address": "MINTA", "symbol": "A"}, "quoteToken": {"address": "USDC", "symbol": "USDC"},
+   "priceUsd": "0.00014", "volume": {"h24": 1000}, "liquidity": {"usd": 500}, "fdv": 140000, "marketCap": 140000},
+  {"chainId": "solana", "dexId": "pumpswap", "pairAddress": "PAIRB", "baseToken": {"address": "MINTB", "symbol": "B"}, "quoteToken": {"address": "So11111111111111111111111111111111111111112", "symbol": "SOL"},
+   "priceUsd": "0.00005", "volume": {"h24": 15000}, "liquidity": {"usd": 9000}, "fdv": 50000, "pairCreatedAt": 1761480100000},
+  {"chainId": "solana", "dexId": "raydium", "pairAddress": "WSOLUSDC", "baseToken": {"address": "So11111111111111111111111111111111111111112", "symbol": "SOL"}, "quoteToken": {"address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "symbol": "USDC"},
+   "priceUsd": "200.5", "volume": {"h24": 1e9}, "liquidity": {"usd": 5e8}},
+  {"chainId": "solana", "dexId": "orca", "pairAddress": "WSOLBONK", "baseToken": {"address": "So11111111111111111111111111111111111111112", "symbol": "SOL"}, "quoteToken": {"address": "BONK", "symbol": "BONK"},
+   "priceUsd": "999", "liquidity": {"usd": 9e9}}
+ ]
+}

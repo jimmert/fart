@@ -1,0 +1,71 @@
+{
+  "_comment": "Per-source rate gates, daily budgets and cost tables. All numbers are estimates to reconcile with provider dashboards (docs/UNVERIFIED.md). rate_per_s * burst = token bucket. daily_cost 'env:RPC_DAILY_BUDGET_CU' is replaced by the env value.",
+  "sources": {
+    "rpc": {
+      "rate_per_s": 8,
+      "burst": 16,
+      "daily_requests": 200000,
+      "daily_cost": "env:RPC_DAILY_BUDGET_CU",
+      "cost_default": 20,
+      "cost_table": {
+        "getTransaction": 59,
+        "getSignaturesForAddress": 50,
+        "getTokenLargestAccounts": 50,
+        "getAccountInfo": 10,
+        "getSlot": 10,
+        "getBlockTime": 10,
+        "getHealth": 0,
+        "getMultipleAccounts": 25,
+        "ws_connect": 10,
+        "ws_subscribe": 10,
+        "ws_notification": 10
+      },
+      "backoff_base_s": 2,
+      "backoff_max_s": 300
+    },
+    "rpc_public": {
+      "rate_per_s": 1,
+      "burst": 4,
+      "daily_requests": 20000,
+      "daily_cost": null,
+      "cost_default": 1,
+      "cost_table": {},
+      "backoff_base_s": 5,
+      "backoff_max_s": 600
+    },
+    "pumpportal": {
+      "_comment": "connect gate: max 12 connects per hour, one connection at a time",
+      "rate_per_s": 0.003333,
+      "burst": 12,
+      "daily_requests": null,
+      "daily_cost": null,
+      "cost_default": 1,
+      "cost_table": {},
+      "backoff_base_s": 20,
+      "backoff_max_s": 180
+    },
+    "dexscreener": {
+      "_comment": "official limit 300/min for token endpoints; we self-limit to 100/min",
+      "rate_per_s": 1.6667,
+      "burst": 10,
+      "daily_requests": 100000,
+      "daily_cost": null,
+      "cost_default": 1,
+      "cost_table": {},
+      "backoff_base_s": 10,
+      "backoff_max_s": 600
+    },
+    "geckoterminal": {
+      "_comment": "assumed 10 calls per minute shared",
+      "rate_per_s": 0.16667,
+      "burst": 5,
+      "daily_requests": 10000,
+      "daily_cost": null,
+      "cost_default": 1,
+      "cost_table": {},
+      "backoff_base_s": 15,
+      "backoff_max_s": 900
+    }
+  },
+  "blocked_warning_period_s": 3600
+}

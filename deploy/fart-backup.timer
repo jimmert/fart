@@ -1,0 +1,10 @@
+[Unit]
+Description=Run fart backup daily at 05:30 UTC
+
+[Timer]
+OnCalendar=*-*-* 05:30:00 UTC
+Persistent=true
+Unit=fart-backup.service
+
+[Install]
+WantedBy=timers.target

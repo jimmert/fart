@@ -1,0 +1,41 @@
+[Unit]
+Description=fart backup: SQLite online backup + quick_check, 14 days retention
+Documentation=file:///opt/fart/app/deploy/DEPLOY.md
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/fart/app/deploy/backup.sh
+TimeoutStartSec=900
+# --- hardening (shared host; outbound HTTPS/WSS only; no inbound ports) ---
+User=fart
+Group=fart
+Slice=fart.slice
+WorkingDirectory=/opt/fart/app
+Environment=FART_ROOT=/opt/fart
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/opt/fart/data /opt/fart/out /opt/fart/logs
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes

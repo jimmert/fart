@@ -1,0 +1,11 @@
+[Unit]
+Description=Run fart measure track every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=fart-measure-track.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,33 @@
+{
+  "_comment": "Outcome measurement and paper trading. method_version changes whenever these semantics change.",
+  "method_version": "m1.0",
+  "horizons_s": [3600, 21600, 86400],
+  "winner": {
+    "peak_mcap_usd": 100000,
+    "min_volume_usd": 20000,
+    "within_s": 86400
+  },
+  "sampling": {
+    "interval_s": 300,
+    "dexscreener_batch": 30,
+    "max_mints_per_run": 600,
+    "track_window_s": 90000
+  },
+  "sol_usd": {
+    "cache_s": 60,
+    "wsol_mint": "So11111111111111111111111111111111111111112",
+    "usdc_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+  },
+  "paper": {
+    "size_sol": 0.5,
+    "entry_delay_s": 20,
+    "trailing_stop_frac": 0.30,
+    "max_hold_s": 86400,
+    "exit_fee_bps": 100,
+    "entry_fee_bps": 100,
+    "network_fee_sol": 0.0001
+  },
+  "report": {
+    "lead_time_bins_s": [-3600, -600, 0, 600, 3600]
+  }
+}
