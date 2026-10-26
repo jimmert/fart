@@ -3,6 +3,9 @@
   ingest                 daemon: PumpPortal + RPC streams (creates, migrations, per-mint trades), sweep, coverage
   engine                 daemon: candidate engine v0 (15 s loop), observations only
   social [--once]        daemon: X mega-account / KOL watch + CA confirmation (15 s loop); --once runs one tick
+  notify [--once]        daemon: Telegram outbox builder + sender to the owner chat (20 s loop)
+  notify test            send one test message to the owner chat (only when TELEGRAM_NOTIFY_ENABLED=1)
+  notify outbox          list the last 20 outbox rows
   measure track          one tracker run (systemd timer, every 5 min)
   measure report --day   daily recall report (systemd timer, 06:00 UTC)
   events classify        counts per undecoded event discriminator with the best-guess name and emitting program
@@ -35,6 +38,9 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("engine")
     so = sub.add_parser("social")
     so.add_argument("--once", action="store_true", help="run one tick and print the summary")
+    no = sub.add_parser("notify")
+    no.add_argument("ncmd", nargs="?", choices=["test", "outbox"], help="test | outbox (default: run the daemon)")
+    no.add_argument("--once", action="store_true", help="run one tick and print the summary")
     m = sub.add_parser("measure")
     ms = m.add_subparsers(dest="mcmd", required=True)
     ms.add_parser("track")
@@ -322,7 +328,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     settings = load_settings(root=args.root)
     settings.ensure_dirs()
-    daemon = args.cmd in ("ingest", "engine", "social") or (args.cmd == "measure")
+    daemon = args.cmd in ("ingest", "engine", "social") or (args.cmd == "measure") or (args.cmd == "notify" and not args.ncmd)
     setup_logging(settings.logs_dir if daemon else None, args.cmd if args.cmd != "measure" else f"measure-{args.mcmd}", stderr=not args.quiet)
     if args.cmd == "status":
         return cmd_status(settings, args.json)
@@ -346,6 +352,14 @@ def main(argv: list[str] | None = None) -> int:
         from .social.service import run_social
 
         return run_social(settings, once=args.once)
+    if args.cmd == "notify":
+        from .notify import service as ns
+
+        if args.ncmd == "test":
+            return ns.cmd_test(settings)
+        if args.ncmd == "outbox":
+            return ns.cmd_outbox(settings, args.json)
+        return ns.run_notify(settings, once=args.once)
     if args.cmd == "measure":
         if args.mcmd == "track":
             from .measure.outcomes import run_track

@@ -132,3 +132,18 @@ Format: decision — why — where. Newest at the bottom.
     only when the last hour counted >= 10 posts. `n_last_hour` = the hourly buckets ending within the last
     60 minutes (so 60-120 minutes of data); `n_24h` = the total with `start_time` 24 h back.
 39. **Follower weighting** of mentions = sum of log10(1 + followers) over the posts of the last hour.
+40. **Telegram goes through a durable outbox** (`fart/notify/`): a message is a row first (`outbox`,
+    `dedupe_key` UNIQUE), the 20 s sender delivers what is due with at most 20 messages per minute, honors
+    `retry_after` on 429, retries after 15/60/300/900/3600 s and then marks `gave_up`; a 4xx other than
+    429 (bad HTML, wrong chat id) gives up at once because retrying cannot help. The gate's source
+    `telegram` adds its own 20/min bucket and backoff. Only the owner chat, only when
+    `TELEGRAM_NOTIFY_ENABLED=1` plus token and chat id; otherwise the daemon idles and builds nothing.
+41. **Message policy**: Dutch, facts only, Europe/Amsterdam with UTC in brackets, HTML-escaped chain/X
+    text, fixed footer on every message. Observations are batched every 5 minutes (max 6 batches per hour,
+    8 items per message, the rest counted); a deferred batch rides the next one, nothing is dropped. The
+    first run starts at the current newest decision so history is never dumped on enabling. Fast posts go
+    out one per decision. The digest goes out once per day at 06:10 UTC from `out/recall/<day>.json` (or a
+    fresh build). Health alerts have a 1 h cooldown per kind; a stream is "silent" only while the ingest
+    heartbeat itself is fresh (a dead daemon is systemd's job, not Telegram's).
+42. **"Link to the raw data id"** is the decision id (`data: beslissing #<id>`) plus the mint in monospace;
+    no external links, so a message never looks like a call to action.

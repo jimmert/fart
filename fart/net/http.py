@@ -17,10 +17,11 @@ USER_AGENT = "fart/0.1 (+read-only public data consumer)"
 
 
 class HttpError(Exception):
-    def __init__(self, status: int | None, message: str, retry_after_s: float | None = None):
+    def __init__(self, status: int | None, message: str, retry_after_s: float | None = None, body: str | None = None):
         super().__init__(f"HTTP {status}: {message}")
         self.status = status
         self.retry_after_s = retry_after_s
+        self.body = body  # first 2000 bytes of an error body (Telegram puts retry_after in it); never logged raw
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -95,8 +96,13 @@ def request_json(
     except urllib.error.HTTPError as e:
         latency = (time.monotonic() - t0) * 1000.0
         retry_after = retry_after_from_headers(e.headers, budget.clock())
+        body: str | None = None
+        try:
+            body = e.read(2000).decode("utf-8", errors="replace")
+        except Exception:
+            body = None
         budget.record(source, method, verdict.cost, False, e.code, latency, err=str(e.reason), retry_after_s=retry_after)
-        raise HttpError(e.code, str(e.reason), retry_after) from None
+        raise HttpError(e.code, str(e.reason), retry_after, body=body) from None
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as e:
         latency = (time.monotonic() - t0) * 1000.0
         budget.record(source, method, verdict.cost, False, None, latency, err=f"{type(e).__name__}: {e}")

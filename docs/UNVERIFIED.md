@@ -88,6 +88,16 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
 - [ ] **Query operators** `from:`, `-is:reply`, `-is:retweet`, `$TICKER` cashtags and quoted exact phrases
   on the pay-per-use tier; query length <= 512 characters (the KOL batch is ~230).
 
+## Telegram
+
+- [ ] **Bot API shapes**: `sendMessage` returns `{"ok": true, "result": {"message_id": N}}`; a 429 carries
+  `parameters.retry_after` in the body and a `Retry-After` header (both honored). Verify with
+  `fart notify test` on the VPS (the first real send).
+- [ ] **HTML parse mode** rejects unbalanced tags: every chain/X text is escaped; a 400 "can't parse
+  entities" marks the row `gave_up` with the description (visible in `fart notify outbox`).
+- [ ] **Time zone data**: `zoneinfo` needs `/usr/share/zoneinfo` (Ubuntu has it; the code falls back to
+  UTC labels when it is missing).
+
 ## Prices
 
 - [ ] **DexScreener** `tokens/v1/solana/{mints}` (≤ 30 mints), fields `marketCap`, `fdv`,
