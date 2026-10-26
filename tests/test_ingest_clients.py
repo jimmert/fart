@@ -63,7 +63,7 @@ def test_pumpportal_handle_text_end_to_end(settings, conn, pp_msgs):
     clock = Clock()
     raw = RawWriter(settings.raw_dir, "pumpportal", flush_interval_s=0)
     pp = PumpPortalClient(conn, make_budget(settings, conn, clock), raw, "wss://x", settings.config("ingest")["pumpportal"],
-                          settings.config("engine")["watchlist"], connect=lambda *a, **k: None, clock=clock)
+                          settings.config("engine")["watchlist"], connect=lambda *a, **k: None, clock=clock, trades_enabled=True)
     assert pp.handle_text(json.dumps(pp_msgs["junk"]), 1.0) == "info"
     assert pp.handle_text(json.dumps(pp_msgs["new_token"]), 2.0) == "create"
     assert pp.handle_text(json.dumps(pp_msgs["trade"]), 3.0) == "trade"  # mint on probation -> stored
@@ -104,7 +104,7 @@ def test_pumpportal_loop_reconnects_with_gaps_and_connect_gate(settings, conn, p
         opened.append(ws)
         return ws
 
-    pp = PumpPortalClient(conn, budget, raw, "wss://x", cfg, settings.config("engine")["watchlist"], connect=connect, clock=clock)
+    pp = PumpPortalClient(conn, budget, raw, "wss://x", cfg, settings.config("engine")["watchlist"], connect=connect, clock=clock, trades_enabled=True)
     stop = asyncio.Event()
     asyncio.run(asyncio.wait_for(pp.run(stop), timeout=10))
     assert pp.connects >= 3
@@ -218,7 +218,7 @@ def test_sweep_fills_chain_time_and_backfills_missed(settings, conn, fixtures_di
     rpc = FakeRpc(sigs, {"sigMISSED": tx_create, "sigMIGR": tx_migr})
     res = sweep_signatures(conn, rpc, {"create": pf["mint_authority"], "migrate": pf["migration_account"]},
                            settings.config("ingest")["backfill"], now=1000.0)
-    assert res["create"] == {"signatures": 3, "pages": 1, "filled": 1, "missed": 1, "failed_tx": 1, "first_run": True}
+    assert res["create"] == {"signatures": 3, "pages": 1, "filled": 1, "missed": 1, "failed_tx": 1, "first_run": True, "truncated": False}
     row = conn.execute("SELECT slot, block_time, sources FROM coins WHERE mint='M1'").fetchone()
     assert row["slot"] == 370_000_001 and row["block_time"] == 1_761_480_000 and "rpc_sigs" in row["sources"]
     assert conn.execute("SELECT value FROM kv WHERE key='ingest.sweep.create.last_sig'").fetchone()[0] == "sigMISSED"

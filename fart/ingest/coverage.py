@@ -1,8 +1,14 @@
 """Coverage: how complete is our view of pump.fun creates and graduations, per UTC hour.
 
 Gaps are intervals during which a source was down (disconnect, budget cap, process restart).
-An hour is `complete` when it is over and at least one create source had no gap inside it.
-Event hour = chain time when known, else our received_at (documented: docs/METING.md).
+A gap left open by the previous process is closed at the next start with reason `restart`.
+The signature sweep (`rpc_sigs`) lists every create/graduation signature since its previous run,
+so a complete, successful sweep *recovers* every stream gap that ended before it started
+(`recovered_at`/`recovered_by='sweep'`); a gap caused by the CU budget cap is never recovered by
+the sweep because the sweep is paused by the same cap. The sweep itself opens an `rpc_sigs` gap
+when it fails. An hour is `complete` when it is over and at least one configured create source had
+no unrecovered gap inside it. Event hour = chain time when known, else our received_at
+(documented: docs/METING.md).
 """
 from __future__ import annotations
 
@@ -13,6 +19,8 @@ from typing import Any
 from ..util import hour_bounds, hour_key
 
 CREATE_SOURCES = ("pumpportal", "rpc_logs", "rpc_sigs")
+STREAM_SOURCES = ("pumpportal", "rpc_logs", "rpc_trades")
+UNRECOVERABLE_REASONS = ("budget_cap",)
 
 
 def gap_open(conn: sqlite3.Connection, source: str, start: float, reason: str) -> int:
@@ -24,25 +32,49 @@ def gap_close(conn: sqlite3.Connection, gap_id: int, end: float) -> None:
     conn.execute("UPDATE coverage_gaps SET end=? WHERE id=? AND end IS NULL", (end, gap_id))
 
 
-def close_dangling_gaps(conn: sqlite3.Connection, end: float, source: str | None = None) -> int:
-    """At startup: gaps left open by a crash end at the earliest sensible time (now)."""
+def close_dangling_gaps(conn: sqlite3.Connection, end: float, source: str | None = None, relabel: str | None = None) -> int:
+    """At startup: gaps left open by the previous process (shutdown or crash) end now. With
+    `relabel` (ingest passes 'restart') the reason is replaced so the report shows restart gaps as
+    such; the sweep recovers them (`mark_recovered_by_sweep`)."""
+    set_clause = "end=?" + (", reason=?" if relabel else "")
+    args: list[Any] = [end] + ([relabel] if relabel else [])
     if source is None:
-        cur = conn.execute("UPDATE coverage_gaps SET end=? WHERE end IS NULL", (end,))
+        cur = conn.execute(f"UPDATE coverage_gaps SET {set_clause} WHERE end IS NULL", args)
     else:
-        cur = conn.execute("UPDATE coverage_gaps SET end=? WHERE end IS NULL AND source=?", (end, source))
+        cur = conn.execute(f"UPDATE coverage_gaps SET {set_clause} WHERE end IS NULL AND source=?", args + [source])
     return cur.rowcount
+
+
+def mark_recovered_by_sweep(conn: sqlite3.Connection, sweep_started_at: float, now: float) -> int:
+    """A complete, successful sweep saw every create/graduation signature since the previous sweep:
+    every closed stream gap that ended before this sweep started is recovered. Budget-cap gaps are
+    not (the sweep shares the cap)."""
+    marks = ",".join("?" for _ in STREAM_SOURCES)
+    unrec = ",".join("?" for _ in UNRECOVERABLE_REASONS)
+    cur = conn.execute(
+        f"UPDATE coverage_gaps SET recovered_at=?, recovered_by='sweep' WHERE recovered_at IS NULL AND end IS NOT NULL"
+        f" AND end <= ? AND source IN ({marks}) AND COALESCE(reason, '') NOT IN ({unrec})",
+        (now, sweep_started_at, *STREAM_SOURCES, *UNRECOVERABLE_REASONS),
+    )
+    return cur.rowcount
+
+
+def open_gap_id(conn: sqlite3.Connection, source: str) -> int | None:
+    row = conn.execute("SELECT id FROM coverage_gaps WHERE source=? AND end IS NULL ORDER BY id DESC LIMIT 1", (source,)).fetchone()
+    return None if row is None else int(row["id"])
 
 
 def gaps_overlapping(conn: sqlite3.Connection, start: float, end: float, now: float) -> list[dict[str, Any]]:
     rows = conn.execute(
-        "SELECT id, start, end, source, reason FROM coverage_gaps WHERE start < ? AND COALESCE(end, ?) > ? ORDER BY start",
+        "SELECT id, start, end, source, reason, recovered_at, recovered_by FROM coverage_gaps WHERE start < ? AND COALESCE(end, ?) > ? ORDER BY start",
         (end, now, start),
     ).fetchall()
     out = []
     for r in rows:
         s = max(r["start"], start)
         e = min(r["end"] if r["end"] is not None else now, end)
-        out.append({"source": r["source"], "reason": r["reason"], "start": s, "end": e, "seconds": round(e - s, 1)})
+        out.append({"source": r["source"], "reason": r["reason"], "start": s, "end": e, "seconds": round(e - s, 1),
+                    "recovered": r["recovered_at"] is not None, "recovered_by": r["recovered_by"]})
     return out
 
 
@@ -87,7 +119,7 @@ def compute_hour(conn: sqlite3.Connection, hour: str, now: float) -> dict[str, A
         ).fetchone()[0],
         "gaps": gaps,
     }
-    sources_with_gap = {g["source"] for g in gaps}
+    sources_with_gap = {g["source"] for g in gaps if not g.get("recovered")}
     hour_over = now >= end
     some_create_source_clean = any(s not in sources_with_gap for s in CREATE_SOURCES if _source_was_configured(conn, s))
     row["complete"] = bool(hour_over and some_create_source_clean)

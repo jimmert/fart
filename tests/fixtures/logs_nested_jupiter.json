@@ -1,0 +1,16 @@
+{
+ "logs": [
+  "Program JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4 invoke [1]",
+  "Program log: Instruction: Route",
+  "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [2]",
+  "Program log: Instruction: Buy",
+  "Program data: vdt/007mYe6sm7DLtJQMTKWBrblAtEnSoVcR/IDyrXRdTVVJ/1S6LQAnuSkAAAAAAGAvRgIUAAABTj3ytuBrZHHtmdhgUlrJspKUU+OQj6yacrcSRD+f/3xeDf5oAAAAAAACRX8HAAAAAIDGpH6NAwAAViGDAAAAAADos1jtjgIAeab3vYovUvpv5qV4j0a4RdawfnVPD4ofaEdpm2FdgLZfAAAAAAAAAJB4ZQAAAAAANm7mIUCSmFCG1RcCi+Rj7n6eQqKYKNK45MJ8Rzjka9keAAAAAAAAACALIAAAAAAA",
+  "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success",
+  "Program data: QMbN6CYIceIHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+  "Program JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4 success"
+ ],
+ "programs": {
+  "jupiter": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+  "pump": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+ }
+}

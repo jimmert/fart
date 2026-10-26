@@ -58,3 +58,50 @@ Format: decision — why — where. Newest at the bottom.
 20. **Engine RPC enrichment** limited to 3 holder lookups + 3 creator lookups per 15 s loop, only
     for candidates at or near the observe thresholds.
 21. **Tests run on Python 3.13** (sandbox); code written for 3.12 (no 3.13-only syntax).
+
+## Milestone 2
+
+22. **Branch and PR**: all work on `m2-rpc-trades-social-telegram` from `main`; the harness branch
+    `claude/determined-ptolemy-fowcar` mirrors the same head; the PR is `m2-rpc-trades-social-telegram` → `main`.
+23. **PumpPortal trades only with a funded key**: without `PUMPPORTAL_API_KEY` no `subscribeTokenTrade` is
+    ever sent (PumpPortal refuses them anyway and the client used to re-send batches every 5 s); the
+    connection stays creates + migrations. With a key the URL gets `?api-key=` (never logged) and the
+    milestone-1 trade subscriptions come back. The mode is logged once at startup (`pp.mode`).
+24. **Per-mint trades over the RPC websocket** (`fart/ingest/rpc_trades.py`): a second connection next to the
+    creates/migrations stream, one `logsSubscribe` per watched mint. Subscription address: the bonding
+    curve before graduation (from the CreateEvent, else derived as the PDA `["bonding-curve", mint]`) and
+    the pump-amm pool after it (from the migration event; the mint itself when the pool is unknown).
+    `config/ingest.json` → `rpc_trades.mention = "mint"` switches to the mint everywhere if the VPS shows
+    that TradeEvents do not arrive on the curve address. Only a keyed RPC runs this client.
+25. **Subscription policy** (`config/engine.json` → `watchlist`): at most `rpc_trades_cap` (150) subscriptions,
+    chosen by watchlist priority (observe > graduation > meta_burst > early_buyers > probation) and
+    recency; above `rpc_trades_cu_drop_fraction` (80%) of the daily CU cap only observe/early_buyers/
+    meta_burst keep a subscription. Probation stays the default for every coin's first 5 minutes
+    (`early_window_s`) because that is where the unique-buyer counts come from. Every notification,
+    subscribe and unsubscribe is booked as estimated CU (aggregated per minute, as in milestone 1).
+26. **PDA derivation in stdlib** (`fart/chain/pda.py`): the Ed25519 on-curve check follows RFC 8032 /
+    curve25519-dalek decompression; verified offline because the pump.fun Global, mint-authority and
+    event-authority PDAs reproduce their known addresses. The pump-amm pool derivation is a guess and is
+    only exposed through `fart chain pda`.
+27. **pump-amm events**: `BuyEvent`/`SellEvent`/`CreatePoolEvent` layouts from the PumpSwap IDL as remembered,
+    TO VERIFY. A swap whose `pool` differs from the pool we subscribed to is rejected and counted
+    (`decode.pump_amm_pool_mismatch`) instead of stored: a cheap, permanent layout self-check. Swaps are
+    stored with `source='pump_amm'`, pool reserves in `virtual_sol/virtual_token` so the curve price/mcap
+    math applies unchanged (an AMM price, one trade's worth of error if the reserves are pre-swap).
+28. **Program attribution of `Program data:` lines** from the invoke nesting; stored in
+    `raw_undecoded.program`. Unknown discriminators from Jupiter/Orca/Raydium in the same transaction are
+    no longer mistaken for new pump.fun events (`fart events classify`).
+29. **Fees**: `fee_bps` 95 (Global account), `creator_fee_bps` 30 (TO VERIFY), `total_curve_fee_bps` 125 used
+    by every quote and therefore by the paper trade (round trip ≈ 2.5%). `fart chain global` exits 1 on a
+    config/chain mismatch; the ingest daemon runs the same check at startup and only logs.
+30. **`global` is a Python keyword**, so the module is `fart/chain/global_account.py`.
+31. **Duplicate trades** (PumpPortal with key + RPC stream): the second arrival is not inserted again but fills
+    slot/block_time/reserves/buyer where the first row lacked them.
+32. **Coverage after a restart**: gaps left open by the previous process are closed at startup with reason
+    `restart`; a complete, successful signature sweep (not a first run, not truncated) marks every closed
+    stream gap that ended before it as `recovered_by='sweep'`; budget-cap gaps are never recovered because
+    the sweep shares the cap. The sweep opens its own `rpc_sigs` gap while it fails. An hour is complete
+    when a configured create source has no *unrecovered* gap.
+33. **Schema v2** is one idempotent migration (`CREATE IF NOT EXISTS` plus guarded `ALTER TABLE`), applied
+    automatically by any process that opens the database; milestone-1 rows are untouched
+    (`tests/test_m2_ingest.py::test_migration_v1_to_v2_preserves_milestone1_data`).

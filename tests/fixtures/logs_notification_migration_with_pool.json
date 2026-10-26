@@ -1,0 +1,26 @@
+{
+ "jsonrpc": "2.0",
+ "method": "logsNotification",
+ "params": {
+  "result": {
+   "context": {
+    "slot": 370000900
+   },
+   "value": {
+    "err": null,
+    "logs": [
+     "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]",
+     "Program log: Instruction: Migrate",
+     "Program pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA invoke [2]",
+     "Program log: Instruction: CreatePool",
+     "Program data: sTEM0qB2p3SaDf5oAAAAAAAAwtlRDqq94pfqCjyfHpU0ee1E12lw6lAePiuDki2+hxOsm7DLtJQMTKWBrblAtEnSoVcR/IDyrXRdTVVJ/1S6LQabiFf+q4GE+2h/Y0YYwDXaxDncGus7VZig8AAAAAABBgkACAGpLLwAAIB7zMkTAAAAAAgBqSy8AACAe8zJEwAAAGQAAAAAAAAAQBrs+QAAAADcGez5AAAAAP5Oxv9V1i9Qc+/4c6iBdqW7tuIK7sA5SOTyE10k988H5M0fcbH5jcJtUW4TKEOD9fkxcmW5nJLWKbuveyTHqj7AOxT9Ntj5PigdinyF/U6jg9mkAaRkWX5v2eIPsNIqTmYjFmZPWYGQSRBBPSnet2r5XvLJMts9kVKYISYG8W302zZu5iFAkphQhtUXAovkY+5+nkKimCjSuOTCfEc45GvZ",
+     "Program pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA success",
+     "Program data: velduVyU6pRsaV23E1aJy7d+tLwtCt/yG/hBsAFfUeMAMMieNWLbpqybsMu0lAxMpYGtuUC0SdKhVxH8gPKtdF1NVUn/VLotAAgBqSy8AACAe8zJEwAAAIDR8AgAAAAAv35m9CiJPCpm/oD6ugW3gR6Xy7qak3dUDbRdxzRM0Y6aDf5oAAAAAE7G/1XWL1Bz7/hzqIF2pbu24gruwDlI5PITXST3zwfk",
+     "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success"
+    ],
+    "signature": "3oWB2X64vx9fGaU5PbTkJz1sptZYZLS2EGzqL4naniPQKQSxpSMfH7aSAJfrtidnJxaX8Ph5SEEA7JF4WWDa3NC6"
+   }
+  },
+  "subscription": 11
+ }
+}

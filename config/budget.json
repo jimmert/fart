@@ -18,7 +18,8 @@
         "getMultipleAccounts": 25,
         "ws_connect": 10,
         "ws_subscribe": 10,
-        "ws_notification": 10
+        "ws_notification": 10,
+        "ws_unsubscribe": 10
       },
       "backoff_base_s": 2,
       "backoff_max_s": 300
@@ -65,6 +66,28 @@
       "cost_table": {},
       "backoff_base_s": 15,
       "backoff_max_s": 900
+    },
+    "x": {
+      "_comment": "X API v2 pay-per-use. cost = estimated USD per call (config/x.json prices); daily_cost is the hard USD cap from X_DAILY_BUDGET_USD. The hourly envelope, the 30% account-watch reserve and the KOL sub-cap live in fart/social/x.py (XBudget) and are ledgered in x_spend.",
+      "rate_per_s": 0.5,
+      "burst": 5,
+      "daily_requests": 5000,
+      "daily_cost": "env:X_DAILY_BUDGET_USD",
+      "cost_default": 0.005,
+      "cost_table": {},
+      "backoff_base_s": 30,
+      "backoff_max_s": 1800
+    },
+    "telegram": {
+      "_comment": "Bot API sendMessage to the owner chat: max 20 messages per minute; 429 retry_after is honored.",
+      "rate_per_s": 0.3333,
+      "burst": 20,
+      "daily_requests": 5000,
+      "daily_cost": null,
+      "cost_default": 1,
+      "cost_table": {},
+      "backoff_base_s": 15,
+      "backoff_max_s": 3600
     }
   },
   "blocked_warning_period_s": 3600

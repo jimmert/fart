@@ -1,7 +1,11 @@
 {
   "_comment": "Outcome measurement and paper trading. method_version changes whenever these semantics change.",
   "method_version": "m1.0",
-  "horizons_s": [3600, 21600, 86400],
+  "horizons_s": [
+    3600,
+    21600,
+    86400
+  ],
   "winner": {
     "peak_mcap_usd": 100000,
     "min_volume_usd": 20000,
@@ -21,13 +25,20 @@
   "paper": {
     "size_sol": 0.5,
     "entry_delay_s": 20,
-    "trailing_stop_frac": 0.30,
+    "trailing_stop_frac": 0.3,
     "max_hold_s": 86400,
-    "exit_fee_bps": 100,
-    "entry_fee_bps": 100,
-    "network_fee_sol": 0.0001
+    "exit_fee_bps": 125,
+    "entry_fee_bps": 125,
+    "network_fee_sol": 0.0001,
+    "_comment": "entry/exit fee come from config/pumpfun.json total_curve_fee_bps (curve math); the *_fee_bps here are informational"
   },
   "report": {
-    "lead_time_bins_s": [-3600, -600, 0, 600, 3600]
+    "lead_time_bins_s": [
+      -3600,
+      -600,
+      0,
+      600,
+      3600
+    ]
   }
 }

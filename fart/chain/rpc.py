@@ -73,5 +73,10 @@ class RpcClient:
         res = self.call("getSlot", [{"commitment": "confirmed"}])
         return int(res) if isinstance(res, int) else None
 
+    def get_block_time(self, slot: int) -> int | None:
+        """Unix time of a slot (None when the node has no block for it)."""
+        res = self.call("getBlockTime", [int(slot)])
+        return int(res) if isinstance(res, int) else None
+
 
 __all__ = ["RpcClient", "RpcError", "Blocked", "HttpError"]

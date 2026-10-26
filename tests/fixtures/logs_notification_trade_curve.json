@@ -1,0 +1,27 @@
+{
+ "jsonrpc": "2.0",
+ "method": "logsNotification",
+ "params": {
+  "result": {
+   "context": {
+    "slot": 370000050
+   },
+   "value": {
+    "err": null,
+    "logs": [
+     "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]",
+     "Program log: Instruction: Buy",
+     "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [2]",
+     "Program log: Instruction: Transfer",
+     "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success",
+     "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [2]",
+     "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success",
+     "Program data: vdt/007mYe6sm7DLtJQMTKWBrblAtEnSoVcR/IDyrXRdTVVJ/1S6LQAnuSkAAAAAAGAvRgIUAAABTj3ytuBrZHHtmdhgUlrJspKUU+OQj6yacrcSRD+f/3xeDf5oAAAAAAACRX8HAAAAAIDGpH6NAwAAViGDAAAAAADos1jtjgIAeab3vYovUvpv5qV4j0a4RdawfnVPD4ofaEdpm2FdgLZfAAAAAAAAAJB4ZQAAAAAANm7mIUCSmFCG1RcCi+Rj7n6eQqKYKNK45MJ8Rzjka9keAAAAAAAAACALIAAAAAAA",
+     "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success"
+    ],
+    "signature": "2bARQqKMiqkfxcvyTJV2emPXREKBe5eM2kWK6RYxJMvVstxb9cNRf1ssC1KAWwDNgtxcsSipCBPJcStRbvcgM1Kq"
+   }
+  },
+  "subscription": 11
+ }
+}

@@ -1,20 +1,25 @@
 """PumpPortal public data websocket: ONE connection, watchdog, bounded reconnects.
 
-Subscriptions: subscribeNewToken, subscribeMigration, subscribeTokenTrade for the active
-watchlist (synced every few seconds, capped). Every raw message is written to the hourly gzip
-store before normalization. Connects go through the budget gate (max 12 per hour).
+Subscriptions: subscribeNewToken, subscribeMigration always; subscribeTokenTrade for the active
+watchlist only when the connection carries a funded API key (`PUMPPORTAL_API_KEY`): PumpPortal
+answers every unkeyed subscribeTokenTrade with "only available when connecting with an API key
+funded with at least some balance" and never sends a trade (VPS, 26 Oct 2026). Without a key the
+client is creates + migrations only and trades come from the RPC (`rpc_trades.py`). Every raw
+message is written to the hourly gzip store before normalization. Connects go through the budget
+gate (max 12 per hour). The connection URL may carry the key and is never logged.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import random
+import re
 import sqlite3
 import time
 from typing import Any, Callable
 
 from ..db import kv_set
-from ..log import get_logger
+from ..log import Throttle, get_logger
 from ..net.budget import Budget
 from ..util import now as wall_now
 from . import coverage, store, watch
@@ -23,6 +28,18 @@ from .raw import RawWriter
 log = get_logger("pumpportal")
 
 SOURCE = "pumpportal"
+_REFUSAL_RE = re.compile(r"api[ -]?key", re.IGNORECASE)
+_HTTP_STATUS_RE = re.compile(r"\b(401|403|429)\b")
+
+
+def http_status_of(exc: BaseException) -> int | None:
+    """Best effort: the HTTP status behind a websocket handshake failure (403/429 from PumpPortal)."""
+    for obj in (exc, getattr(exc, "response", None)):
+        v = getattr(obj, "status_code", None)
+        if isinstance(v, int):
+            return v
+    m = _HTTP_STATUS_RE.search(str(exc))
+    return int(m.group(1)) if m else None
 
 
 class PumpPortalClient:
@@ -36,6 +53,7 @@ class PumpPortalClient:
         watch_cfg: dict[str, Any],
         connect: Callable[..., Any] | None = None,
         clock: Callable[[], float] = wall_now,
+        trades_enabled: bool = False,
     ):
         self.conn = conn
         self.budget = budget
@@ -44,6 +62,8 @@ class PumpPortalClient:
         self.cfg = cfg
         self.watch_cfg = watch_cfg
         self.clock = clock
+        self.trades_enabled = trades_enabled
+        self._throttle = Throttle(3600)
         if connect is None:
             import websockets  # imported lazily so tests can run without the package
 
@@ -87,7 +107,15 @@ class PumpPortalClient:
                 if rec.get("mint") and self.watch_cfg.get("subscribe_graduations", True):
                     watch.add(self.conn, rec["mint"], "graduation", received_at, float(self.watch_cfg.get("ttl_s", 86400)), cap)
             elif kind == "info":
-                log.info("pp.info", text=str(msg)[:200])
+                text_l = str(msg)
+                if _REFUSAL_RE.search(text_l) and "trade" in text_l.lower():
+                    # the funded-key refusal of subscribeTokenTrade; without a key we never send it
+                    store.counter_bump(self.conn, "pp.trade_sub_refused", 1, received_at)
+                    kv_set(self.conn, "ingest.pumpportal.trade_sub_refused_at", str(received_at), received_at)
+                    if self._throttle.allow("refusal", received_at):
+                        log.warning("pp.trade_subscription_refused", trades_enabled=self.trades_enabled, text=text_l[:200])
+                else:
+                    log.info("pp.info", text=text_l[:200])
             else:
                 store.counter_bump(self.conn, "pp.unknown_messages", 1, received_at)
             kv_set(self.conn, "ingest.pumpportal.last_msg_at", str(received_at), received_at)
@@ -103,7 +131,11 @@ class PumpPortalClient:
         return set(watch.active_mints(self.conn)[:cap])
 
     def subscription_messages(self, now: float) -> list[dict[str, Any]]:
-        """Diff the active watchlist against what the connection is subscribed to."""
+        """Diff the active watchlist against what the connection is subscribed to. Without a funded
+        API key no trade subscription is ever sent (PumpPortal would refuse it anyway)."""
+        if not self.trades_enabled:
+            self.subscribed = set()
+            return []
         desired = self.desired_subscriptions(now)
         msgs: list[dict[str, Any]] = []
         add = sorted(desired - self.subscribed)
@@ -143,7 +175,14 @@ class PumpPortalClient:
                 # applies); a failed handshake is an error and also arms the budget backoff
                 self.budget.record(SOURCE, "connect", verdict.cost, self._connected, None, (time.monotonic() - t0) * 1000.0,
                                    err=None if self._connected else f"{type(e).__name__}: {e}")
-                log.warning("pp.disconnected", connected=self._connected, error=f"{type(e).__name__}: {str(e)[:200]}")
+                status = http_status_of(e) if not self._connected else None
+                if status in (401, 403, 429):
+                    # the shared VPS IP was refused; recorded for `fart status` and the health alerts
+                    t_now = self.clock()
+                    kv_set(self.conn, "ingest.pumpportal.last_http_status", str(status), t_now)
+                    kv_set(self.conn, "ingest.pumpportal.last_http_status_at", str(t_now), t_now)
+                    store.counter_bump(self.conn, "pp.http_refusals", 1, t_now)
+                log.warning("pp.disconnected", connected=self._connected, http_status=status, error=f"{type(e).__name__}: {str(e)[:200]}")
                 if self._connected and time.monotonic() - t0 > 60:  # a stable session resets the backoff ladder
                     attempt = 0
             if stop.is_set():
@@ -164,7 +203,7 @@ class PumpPortalClient:
             self.connects += 1
             self._connected = True
             now = self.clock()
-            log.info("pp.connected", connects=self.connects)
+            log.info("pp.connected", connects=self.connects, trades="api_key" if self.trades_enabled else "disabled (no PUMPPORTAL_API_KEY; trades via RPC)")
             self._close_gap(now)
             await ws.send(json.dumps({"method": "subscribeNewToken"}))
             await ws.send(json.dumps({"method": "subscribeMigration"}))
@@ -218,4 +257,4 @@ class PumpPortalClient:
 
     def stats(self) -> dict[str, Any]:
         return {"connects": self.connects, "failures": self.failures, "messages": self.messages,
-                "subscribed": len(self.subscribed), "counts": dict(self.counts)}
+                "subscribed": len(self.subscribed), "trades_enabled": self.trades_enabled, "counts": dict(self.counts)}

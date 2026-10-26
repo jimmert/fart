@@ -29,7 +29,15 @@
     "early_buyers_threshold": 10,
     "early_window_s": 300,
     "subscribe_graduations": true,
-    "subscribe_bursting_meta": true
+    "subscribe_bursting_meta": true,
+    "_comment": "probation = every new pump coin for early_window_s seconds (unique-buyer counts come from here). rpc_trades_cap caps the number of per-mint logsSubscribe subscriptions; above rpc_trades_cu_drop_fraction of the daily CU cap only the rpc_trades_keep_reasons_above_cu_fraction reasons keep a subscription (probation is dropped first).",
+    "rpc_trades_cap": 150,
+    "rpc_trades_cu_drop_fraction": 0.8,
+    "rpc_trades_keep_reasons_above_cu_fraction": [
+      "observe",
+      "early_buyers",
+      "meta_burst"
+    ]
   },
   "decision_cooldown_s": 1800
 }

@@ -8,7 +8,7 @@
     "raw_flush_interval_s": 5,
     "raw_flush_lines": 200,
     "watchlist_sync_interval_s": 5,
-    "_comment": "trade subscription cap lives in config/engine.json -> watchlist.cap"
+    "_comment": "trade subscriptions are sent only when PUMPPORTAL_API_KEY is set (funded key); the subscription cap lives in config/engine.json -> watchlist.cap"
   },
   "rpc_logs": {
     "enabled": true,
@@ -16,7 +16,8 @@
     "watchdog_idle_s": 180,
     "backoff_min_s": 10,
     "backoff_max_s": 300,
-    "ping_interval_s": 30
+    "ping_interval_s": 30,
+    "_comment": "creates (mint authority) and graduations (migration account); one connection"
   },
   "backfill": {
     "enabled": true,
@@ -36,5 +37,18 @@
     "trades_days": 14,
     "samples_days": 30,
     "api_ledger_days": 30
+  },
+  "rpc_trades": {
+    "_comment": "per-mint logsSubscribe over the keyed RPC websocket. mention: 'bonding_curve' subscribes on the curve PDA before graduation and on the pump-amm pool after it (fallback: the mint); 'mint' always uses the mint. VERIFY on the VPS which address carries the TradeEvent notifications (docs/UNVERIFIED.md).",
+    "enabled": true,
+    "mention": "bonding_curve",
+    "commitment": "confirmed",
+    "sync_interval_s": 5,
+    "watchdog_idle_s": 900,
+    "watchdog_min_subscriptions": 20,
+    "backoff_min_s": 10,
+    "backoff_max_s": 300,
+    "ping_interval_s": 30,
+    "max_block_time_lookups_per_run": 20
   }
 }
