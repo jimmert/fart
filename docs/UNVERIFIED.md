@@ -72,6 +72,22 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
 - [ ] **`getSignaturesForAddress` on the mint authority** lists create transactions newest-first
   with `slot`/`blockTime`, and one transaction creates one coin (`fart/ingest/sweep.py`).
 
+## X (Twitter) API v2
+
+- [ ] **Prices** in `config/x.json` (search/recent $0.005 per post returned, counts/recent $0.005 per
+  request, author expansion $0.010 per user per UTC day) are the previous builder's notes of 24 Oct 2026:
+  compare with the developer console and with `fart status` → `x spend today` after one day.
+- [ ] **Per-day deduplication** of billed posts/authors (assumed by the pricing notes; `x_dedupe`).
+- [ ] **`GET /2/tweets?ids=` re-reads are free** for same-day ids (booked as `refresh` at $0).
+- [ ] **Response field names** (`data[].public_metrics.like_count/quote_count/impression_count`,
+  `includes.users[].public_metrics.followers_count`, `meta.newest_id`, counts `data[].tweet_count`,
+  `meta.total_tweet_count`) come from the public docs; the fixtures under `tests/fixtures/x_*.json` are
+  synthetic. Parsing is tolerant: missing fields become NULL, never 0.
+- [ ] **Rate limits**: `x-rate-limit-reset` (epoch seconds) is honored as backoff on 429; the gate
+  allows 0.5 calls/s (burst 5) and 5,000 calls/day for the source `x`.
+- [ ] **Query operators** `from:`, `-is:reply`, `-is:retweet`, `$TICKER` cashtags and quoted exact phrases
+  on the pay-per-use tier; query length <= 512 characters (the KOL batch is ~230).
+
 ## Prices
 
 - [ ] **DexScreener** `tokens/v1/solana/{mints}` (≤ 30 mints), fields `marketCap`, `fdv`,

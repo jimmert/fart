@@ -144,7 +144,52 @@ def coin_features(conn: sqlite3.Connection, mint: str, as_of: float, params: Cur
         ).fetchone()[0]
     else:
         f["creator_prior_coins_24h"] = None
+    f.update(x_features(conn, mint, as_of))
     return f
+
+
+# ----- social (X) features, as-of: received_at <= as_of AND (created_at IS NULL OR created_at <= as_of) ------
+X_ASOF = "(received_at <= ? AND (created_at IS NULL OR created_at <= ?))"
+
+
+def x_features(conn: sqlite3.Connection, mint: str, as_of: float) -> dict[str, Any]:
+    """Confirmation posts (kind 'ca', query_key = mint) and counts knowable at as_of. Zero mentions is
+    a real count of nothing only when a count was taken; otherwise None."""
+    pt = "COALESCE(created_at, received_at)"
+    row = conn.execute(
+        f"SELECT COUNT(*) AS n, COUNT(DISTINCT author_id) AS authors, COALESCE(SUM(CASE WHEN followers IS NOT NULL THEN LOG10(1 + followers) END), 0) AS fw,"
+        f" MIN({pt}) AS first_ts FROM social_posts WHERE kind='ca' AND query_key=? AND {X_ASOF} AND {pt} > ?",
+        (mint, as_of, as_of, as_of - 3600),
+    ).fetchone()
+    first = conn.execute(
+        f"SELECT MIN({pt}) FROM social_posts WHERE kind='ca' AND query_key=? AND {X_ASOF}", (mint, as_of, as_of)
+    ).fetchone()[0]
+    cnt = conn.execute(
+        "SELECT n_last_hour, n_24h, ts FROM social_counts WHERE key=? AND ts <= ? ORDER BY ts DESC LIMIT 1", (mint, as_of)
+    ).fetchone()
+    return {
+        "x_mentions_1h": int(row["n"]),
+        "x_distinct_authors_1h": int(row["authors"]),
+        "x_follower_weighted_1h": round(float(row["fw"]), 3),
+        "x_first_mention_ts": first,
+        "x_count_1h": None if cnt is None else cnt["n_last_hour"],
+        "x_count_24h": None if cnt is None else cnt["n_24h"],
+        "x_count_ts": None if cnt is None else cnt["ts"],
+    }
+
+
+def mega_post_feature(conn: sqlite3.Connection, as_of: float, max_age_s: float = 7200.0) -> dict[str, Any] | None:
+    """The most recent `fast` mega post as of: which account, likes/min, age. None when there is none."""
+    row = conn.execute(
+        f"SELECT id, author, likes, likes_per_min, quotes_per_min, created_at, received_at, fast_at FROM social_posts"
+        f" WHERE kind='mega' AND fast=1 AND fast_at <= ? AND {X_ASOF} AND COALESCE(created_at, received_at) >= ?"
+        f" ORDER BY fast_at DESC, COALESCE(likes_per_min, 0) DESC LIMIT 1", (as_of, as_of, as_of, as_of - max_age_s),
+    ).fetchone()
+    if row is None:
+        return None
+    t = row["created_at"] if row["created_at"] is not None else row["received_at"]
+    return {"post_id": row["id"], "account": row["author"], "likes": row["likes"], "likes_per_min": row["likes_per_min"],
+            "quotes_per_min": row["quotes_per_min"], "age_s": round(as_of - float(t), 1), "fast_at": row["fast_at"]}
 
 
 def recent_coins(conn: sqlite3.Connection, as_of: float, window_s: float) -> list[dict[str, Any]]:

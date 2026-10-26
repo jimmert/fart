@@ -2,6 +2,7 @@
 
   ingest                 daemon: PumpPortal + RPC streams (creates, migrations, per-mint trades), sweep, coverage
   engine                 daemon: candidate engine v0 (15 s loop), observations only
+  social [--once]        daemon: X mega-account / KOL watch + CA confirmation (15 s loop); --once runs one tick
   measure track          one tracker run (systemd timer, every 5 min)
   measure report --day   daily recall report (systemd timer, 06:00 UTC)
   events classify        counts per undecoded event discriminator with the best-guess name and emitting program
@@ -32,6 +33,8 @@ def _parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ingest")
     sub.add_parser("engine")
+    so = sub.add_parser("social")
+    so.add_argument("--once", action="store_true", help="run one tick and print the summary")
     m = sub.add_parser("measure")
     ms = m.add_subparsers(dest="mcmd", required=True)
     ms.add_parser("track")
@@ -319,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     settings = load_settings(root=args.root)
     settings.ensure_dirs()
-    daemon = args.cmd in ("ingest", "engine") or (args.cmd == "measure")
+    daemon = args.cmd in ("ingest", "engine", "social") or (args.cmd == "measure")
     setup_logging(settings.logs_dir if daemon else None, args.cmd if args.cmd != "measure" else f"measure-{args.mcmd}", stderr=not args.quiet)
     if args.cmd == "status":
         return cmd_status(settings, args.json)
@@ -339,6 +342,10 @@ def main(argv: list[str] | None = None) -> int:
         from .engine.service import run_engine
 
         return run_engine(settings)
+    if args.cmd == "social":
+        from .social.service import run_social
+
+        return run_social(settings, once=args.once)
     if args.cmd == "measure":
         if args.mcmd == "track":
             from .measure.outcomes import run_track

@@ -1,5 +1,6 @@
 {
   "_comment": "X API v2 pay-per-use watch. Prices as documented by the previous builder on 24 Oct 2026: VERIFY against the X developer console and adjust here. All intervals in seconds, all money in USD.",
+  "loop_interval_s": 15,
   "api_base": "https://api.x.com/2",
   "prices": {
     "_comment": "search_recent: per post returned, deduplicated per UTC day. counts_recent: per request. author_expansion: per user per UTC day. refresh (GET /2/tweets?ids=) assumed free for same-day re-reads: VERIFY.",

@@ -105,3 +105,30 @@ Format: decision — why — where. Newest at the bottom.
 33. **Schema v2** is one idempotent migration (`CREATE IF NOT EXISTS` plus guarded `ALTER TABLE`), applied
     automatically by any process that opens the database; milestone-1 rows are untouched
     (`tests/test_m2_ingest.py::test_migration_v1_to_v2_preserves_milestone1_data`).
+34. **X is confirmation, never the trigger** (`fart/social/`): a separate daemon (`fart-social`, 15 s loop) that
+    idles with a heartbeat without `X_BEARER_TOKEN`. Posts keep `created_at` (platform) and `received_at`
+    (ours) apart; the X features in `fart/engine/features.py` use `received_at <= as_of AND created_at <= as_of`.
+35. **X money**: one budget source `x` whose cost is estimated USD per call (hard cap `X_DAILY_BUDGET_USD`,
+    default $3.00, enforced by the generic gate on the actual costs) plus `XBudget` pacing: an hourly
+    envelope weighted 1.0 for 13:00-02:00 UTC and 0.4 elsewhere, 30% of the cap reserved for the account
+    watches (confirmation calls may use at most 70%), a $1.00/day KOL sub-cap. A refused call is ledgered
+    with its reason (`hourly_envelope`, `account_watch_reserve`, `kol_daily_cap`, `daily_cost_cap`).
+    The per-kind USD ledger is `x_spend`; posts and author expansions are billed once per UTC day
+    (`x_dedupe`). The estimate before an incremental search is one new post + one new author; a single
+    call can therefore exceed the cap by at most max_results x ($0.005 + $0.010).
+36. **Prices** (`config/x.json`) are the previous builder's notes of 24 Oct 2026 and are TO VERIFY;
+    `GET /2/tweets?ids=` re-reads are booked as `refresh` at $0 (assumed free same-day, TO VERIFY).
+37. **Fast post** = likes/min >= 150 with >= 3,000 likes, or quotes/min >= 3, within 2 h of posting; velocity
+    from the last two metric samples (`social_post_metrics`), else the average since posting. A `fast_post`
+    decision needs a rare word of the post (not in the meta stopwords nor in the extra English list in
+    `config/x.json`) to appear in >= 3 pump.fun coin names created within 30 min before or after the post by
+    >= 2 creators. One decision per post (`decisions.term = 'x:<post id>'`, mint NULL, matched words and
+    mints in `features_json`); verdict stays `observe`, no tier words.
+38. **Confirmation keys are unambiguous only**: the mint itself always; `$TICKER` only when >= 3 characters,
+    not in the generic list and not a stopword; the exact coin name only when it has >= 2 words that are
+    not all stopwords; a meta term only when it is a bigram or >= 8 characters. Only mints with an
+    `observe` decision in the last 6 h that are still on the active watchlist are confirmed, most recent
+    first, at most 4 keys per 15 s tick and one `counts/recent` per key per 15 min; a 10-post search follows
+    only when the last hour counted >= 10 posts. `n_last_hour` = the hourly buckets ending within the last
+    60 minutes (so 60-120 minutes of data); `n_24h` = the total with `start_time` 24 h back.
+39. **Follower weighting** of mentions = sum of log10(1 + followers) over the posts of the last hour.
