@@ -65,6 +65,12 @@ def run_retention(conn: sqlite3.Connection, raw_dir: Path, archive_dir: Path, cf
     _archive_rows(archive_dir, "features_asof", rows, now)
     conn.execute("DELETE FROM features_asof WHERE computed_at < ?", (now - 30 * 86400,))
     out["features_archived"] = len(rows)
+    # milestone 6: the engine's per-day candidate maxima (one row per coin/term per day; the shadow tables are never pruned)
+    cutoff_day = day_key(now - int(cfg.get("candidates_days", 30)) * 86400)
+    rows = conn.execute("SELECT * FROM engine_candidates WHERE day < ?", (cutoff_day,)).fetchall()
+    _archive_rows(archive_dir, "engine_candidates", rows, now)
+    conn.execute("DELETE FROM engine_candidates WHERE day < ?", (cutoff_day,))
+    out["candidates_archived"] = len(rows)
     kv_set(conn, "retention.last_run", str(now), now)
     log.info("retention.done", **out)
     return out

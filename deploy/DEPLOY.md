@@ -23,12 +23,12 @@ systemd units (all in `deploy/`, installed to `/etc/systemd/system/`):
 | `fart.slice` | MemoryMax=1G, CPUQuota=100% for everything below | - |
 | `fart-ingest.service` | PumpPortal (creates + migrations) + RPC streams (creates, migrations, per-mint trades before graduation), signature sweep, coverage, retention, Global check | daemon, Restart=always |
 | `fart-engine.service` | candidate engine v0, observations only | daemon, 15 s loop |
-| `fart-social.service` | X mega-account / KOL watch, CA/ticker confirmation counts (milestone 2; idle without `X_BEARER_TOKEN`) | daemon, 15 s loop |
+| `fart-social.service` | X mega-account / KOL watch, CA/ticker confirmation counts (milestone 2; idle without `X_BEARER_TOKEN`; since milestone 6 in **shadow mode** by default: nothing of it reaches the decisions, `X_MODE`) | daemon, 15 s loop |
 | `fart-notify.service` | Telegram outbox to the owner chat (milestone 2; idle unless `TELEGRAM_NOTIFY_ENABLED=1`) | daemon, 20 s loop |
 | `fart-measure-track.timer` | price samples + due outcomes + paper trades | every 5 min |
 | `fart-measure-report.timer` | daily recall report for the previous UTC day | 06:00 UTC |
 | `fart-measure-week.timer` | week report (rolling 7 days ending yesterday; the Monday run is the Monday-Sunday calendar week): universe, hit rate, recall, lead time, bootstrap intervals, costs, the frozen go/no-go test (milestone 5) | 06:30 UTC daily |
-| `fart-backup.timer` | SQLite online backup + quick_check, 14 days kept | 05:30 UTC |
+| `fart-backup.timer` | SQLite online backup + quick_check, 14 days kept; since milestone 6 followed by `fart backup verify` (the newest archive unpacked, checked and compared with the live database; a failed check fails the unit) | 05:30 UTC |
 
 Hardening on every service: `User=fart`, `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
 `PrivateTmp`, `PrivateDevices`, `ReadWritePaths=/opt/fart/data /opt/fart/out /opt/fart/logs`,
@@ -71,8 +71,9 @@ RPC_WSS_URL=wss://solana-mainnet.g.alchemy.com/v2/<key>
 RPC_DAILY_BUDGET_CU=3000000
 PUMPPORTAL_WSS_URL=wss://pumpportal.fun/api/data
 PUMPPORTAL_API_KEY=                 # optional: funded PumpPortal key -> trade subscriptions via PumpPortal
-X_BEARER_TOKEN=                     # optional: X API v2 bearer token -> fart-social active
+X_BEARER_TOKEN=                     # optional: X API v2 bearer token -> fart-social active (in shadow mode, see X_MODE)
 X_DAILY_BUDGET_USD=3.00             # hard daily cap for all X calls together
+X_MODE=                             # milestone 6: off | shadow | live; empty = off without a token, shadow with one; live needs the x_live rules key
 TELEGRAM_BOT_TOKEN=                 # optional: bot token from @BotFather
 TELEGRAM_OWNER_CHAT_ID=             # the owner's chat id (fart-notify sends nowhere else)
 TELEGRAM_NOTIFY_ENABLED=0           # 1 = send; 0 = build nothing, send nothing
@@ -431,6 +432,107 @@ it), so the week report pools the new commit's `rules_version` with the frozen o
    re-add the trimmed rows; disable the new timer (`systemctl disable --now fart-measure-week.timer`) since the
    M4 installer does not know it. The pre-upgrade `.db` from step 1 is the clean way back if you want the rows.
 
+## 5e. Upgrade to milestone 6 (M6)
+
+M6 makes the X layer safe to switch on during the measurement week, shows why the coin branch gives few
+observations, and closes two operational gaps. No engine rule changes: the fingerprint of the rule-defining
+files stays `sha256:e3bf4320c45c` (the same test pins it), so the week report keeps pooling the new commit
+with `150ca73cb354`. What changes on the server:
+
+* **`X_MODE`** (new `.env` name, default `off`): with `X_BEARER_TOKEN` set and `X_MODE` empty or `shadow`,
+  `fart-social` runs the whole watch (mega accounts every 60 s, KOLs every 180 s, refresh, confirmation counts
+  every 15 min per key, fast-post matching) within `X_DAILY_BUDGET_USD`, but **nothing of it reaches the
+  decisions**: a fast post becomes a row in `shadow_decisions` (never in `decisions`, so Telegram never sends
+  it and the tracker never measures it), a confirmation count a row in `shadow_confirmations` (never in
+  `social_counts`), and the engine passes no mega-post feature and neutral X fields to every decision, so the
+  decisions of a shadow day are byte for byte those of a day without X (a test compares the two). `live` (the
+  milestone-2 behaviour) is only honoured together with `"x_live": true` in `config/engine.json`, which is a
+  rules change (a new fingerprint, a new segment in the week report): not during the week. A requested `live`
+  without that key runs as shadow and says so (`fart status` → `x mode note`).
+* **Schema v6**: three new tables, no new columns, no cleanup: `shadow_decisions` and `shadow_confirmations`
+  (append-only like `decisions`) and `engine_candidates` (one row per watched coin and per ranked meta per UTC
+  day with the highest threshold features the engine saw; pruned after 30 days by retention). The engine
+  writes the candidate rows in its decision transaction from the first tick after the upgrade.
+* **New commands**, all read-only or writing only under `data/`: `fart engine explain --day D`, `fart social
+  dryrun`, `fart backup verify`, `fart budget calibrate --day D --dashboard-cu N`.
+* **Reports**: the daily report gains "Waarom wel of geen observaties" (candidate maxima per threshold, the
+  distribution per feature, probation data availability per hour next to the trade-stream gaps) and
+  "X-schaduw" (what X would have added, how many existing observations it confirmed within 1 h / 24 h, the
+  outcome of the shadow decisions under the hit-rate denominator rules); the week report gains "X-schaduw".
+* **Backup**: `deploy/backup.sh` runs `fart backup verify` after every backup; a failed check fails the unit.
+
+Step by step:
+
+1. **Back up first** (the migration only creates tables, but the habit stays):
+   ```bash
+   sudo systemctl start fart-backup.service; systemctl show -p Result fart-backup.service   # Result=success
+   ls -la /opt/fart/data/backup/
+   ```
+2. **Pull and install:**
+   ```bash
+   cd /opt/fart-src && git pull --ff-only && sudo deploy/install.sh
+   ```
+   The installer opens the database once as the `fart` user (schema migration 5 → 6: the three tables above;
+   it prints `user_version 6`), installs the units (unchanged) and restarts the daemons. `config/ingest.json`
+   gains `retention.candidates_days` 30 and `config/x.json` a `dryrun` block with the assumptions of the dry run;
+   neither is a rule file.
+3. **`.env`**: add the new name from `.env.example` (the installer never edits the file):
+   ```
+   X_MODE=
+   ```
+   Leave it empty (= `off` without a token, `shadow` with one). Jim's own rule applies: the key goes in only
+   after a day of watching without X. When the day comes, set `X_BEARER_TOKEN` in `/opt/fart/.env`, leave
+   `X_MODE` empty, and `sudo systemctl restart fart-social fart-engine`: the watch runs in shadow and the
+   measurement week is untouched. Never set `X_MODE=live` during the week; the engine would refuse it anyway
+   until `config/engine.json` carries `"x_live": true` (after the week, in a commit, with the new fingerprint
+   written into `config/measure.json` → `community_gate.frozen_rules` on purpose).
+4. **Verify after 15 minutes:**
+   ```bash
+   sudo -u fart /opt/fart/bin/fart status
+   #   schema_version: 6
+   #   x: bearer token not configured, mode off (X_MODE unset; live needs "x_live": true in config/engine.json), daily budget $3.00
+   #     -> with the token set and X_MODE empty: `mode shadow (X_MODE unset; ...)`; with X_MODE=live during the week an extra line
+   #        `x mode note: X_MODE=live refused: ... running shadow`
+   #   x shadow: decisions total=0 today=0; confirmations today=0 (confirmed within 1 h 0, within 24 h 0); daemons report social=off engine=off
+   #     -> the daemons report the mode they run (kv social.x_mode / engine.x_mode): both must say the same; `not started` means the
+   #        daemon has not run since the upgrade. In shadow the counters grow as fast posts and confirmation counts arrive.
+   #   engine candidates today: coins=N (with trades N, passed all thresholds N), metas=N (passed all N)  [fart engine explain --day ...]
+   #     -> coins counts up with every new probation coin; `with trades` is the data availability of the coin branch
+   #   backup: last verify ok at ... (fart-<stamp>.db.gz; coins N, migrations N, decisions N, outcomes N)   <- after the first backup run
+   #   failures: none; rules fingerprints (engine): <new commit>=sha256:e3bf4320c45c
+   journalctl -u fart-engine --since -15min --no-pager | grep -c tick_failed      # 0
+   journalctl -u fart-social -n 5 --no-pager                                       # social.started x_mode=off (or shadow with a token)
+   ```
+5. **Smoke tests** (nothing is sent, nothing is called; only `backup verify` writes, and only under `data/`):
+   ```bash
+   sudo -u fart /opt/fart/bin/fart social dryrun                      # the X calls and USD per kind per day, no HTTP
+   sudo -u fart /opt/fart/bin/fart engine explain --day 2026-10-27    # why (no) observations: candidates per threshold, distributions
+   sudo -u fart /opt/fart/bin/fart backup verify                      # unpacks the newest archive, quick_check, counts vs live
+   ```
+   Expected: the dry run shows `mega_search` 1440 requests/day, `kol_search` 480, `ca_counts` 96 per key, a
+   total under or over the `$3.00` cap with the reasons, and the hour table of the next 24 h (an asterisk marks
+   the peak hours; refused kinds name the rule: `hourly_envelope`, `account_watch_reserve`, `kol_daily_cap`,
+   `daily_cost_cap`). `engine explain` for 27 Oct shows the candidate counts of the first full measurement day
+   (`geen kandidaatgegevens` for a day before the upgrade is correct: the table starts with M6). `backup verify`
+   ends with `backup verify: OK` and exit 0; `systemctl start fart-backup.service` now ends with
+   `backup: verify ok` in `journalctl -u fart-backup` and `Result=success`; a failed check is `Result=exit-code`
+   with `VERIFY FAILED` in the journal (section 7).
+6. **The calibration** with the Alchemy dashboard (section 5c, step 5, and docs/UNVERIFIED.md) now has a
+   command: for one whole UTC day of M4+ running, read the dashboard's compute units of that day and run
+   ```bash
+   sudo -u fart /opt/fart/bin/fart budget calibrate --day 2026-10-27 --dashboard-cu <N>
+   ```
+   It prints our ledger per method, the implied CU per byte of the websocket frames, the documented value it is
+   closest to (0, 0.0002 or 0.04) and the `config/budget.json` line that follows; it writes nothing. Change
+   `rpc.cu_per_byte` in a commit (not a rule file: the fingerprint stays) and write the dashboard figures into
+   docs/UNVERIFIED.md.
+7. **The daily report** of 27 Oct (written 28 Oct 06:00 UTC) carries the two new sections; the X-schaduw section
+   says `Geen schaduwgegevens` until the token is set. The week report of the measurement week shows the X-schaduw
+   totals per day; the go/no-go test does not use them.
+8. **Rollback** to M5 code after the migration: M5 ignores the three new tables (nothing was changed in the old
+   ones); `fart-backup.service` on M5 code does not run the verify step. The pre-upgrade `.db` from step 1 is the
+   clean way back if you want the tables gone.
+
 ## 6. First-day checklist (docs/UNVERIFIED.md)
 
 1. `fart chain global`: reserves, supply, `fee_basis_points` 95 and `creator_fee_basis_points` 5 must
@@ -444,10 +546,13 @@ it), so the week report pools the new commit's `rules_version` with the frozen o
    stay small (a swap on a pool we never saw created is expected now and then).
 4. Compare `fart status` → `rpc CU today by method` with the Alchemy dashboard, in particular the CU per
    byte of the websocket frames (`ws_notification`, `ws_trade_notification`: 0.0002 or 0.04 per byte, or
-   not billed); adjust `config/budget.json` → `rpc.cu_per_byte` in a commit (docs/UNVERIFIED.md, "Solana
-   RPC / Alchemy", step by step in section 5c).
+   not billed): `fart budget calibrate --day <day> --dashboard-cu <N>` prints the implied factor and the config
+   line; adjust `config/budget.json` → `rpc.cu_per_byte` in a commit (docs/UNVERIFIED.md, "Solana RPC /
+   Alchemy", step by step in section 5c).
 5. Watch `coverage --hours 24` for a day: `grads_without_create` should be close to zero.
-6. X: compare the prices in `config/x.json` with the developer console; `fart status` → `x spend today`.
+6. X: compare the prices in `config/x.json` with the developer console (docs/UNVERIFIED.md says how);
+   `fart social dryrun` shows what the watch would cost per day before the token goes in, `fart status` →
+   `x spend today` what it cost once it runs (in shadow mode, during the week).
 7. Telegram: `fart notify test`, then watch `fart notify outbox` for `sent` rows.
 8. Week report (M5): `fart measure week --end <yesterday> --days 1` after 06:30 UTC; compare its universe row with
    the daily report of the same day; the bootstrap says `te weinig data` until the window has 3 covered days and
@@ -456,7 +561,58 @@ it), so the week report pools the new commit's `rules_version` with the frozen o
 ## 7. Backup and restore
 
 `fart-backup.timer` runs `deploy/backup.sh` daily: SQLite online backup API into
-`/opt/fart/data/backup/fart-<stamp>.db.gz` after `PRAGMA quick_check`, keeping 14 days.
+`/opt/fart/data/backup/fart-<stamp>.db.gz` after `PRAGMA quick_check`, keeping 14 days. Since milestone 6 the
+script then runs `fart backup verify`: the newest archive is unpacked into `data/backup/.verify-<pid>/`,
+`PRAGMA quick_check` runs on the copy, the row counts of `coins`, `migrations`, `decisions` and `outcomes` are
+compared with the live database (live ≥ archive: those tables only grow), the copy is removed and the result
+printed and kept in kv (`fart status` → `backup: last verify ...`). A failed check exits 1 and the unit ends
+`failed`:
+
+```bash
+systemctl show -p Result,ExecMainStatus fart-backup.service   # Result=success ExecMainStatus=0, or Result=exit-code ExecMainStatus=1
+journalctl -u fart-backup -n 12 --no-pager                     # "backup verify: OK ..." and "backup: verify ok", or "VERIFY FAILED"
+sudo -u fart /opt/fart/bin/fart backup verify                  # by hand, any time; exit 0 ok, 1 failed, 2 no archive
+```
+
+A failed verify means the newest archive does not restore (bad gzip, `quick_check` not ok) or the live
+database has fewer rows than the archive in a table that never shrinks (rows were lost, or the archive is not
+ours): keep the previous archives, stop the daemons, look before restoring anything.
+
+**Offsite copy (manual, by the deployer).** The archives live on the same disk as the database. Copy the newest
+one to a second location after the daily run (05:30 UTC) from your own machine, never from the VPS outwards:
+
+```bash
+# on your machine: the newest archive and its size, then the copy
+NEWEST=$(ssh root@<vps> 'ls -1 /opt/fart/data/backup/fart-*.db.gz | sort | tail -1')
+ssh root@<vps> "ls -la $NEWEST"
+scp "root@<vps>:$NEWEST" ~/fart-offsite/
+gzip -t ~/fart-offsite/$(basename "$NEWEST") && echo "offsite copy ok"
+```
+
+Keep the last few; one copy per week is the minimum, one per day is cheap (an archive is a few tens of MB).
+
+**Restore drill (do it once after the M6 upgrade, and after every schema migration).** Nothing here touches
+the live database or the daemons; the archive is restored into an empty `FART_ROOT` and read with `fart status`:
+
+```bash
+# 1. an empty root the fart user can write to
+sudo -u fart mkdir -p /tmp/fart-restore/data
+# 2. the newest archive, unpacked as the database of that root
+NEWEST=$(ls -1 /opt/fart/data/backup/fart-*.db.gz | sort | tail -1)
+sudo -u fart bash -c "gunzip -c $NEWEST > /tmp/fart-restore/data/fart.db"
+# 3. status against the restored copy: FART_ROOT points at the empty root, the code is the installed app
+sudo -u fart env FART_ROOT=/tmp/fart-restore /opt/fart/bin/fart status
+#    expected: schema_version 6, counts: coins=N, migrations=N, decisions=N, outcomes=N ... the same numbers (or slightly
+#    lower: the archive is older) as `fart backup verify` printed for that archive; `freshness` empty (nothing runs there)
+sudo -u fart env FART_ROOT=/tmp/fart-restore /opt/fart/bin/fart measure report --day $(date -u -d yesterday +%F)
+#    optional: yesterday's report from the copy, written to /tmp/fart-restore/out/recall/ (sends nothing)
+# 4. clean up
+sudo rm -rf /tmp/fart-restore
+```
+
+Note that `/tmp/fart-restore` is a plain directory: the systemd units never see it (`PrivateTmp`), and the
+drill works equally well in `/opt/fart/data/restore-drill` (inside `ReadWritePaths`) when `/tmp` is small.
+The real restore (below) is the same `gunzip -c` into `/opt/fart/data/fart.db` with the daemons stopped.
 
 Restore (stops the daemons; raw gz files and out/ are untouched):
 
@@ -497,6 +653,9 @@ old rows stay, new rows get the old version string again.
 | `engine.tick_failed` in `failures:` growing | a tick still fails after 3 retries | read `engine.tick_failed.last` in `status --json` and `journalctl -u fart-engine`; a lock holder longer than 15 s is a bug, not expected |
 | `ingest.handle_failed.<source>` in `failures:` growing | a handler could not write after 3 retries | the message is in the raw store: `fart ingest replay --source <source> --since <time>` after fixing the cause |
 | `fart-backup.service` `Result=signal` (exit 159) | the M2 script's `gzip -f` was killed by the syscall filter (`fchown`) | upgrade to M3 (`deploy/backup.sh` uses `gzip -n -c`); the `.db` written before the kill is complete |
+| `fart-backup.service` `Result=exit-code` with `VERIFY FAILED` in the journal (M6) | the newest archive does not restore, or the live database has fewer rows than the archive in a table that only grows | `fart backup verify` by hand shows which; keep the older archives; a bad archive after a good backup line points at the disk, lost live rows at something that deleted (`decisions`/`outcomes` cannot be deleted: triggers) |
+| `x mode note: X_MODE=live refused` in `status` (M6) | `X_MODE=live` without `"x_live": true` in `config/engine.json` | expected during the measurement week: the watch runs in shadow; after the week the key is a commit (new fingerprint) |
+| `x shadow: ... daemons report social=shadow engine=off` (M6) | the two daemons read different `.env` states (one was not restarted) | `sudo systemctl restart fart-social fart-engine`; both must report the same mode |
 | `ws_subscriptions.notifications` grows but `trades` with `source='rpc_trades'` stays 0 | TradeEvents do not arrive on the bonding-curve address | set `config/ingest.json` → `rpc_trades.mention` to `"mint"` and restart |
 | `decode.pump_amm_pool_mismatch` counting up | the pump-amm BuyEvent/SellEvent layout differs from `fart/chain/events.py` | inspect `raw_undecoded` / `fart events classify`; fix the layout (docs/PUMPFUN-EVENTS.md) |
 | `global.check_mismatch` at ingest start / `fart chain global` exit 1 | config/pumpfun.json differs from the chain | update the config (one commit = new `rules_version`); a mismatch never stops the daemons |

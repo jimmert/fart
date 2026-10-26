@@ -92,8 +92,9 @@ chmod 0640 "$FART_ROOT/.env"
 # Milestone 3 (user_version 3) also removes the rows the USDC/PUMP "migrations" caused and prints
 # the counts (kv schema.v3.cleanup); milestone 4 (user_version 4) closes the milestone-2 graduation
 # watchlist rows and flags migrations without a create (kv schema.v4.cleanup); milestone 5 (user_version 5)
-# trims the meta_burst watchlist rows above the engine's bound of 40 (kv schema.v5.cleanup); a second run
-# changes nothing.
+# trims the meta_burst watchlist rows above the engine's bound of 40 (kv schema.v5.cleanup); milestone 6
+# (user_version 6) only creates the tables shadow_decisions, shadow_confirmations and engine_candidates; a
+# second run changes nothing.
 if [ -f "$FART_ROOT/data/fart.db" ]; then
   if STATUS_JSON="$(sudo -u "$FART_USER" "$FART_ROOT/bin/fart" --quiet --json status 2>/dev/null)"; then
     log "database schema: $(printf '%s' "$STATUS_JSON" | "$VENV/bin/python" -c 'import json,sys
@@ -143,7 +144,10 @@ echo "  journalctl -u fart-ingest -n 50 --no-pager"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart coverage --hours 3"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart chain global        # Global account vs config/pumpfun.json"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart events classify     # undecoded event discriminators"
-echo "  systemctl start fart-backup.service && systemctl show -p Result,ExecMainStatus fart-backup.service   # backup fix (M3)"
+echo "  systemctl start fart-backup.service && systemctl show -p Result,ExecMainStatus fart-backup.service   # backup + verify (M3, M6)"
+echo "  sudo -u $FART_USER $FART_ROOT/bin/fart backup verify                                 # restore check of the newest archive (M6)"
+echo "  sudo -u $FART_USER $FART_ROOT/bin/fart social dryrun                                 # X calls and USD per day, no HTTP (M6)"
+echo "  sudo -u $FART_USER $FART_ROOT/bin/fart engine explain --day $(date -u +%F)             # why (no) observations today (M6)"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart measure week --end $(date -u -d yesterday +%F 2>/dev/null || date -u +%F) --days 1   # week report smoke test (M5), sends nothing"
 echo "  systemctl list-timers 'fart-*' --no-pager                          # fart-measure-week.timer daily 06:30 UTC"
 echo "  tail -f $FART_ROOT/logs/ingest.log"

@@ -42,6 +42,7 @@ def test_backup_script_end_to_end(tmp_path):
     assert res.returncode == 0, res.stdout + res.stderr
     out = res.stdout
     assert "quick_check=ok coins=2 decisions=0" in out and "gzip -t ok" in out
+    assert "backup verify: OK" in out and "backup: verify ok" in out  # milestone 6: the restore check runs after every backup
     assert "backup: removed" in out and not old.exists()  # the retention step ran this time
     archives = sorted(dest.glob("fart-*.db.gz"))
     assert len(archives) == 1 and not list(dest.glob("fart-*.db")) and not list(dest.glob("*.tmp"))

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # SQLite online backup (backup API) + quick_check; keeps $KEEP_DAYS days under $FART_ROOT/data/backup.
 # Runs as the fart user (systemd fart-backup.timer) or manually: sudo -u fart deploy/backup.sh
+# Milestone 6: after the archive is written, `fart backup verify` unpacks the newest archive under data/,
+# runs quick_check on the copy and compares its row counts with the live database; a failed check exits 1,
+# so the unit ends `failed` and `systemctl show -p Result fart-backup.service` shows it.
 #
 # Compression never uses `gzip -f FILE`: gzip then copies the ownership of the input onto the output
 # with fchown(2), which the unit's SystemCallFilter (~@privileged contains @chown) kills with SIGSYS
@@ -10,6 +13,7 @@ set -euo pipefail
 FART_ROOT="${FART_ROOT:-/opt/fart}"
 PY="${PY:-$FART_ROOT/venv/bin/python}"
 [ -x "$PY" ] || PY=python3
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # the checkout or /opt/fart/app: `python -m fart` runs from here
 DB="$FART_ROOT/data/fart.db"
 DEST="$FART_ROOT/data/backup"
 KEEP_DAYS="${KEEP_DAYS:-14}"
@@ -53,3 +57,9 @@ echo "backup: compressed $OUT.gz (gzip -t ok)"
 # retention: archives older than KEEP_DAYS days
 find "$DEST" -name 'fart-*.db.gz' -type f -mtime "+$KEEP_DAYS" -print -delete | sed 's/^/backup: removed /' || true
 echo "backup: done $(ls -1 "$DEST" | wc -l) file(s) kept"
+# restore check (milestone 6): unpack the newest archive, quick_check it, compare row counts with the live database
+if ! (cd "$APP_DIR" && FART_ROOT="$FART_ROOT" "$PY" -m fart --quiet backup verify); then
+  echo "backup: VERIFY FAILED for the newest archive (see above); the unit fails on purpose" >&2
+  exit 1
+fi
+echo "backup: verify ok"

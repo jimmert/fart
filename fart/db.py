@@ -2,7 +2,8 @@
 and the ONE way to write: `write_tx()`.
 
 Time columns: `slot`/`block_time` are chain time, `received_at`/`created_at`/`measured_at`
-are our clock. `decisions` and `outcomes` are append-only (enforced by triggers).
+are our clock. `decisions` and `outcomes` are append-only (enforced by triggers); so are the milestone-6
+shadow tables `shadow_decisions` and `shadow_confirmations`.
 
 Write rules (milestone 3, after the VPS lock storm of 26 Oct 2026):
 
@@ -34,7 +35,7 @@ from .util import day_key
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 BUSY_TIMEOUT_MS = 15000
 WRITE_RETRY_ATTEMPTS = 3
@@ -564,6 +565,102 @@ def _migrate_v5(conn: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[5] = _migrate_v5
+
+
+# ----- schema version 6 (milestone 6) --------------------------------------------------------------
+# Three new tables, no new columns, no cleanup; every statement is idempotent.
+# * `shadow_decisions`: what the X layer WOULD have written to `decisions` while X runs in shadow mode
+#   (X_MODE unset or `shadow` with a bearer token): the same columns as `decisions` plus `would_kind`, the
+#   `decisions.kind` the row would have had (`fast_post`). `kind` is always `shadow`. Append-only like
+#   `decisions`, never read by the engine, the notifier or the tracker; the reports count them.
+# * `shadow_confirmations`: every X confirmation count (counts/recent per key) taken in shadow mode, linked to
+#   the observe / observe_meta decision it would have confirmed, with the threshold of the moment and whether
+#   the last hour / the last 24 h reached it. In live mode the same counts go to `social_counts` and reach the
+#   features; in shadow mode they never do. Append-only.
+# * `engine_candidates`: one row per UTC day per watched coin (kind `coin`, key = mint) and per meta term the
+#   engine ranked (kind `meta`, key = term) with the highest value of every threshold feature seen in any tick
+#   of that day, the number of ticks, the watchlist reason at first sight and whether every threshold was met
+#   at once in some tick. Written in the engine's decision transaction (an UPSERT per coin and term per tick);
+#   `fart engine explain --day` and the daily report read it. `features_asof` stays what it was: a snapshot per
+#   decision (a row per watched coin per 15 s tick would be over a million rows a day). Pruned by retention
+#   (config/ingest.json -> retention.candidates_days).
+SCHEMA_V6_SQL = [
+    """CREATE TABLE IF NOT EXISTS shadow_decisions(
+        id            INTEGER PRIMARY KEY,
+        as_of         REAL NOT NULL,
+        created_at    REAL NOT NULL,
+        kind          TEXT NOT NULL,
+        mint          TEXT,
+        term          TEXT,
+        features_json TEXT NOT NULL,
+        rules_version TEXT NOT NULL,
+        verdict       TEXT NOT NULL,
+        reasons_json  TEXT NOT NULL,
+        would_kind    TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS shadow_decisions_as_of ON shadow_decisions(as_of)",
+    "CREATE INDEX IF NOT EXISTS shadow_decisions_term ON shadow_decisions(would_kind, term)",
+    """CREATE TRIGGER IF NOT EXISTS shadow_decisions_no_update BEFORE UPDATE ON shadow_decisions
+        BEGIN SELECT RAISE(ABORT, 'shadow_decisions is append-only'); END""",
+    """CREATE TRIGGER IF NOT EXISTS shadow_decisions_no_delete BEFORE DELETE ON shadow_decisions
+        BEGIN SELECT RAISE(ABORT, 'shadow_decisions is append-only'); END""",
+    """CREATE TABLE IF NOT EXISTS shadow_confirmations(
+        id             INTEGER PRIMARY KEY,
+        ts             REAL NOT NULL,
+        decision_id    INTEGER,
+        decision_kind  TEXT,
+        decision_as_of REAL,
+        key            TEXT NOT NULL,
+        kind           TEXT NOT NULL,
+        n_last_hour    INTEGER,
+        n_24h          INTEGER,
+        query          TEXT,
+        threshold      INTEGER NOT NULL,
+        confirmed_1h   INTEGER NOT NULL DEFAULT 0,
+        confirmed_24h  INTEGER NOT NULL DEFAULT 0,
+        rules_version  TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS shadow_confirmations_ts ON shadow_confirmations(ts)",
+    "CREATE INDEX IF NOT EXISTS shadow_confirmations_decision ON shadow_confirmations(decision_id)",
+    """CREATE TRIGGER IF NOT EXISTS shadow_confirmations_no_update BEFORE UPDATE ON shadow_confirmations
+        BEGIN SELECT RAISE(ABORT, 'shadow_confirmations is append-only'); END""",
+    """CREATE TRIGGER IF NOT EXISTS shadow_confirmations_no_delete BEFORE DELETE ON shadow_confirmations
+        BEGIN SELECT RAISE(ABORT, 'shadow_confirmations is append-only'); END""",
+    """CREATE TABLE IF NOT EXISTS engine_candidates(
+        day                         TEXT NOT NULL,
+        kind                        TEXT NOT NULL,
+        key                         TEXT NOT NULL,
+        first_as_of                 REAL NOT NULL,
+        last_as_of                  REAL NOT NULL,
+        ticks                       INTEGER NOT NULL DEFAULT 0,
+        reason                      TEXT,
+        rules_version               TEXT,
+        max_unique_buyers_5m        INTEGER,
+        max_net_sol_5m              REAL,
+        min_largest_buyer_share_15m REAL,
+        max_largest_buyer_share_15m REAL,
+        bundled_last                INTEGER,
+        bundled_ever                INTEGER NOT NULL DEFAULT 0,
+        max_trades_total            INTEGER,
+        passed_momentum             INTEGER NOT NULL DEFAULT 0,
+        passed_all                  INTEGER NOT NULL DEFAULT 0,
+        max_burst_ratio             REAL,
+        burst_inf                   INTEGER NOT NULL DEFAULT 0,
+        max_sol_inflow              REAL,
+        max_unique_buyers           INTEGER,
+        max_n_coins                 INTEGER,
+        max_distinct_creators       INTEGER,
+        PRIMARY KEY(day, kind, key)
+    ) WITHOUT ROWID""",
+]
+
+
+def _migrate_v6(conn: sqlite3.Connection) -> None:
+    for stmt in SCHEMA_V6_SQL:
+        conn.execute(stmt)
+
+
+MIGRATIONS[6] = _migrate_v6
 
 
 def _apply_pragmas(conn: sqlite3.Connection, readonly: bool) -> None:

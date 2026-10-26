@@ -38,7 +38,8 @@
     "raw_days": 30,
     "trades_days": 14,
     "samples_days": 30,
-    "api_ledger_days": 30
+    "api_ledger_days": 30,
+    "candidates_days": 30
   },
   "rpc_trades": {
     "_comment": "per-mint logsSubscribe over the keyed RPC websocket, BEFORE graduation only (reasons): the bonding curve PDA (mention 'bonding_curve') or the mint ('mint'). No pool subscriptions after graduation (one hot pool cost 79,604 notifications in 2 h on 26 Oct 2026); graduated coins are measured by the 5-minute DexScreener sampling of the tracker. max_notifications_per_subscription_per_hour: above it the subscription is dropped for the rest of its hour and counted. daily_cu_share (milestone 4, replaces hourly_cu_fraction): the share of the daily CU cap the stream's own frames (ledger methods ws_trade_*) may use over a whole day; the hourly envelope is daily_cu_share / 24 of the cap (0.35 -> 1.46% per hour, 43,750 CU at a 3,000,000 cap), so rpc_logs, enrich and the engine always keep the remaining 65%. The VPS override of 26 Oct 2026 (hourly_cu_fraction 0.015 = 36% per day) is where this value comes from. unsubscribe_after_s / subscribe_after_syncs: the hysteresis of sync_messages(): a mint is unsubscribed only after it has been undesired for that long, and subscribed only after it was desired in that many consecutive syncs (sync_interval_s apart), so a watchlist flicker never reaches the websocket. log_interval_s: the rpc_trades.subscriptions log line is written when the set changes and otherwise once per this interval.",

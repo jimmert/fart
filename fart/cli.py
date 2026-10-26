@@ -5,7 +5,19 @@
                          re-feed the raw hour files of one source (pumpportal | rpc_logs | rpc_trades) to its handler,
                          data writes only, idempotent; T = ISO-8601 (2026-10-26T08:00Z) or unix seconds
   engine                 daemon: candidate engine v0 (15 s loop), observations only
-  social [--once]        daemon: X mega-account / KOL watch + CA confirmation (15 s loop); --once runs one tick
+  engine explain --day D read-only: why the coin and theme branches gave (no) observations on day D: candidate maxima per
+                         threshold, the distribution per feature, probation data availability per hour next to the trade-stream
+                         gaps (milestone 6; the daily report carries the same table). Thresholds unchanged, no advice.
+  social [--once]        daemon: X mega-account / KOL watch + CA confirmation (15 s loop); --once runs one tick.
+                         X_MODE off | shadow (default with a token: nothing reaches decisions) | live (needs the x_live rules key)
+  social dryrun [--hours N] [--arrival uniform|envelope]
+                         no HTTP: requests and USD per kind per day from config/x.json, the current confirmation keys and the
+                         observed post rates; the next N hours through the envelope, reserve and KOL cap (milestone 6)
+  backup verify          unpack the newest data/backup/fart-*.db.gz under data/, quick_check, row counts vs the live database
+                         (live >= archive), clean up; exit 1 on failure, 2 without an archive (deploy/backup.sh calls it)
+  budget calibrate --day D --dashboard-cu N
+                         implied CU per byte of the websocket frames from the day's api_ledger and the Alchemy dashboard total;
+                         prints the config/budget.json value that follows and what it means per day; writes nothing
   notify [--once]        daemon: Telegram outbox builder + sender to the owner chat (20 s loop)
   notify test            send one test message to the owner chat (only when TELEGRAM_NOTIFY_ENABLED=1)
   notify outbox          list the last 20 outbox rows
@@ -46,9 +58,23 @@ def _parser() -> argparse.ArgumentParser:
     ing.add_argument("--source", choices=["pumpportal", "rpc_logs", "rpc_trades"], help="replay: which raw store")
     ing.add_argument("--since", help="replay: start (ISO-8601 or unix seconds)")
     ing.add_argument("--until", help="replay: end (ISO-8601 or unix seconds; default now)")
-    sub.add_parser("engine")
+    en = sub.add_parser("engine")
+    en.add_argument("ecmd", nargs="?", choices=["explain"], help="explain (default: run the daemon)")
+    en.add_argument("--day", help="explain: UTC day YYYY-MM-DD (default: today)")
     so = sub.add_parser("social")
+    so.add_argument("scmd", nargs="?", choices=["dryrun"], help="dryrun (default: run the daemon)")
     so.add_argument("--once", action="store_true", help="run one tick and print the summary")
+    so.add_argument("--hours", type=int, default=24, help="dryrun: hours to walk through the envelope from the current UTC hour (default 24)")
+    so.add_argument("--arrival", choices=["uniform", "envelope"], default="uniform",
+                    help="dryrun: how the day's posting volume arrives over the hours (default uniform)")
+    bk = sub.add_parser("backup")
+    bks = bk.add_subparsers(dest="bcmd", required=True)
+    bks.add_parser("verify")
+    bu = sub.add_parser("budget")
+    bus = bu.add_subparsers(dest="bucmd", required=True)
+    cal = bus.add_parser("calibrate")
+    cal.add_argument("--day", required=True, help="UTC day YYYY-MM-DD of the Alchemy dashboard figure")
+    cal.add_argument("--dashboard-cu", type=float, required=True, help="the dashboard's compute units for that UTC day (all methods together)")
     no = sub.add_parser("notify")
     no.add_argument("ncmd", nargs="?", choices=["test", "outbox"], help="test | outbox (default: run the daemon)")
     no.add_argument("--once", action="store_true", help="run one tick and print the summary")
@@ -112,7 +138,7 @@ def cmd_status(settings, as_json: bool) -> int:
             out["trades_by_source_today"] = {r[0]: r[1] for r in conn.execute(
                 "SELECT source, COUNT(*) FROM trades WHERE received_at >= ? GROUP BY source", (day_start(t),))}
             kv = _kv_prefixed(conn, ("ingest.", "engine.", "measure.", "retention.", "decode.", "pp.", "chain.", "social.", "notify.", "x.",
-                                     "rpc_trades.", "enrich.", "schema."))
+                                     "rpc_trades.", "enrich.", "schema.", "backup."))
             ages = {}
             for k in ("ingest.heartbeat", "ingest.pumpportal.last_msg_at", "ingest.rpc_logs.last_msg_at", "ingest.rpc_trades.last_msg_at",
                       "engine.heartbeat", "measure.track.last_run", "measure.report.last_run", "measure.week.last_run", "social.heartbeat",
@@ -175,6 +201,15 @@ def cmd_status(settings, as_json: bool) -> int:
             out["outbox"] = {r[0]: r[1] for r in conn.execute("SELECT status, COUNT(*) FROM outbox GROUP BY status")}
             last_dec = conn.execute("SELECT MAX(as_of) FROM decisions").fetchone()[0]
             out["last_decision_at"] = utc_iso(last_dec) if last_dec else None
+            # milestone 6: the X mode as the daemons run it, the shadow counters, the engine's candidate rows, the last backup check
+            from .social.shadow import status_counters
+
+            out["x_mode"] = {"effective": settings.x_mode, "requested": settings.x_mode_requested or "unset", "note": settings.x_mode_note,
+                             "live_allowed": settings.x_live_allowed, "social_daemon": kv.get("social.x_mode"), "engine_daemon": kv.get("engine.x_mode")}
+            out["x_shadow"] = status_counters(conn, t)
+            out["engine_candidates_today"] = {r[0]: {"rows": int(r[1]), "with_trades": int(r[2] or 0), "passed_all": int(r[3] or 0)} for r in conn.execute(
+                "SELECT kind, COUNT(*), SUM(COALESCE(max_trades_total, 0) > 0), SUM(passed_all) FROM engine_candidates WHERE day=? GROUP BY kind", (day_key(t),))}
+            out["backup_verify_last"] = json.loads(kv["backup.verify.last"]) if kv.get("backup.verify.last") else None
         finally:
             conn.close()
     if as_json:
@@ -184,8 +219,12 @@ def cmd_status(settings, as_json: bool) -> int:
     print(f"fart status  rules_version={out['rules_version']}  root={settings.root}")
     print(f"  rpc: {s['rpc_http']} ({'PUBLIC fallback, no key' if s['rpc_is_public'] else 'keyed'})  daily CU cap {s['rpc_daily_budget_cu']}")
     print(f"  pumpportal: {s['pumpportal']}  api key: {s['pumpportal_api_key']}  trades: {s['pumpportal_trades']}")
-    print(f"  x: bearer token {s['x_bearer_token']}, daily budget ${s['x_daily_budget_usd']:.2f}   telegram: {s['telegram']}, notify "
+    print(f"  x: bearer token {s['x_bearer_token']}, mode {s['x_mode']} (X_MODE {s['x_mode_requested']}"
+          + ("; live allowed by config/engine.json x_live" if s.get("x_live_allowed") else "; live needs \"x_live\": true in config/engine.json")
+          + f"), daily budget ${s['x_daily_budget_usd']:.2f}   telegram: {s['telegram']}, notify "
           f"{'enabled' if s['telegram_notify_enabled'] else 'disabled (TELEGRAM_NOTIFY_ENABLED)'}")
+    if s.get("x_mode_note"):
+        print(f"  x mode note: {s['x_mode_note']}")
     print(f"  telegram community: {s.get('telegram_community', 'not configured')}, "
           f"{'ENABLED' if s.get('telegram_community_enabled') else 'disabled (TELEGRAM_COMMUNITY_ENABLED=0 or no chat id)'}, "
           f"preview to owner {'on' if s.get('telegram_community_preview') else 'off'}")
@@ -248,6 +287,23 @@ def cmd_status(settings, as_json: bool) -> int:
         print("  rules fingerprints (engine): " + ", ".join(f"{k}={str(v)[:19]}" for k, v in sorted(out["rules_fingerprints"].items())))
     if out.get("week_report_last_end_day"):
         print(f"  week report: last end day {out['week_report_last_end_day']}")
+    xm = out.get("x_mode") or {}
+    xs = out.get("x_shadow") or {}
+    print(f"  x shadow: decisions total={xs.get('decisions_total', 0)} today={xs.get('decisions_today', 0)}; confirmations today={xs.get('confirmations_today', 0)}"
+          f" (confirmed within 1 h {xs.get('confirmed_1h_today', 0)}, within 24 h {xs.get('confirmed_24h_today', 0)});"
+          f" daemons report social={xm.get('social_daemon') or 'not started'} engine={xm.get('engine_daemon') or 'not started'}"
+          + (f"; last shadow decision {utc_iso(xs['last_decision_at'])}" if xs.get("last_decision_at") else ""))
+    ec = out.get("engine_candidates_today") or {}
+    cc, mc = ec.get("coin") or {}, ec.get("meta") or {}
+    print(f"  engine candidates today: coins={cc.get('rows', 0)} (with trades {cc.get('with_trades', 0)}, passed all thresholds {cc.get('passed_all', 0)}),"
+          f" metas={mc.get('rows', 0)} (passed all {mc.get('passed_all', 0)})  [fart engine explain --day {day_key(now())}]")
+    bv = out.get("backup_verify_last")
+    if bv:
+        cts = bv.get("counts") or {}
+        detail = (str(bv.get("archive") or "").rsplit("/", 1)[-1] + "; " + ", ".join(f"{k} {v.get('archive')}" for k, v in cts.items())) if bv.get("archive") else "no archive"
+        print(f"  backup: last verify {bv.get('status', '?')} at {bv.get('checked_at')} ({detail})" + (f" errors={json.dumps(bv.get('errors'))}" if bv.get("errors") else ""))
+    else:
+        print("  backup: never verified (fart backup verify; deploy/backup.sh runs it after every backup)")
     mu = out["migrations_coin_unknown"]
     if mu["total"]:
         print(f"  graduations without a known create (coin_unknown, never watched): {mu['total']} total, {mu['today']} today")
@@ -469,11 +525,80 @@ def cmd_ingest_replay(settings, source: str | None, since: str | None, until: st
     return 0 if stats["errors"] == 0 else 1
 
 
+def cmd_engine_explain(settings, day: str, as_json: bool) -> int:
+    """Read-only: the day's candidate maxima against the thresholds (milestone 6)."""
+    from .engine.explain import build_explain, render_text
+
+    if not settings.db_path.exists():
+        print("no database yet")
+        return 0
+    try:
+        day_bounds_check(day)
+    except ValueError:
+        print(f"bad day: {day} (YYYY-MM-DD)")
+        return 2
+    conn = db.connect_ro(settings.db_path)
+    try:
+        if not _table_exists(conn, "engine_candidates"):
+            print("the database has no engine_candidates table yet (schema v6): start the daemons once after the milestone 6 upgrade")
+            return 2
+        res = build_explain(conn, settings, day, now())
+    finally:
+        conn.close()
+    print(json.dumps(res, indent=2, default=str) if as_json else render_text(res))
+    return 0
+
+
+def day_bounds_check(day: str) -> float:
+    from .util import day_bounds
+
+    return day_bounds(day)[0]
+
+
+def _table_exists(conn, name: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def cmd_social_dryrun(settings, hours: int, arrival: str, as_json: bool) -> int:
+    """No HTTP: the X calls and USD per kind per day, and the next hours through the envelope (milestone 6)."""
+    from .social.dryrun import build, render_text
+
+    conn = db.connect(settings.db_path)  # creates an empty database when none exists: the estimate then rests on the assumptions
+    try:
+        res = build(conn, settings, now(), max(1, int(hours)), arrival)
+    finally:
+        conn.close()
+    print(json.dumps(res, indent=2, default=str) if as_json else render_text(res))
+    return 0
+
+
+def cmd_budget_calibrate(settings, day: str, dashboard_cu: float, as_json: bool) -> int:
+    """Read-only: the implied CU per byte from the ledger and the dashboard total (milestone 6)."""
+    from .net.calibrate import calibrate, render_text
+
+    if not settings.db_path.exists():
+        print("no database yet")
+        return 2
+    try:
+        day_bounds_check(day)
+    except ValueError:
+        print(f"bad day: {day} (YYYY-MM-DD)")
+        return 2
+    conn = db.connect_ro(settings.db_path)
+    try:
+        res = calibrate(conn, settings, day, float(dashboard_cu))
+    finally:
+        conn.close()
+    print(json.dumps(res, indent=2, default=str) if as_json else render_text(res))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     settings = load_settings(root=args.root)
     settings.ensure_dirs()
-    daemon = (args.cmd == "ingest" and not args.icmd) or args.cmd in ("engine", "social") or (args.cmd == "measure") or (args.cmd == "notify" and not args.ncmd)
+    daemon = ((args.cmd == "ingest" and not args.icmd) or (args.cmd == "engine" and not args.ecmd) or (args.cmd == "social" and not args.scmd)
+              or (args.cmd == "measure") or (args.cmd == "notify" and not args.ncmd))
     setup_logging(settings.logs_dir if daemon else None, args.cmd if args.cmd != "measure" else f"measure-{args.mcmd}", stderr=not args.quiet)
     if args.cmd == "status":
         return cmd_status(settings, args.json)
@@ -492,13 +617,23 @@ def main(argv: list[str] | None = None) -> int:
 
         return run_ingest(settings)
     if args.cmd == "engine":
+        if args.ecmd == "explain":
+            return cmd_engine_explain(settings, args.day or day_key(now()), args.json)
         from .engine.service import run_engine
 
         return run_engine(settings)
     if args.cmd == "social":
+        if args.scmd == "dryrun":
+            return cmd_social_dryrun(settings, args.hours, args.arrival, args.json)
         from .social.service import run_social
 
         return run_social(settings, once=args.once)
+    if args.cmd == "backup":
+        from .backup import cmd_verify
+
+        return cmd_verify(settings, args.json)
+    if args.cmd == "budget":
+        return cmd_budget_calibrate(settings, args.day, args.dashboard_cu, args.json)
     if args.cmd == "notify":
         from .notify import service as ns
 
