@@ -81,3 +81,21 @@ def test_status_json_has_milestone2_fields(settings, capsys):
     assert main(["--root", str(settings.root), "--quiet", "status"]) == 0
     out = capsys.readouterr().out
     assert "trades: rpc only (no key)" in out and "not configured" in out
+
+
+def test_env_example_names_every_setting_without_values():
+    from pathlib import Path
+
+    from fart.config import ENV_KEYS
+
+    text = (Path(__file__).resolve().parent.parent / ".env.example").read_text()
+    names = {}
+    for line in text.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s:
+            k, v = s.split("=", 1)
+            names[k.strip()] = v.strip()
+    assert set(ENV_KEYS) <= set(names), set(ENV_KEYS) - set(names)
+    for k in ("RPC_HTTP_URL", "RPC_WSS_URL", "PUMPPORTAL_API_KEY", "X_BEARER_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_CHAT_ID"):
+        assert names[k] == "", k  # secrets are named, never valued
+    assert names["TELEGRAM_NOTIFY_ENABLED"] == "0" and names["X_DAILY_BUDGET_USD"] == "3.00"
