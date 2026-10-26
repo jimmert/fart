@@ -1,4 +1,4 @@
-"""The website (milestone 8): `fart web`.
+"""The website (milestones 8 and 9): `fart web`.
 
 A standard-library HTTP server (`http.server.ThreadingHTTPServer`) that listens on the loopback only
 (`FART_WEB_BIND`, default 127.0.0.1:8792) behind the VPS's shared Caddy (`deploy/caddy/fart.caddy`), shows the
@@ -7,7 +7,14 @@ operational data of fart in Dutch behind a login, and changes nothing: the datab
 writes is its own log (`logs/web.log`). No framework, no external script, font or tracker; one small CSS and one
 small JS file of our own, served under `/static/` (the only paths that need no session: they carry no data).
 
-Modules:
+Milestone 9 splits the site in a public section (the live dashboard, the observations, the measurement, the reports, the
+method, the tools placeholder, `/api/public/*`; `FART_WEB_PUBLIC=1`, the default) and the owner section behind the login
+(`/eigenaar`, the raw Markdown reports, `/api/*`). Modules:
+
+* `public`   the public views: only public fields, the honesty rules on every number, the live dashboard data.
+* `charts`   inline SVG charts rendered on the server, with a text summary for screen readers.
+* `theme`    the accent colour of `config/web.json` as a stylesheet override (no inline style).
+
 
 * `auth`     the owner account (scrypt hash in `.env`), signed session cookies (HMAC, 12 h, HttpOnly, Secure,
              SameSite=Strict), the CSRF token of the login form, and the login guard (5 failed attempts per 10 minutes

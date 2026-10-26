@@ -263,7 +263,7 @@ counts of `coins`, `migrations`, `decisions` and `outcomes` compared with the li
 the copy removed; a failure exits 1 and fails the unit; the result lands in kv `backup.verify.last` for
 `fart status`. The offsite copy (scp from a second machine) and the restore drill are in `deploy/DEPLOY.md`.
 
-## Website (milestone 8)
+## Website (milestones 8 and 9)
 
 `fart web` (`fart/web/server.py`) is a `ThreadingHTTPServer` from the standard library on `FART_WEB_BIND`
 (`127.0.0.1:8792`); the shared Caddy of the VPS (`deploy/caddy/fart.caddy`, imported by its Caddyfile) terminates TLS for
@@ -298,6 +298,23 @@ or a day NIET GEDEKT stays empty, an unknown outcome stays "onbekend", a decisio
   reading the body; Caddy enforces the same with `request_body`), a socket timeout of 30 s, HTTP/1.1 with explicit
   lengths. The log has the method, the path without its query, the status, the duration and the client IP (the last
   `X-Forwarded-For` entry that Caddy appends), never a cookie, a password, a token or a body.
+* **Public section (milestone 9)** (`fart/web/public.py`, `fart/web/charts.py`, `fart/web/theme.py`): with `FART_WEB_PUBLIC=1`
+  (the default) the dashboard, `/observaties`, `/meting`, `/rapporten` (every report as a structured page), `/methode`, `/tools`
+  and `/api/public/*` need no session; the owner section (`/eigenaar`, the raw Markdown reports, `/api/*`) keeps the login.
+  The public views are a separate module that returns only public fields (a test flattens every public JSON document and
+  proves that no owner vocabulary, path, address or secret occurs in it). The dashboard is processed data, live: the watched
+  coins with the most net SOL inflow in the last five minutes (the radar has every trade of the coins on its watchlist and
+  of no other), the newest coins, the themes the engine's own clustering finds right now (the same functions and thresholds,
+  read-only), the latest graduations with the tracker's newest sample and the 24 h outcome under the reports' tracker rule,
+  what the X layer sees (honest about its state: off, shadow, live), today's observations and one line of measurement; the
+  measurement itself (the frozen week, the coverage strip, the reports) lives on `/meting`. Every expensive view is computed
+  at most once per 15 s (live) or 30 s (the rest) in an in-memory cache shared by every visitor; public answers carry
+  `Cache-Control: public, max-age` and an `ETag` (304 on a match); a client without a session gets at most 120 requests per
+  minute on the public routes (429). Charts are inline SVG rendered on the server (a hatched cell for NIET GEDEKT, never a
+  zero bar; a band for a bootstrap interval only once it exists) with a text summary for screen readers; the stylesheet is
+  one design system with tokens (dark by default, light with the system setting) whose accent colour comes from
+  `config/web.json` through `theme.accent_override` (appended to the served CSS, never inline). The page is the only
+  renderer: `static/app.js` refreshes it by fetching the same page and swapping the `data-live` regions.
 * **Unit** (`deploy/fart-web.service`): the hardening of the other units plus `IPAddressDeny=any` and
   `IPAddressAllow=localhost` (the website needs no network beyond the loopback), `Restart=on-failure` with
   `RestartPreventExitStatus=2` (a missing `.env` value is a configuration error, not a crash loop). The installer

@@ -877,3 +877,123 @@ Caddy, met waarschuwing), controle met `curl -sI https://kingdegen.dev`, rollbac
 129. **`.env` names and `fart status`**: `FART_WEB_BIND` (default `127.0.0.1:8792`), `FART_WEB_PASSWORD_HASH`,
     `FART_WEB_SECRET` join `ENV_KEYS`; `Settings.describe()` reports them as configured / not configured and `fart
     status` prints a `web:` line; the test that pins `.env.example` to `ENV_KEYS` covers the new names with empty values.
+
+## Milestone 9 (26 oktober 2026)
+
+**Samenvatting voor Jim.** Mijlpaal 9 bouwt de website opnieuw op als openbaar product: `https://kingdegen.dev` is het
+gezicht van de radar naar buiten, Telegram blijft het kanaal voor alerts aan de community. Geen regelbestand verandert (de
+vingerafdruk blijft `sha256:e3bf4320c45c`; dezelfde test bewaakt dat), er is geen schema-migratie, geen nieuwe dependency,
+de daemons en de meting blijven onaangeraakt en de webdienst blijft alleen-lezen.
+De keuze: **openbaar dashboard, eigenaarssectie achter login**. (1) **Het dashboard is verwerkte data, live.** Jims aanwijzing halverwege de bouw: het
+dashboard moet laten zien wat de radar nú ziet, niet hoe de machines lopen. `/` toont daarom waar het geld heen gaat (de
+gevolgde munten met de meeste netto SOL-instroom in de laatste 5 minuten, met kopers, trades, marktkapitalisatie uit de
+curve en het aandeel van de grootste koper), de nieuwste munten met hun tempo, de thema's die nu opkomen in de muntnamen
+(dezelfde clustering en drempels als de engine, alleen lezend), de laatste graduaties met de nieuwste prijssample en de
+24-uursuitkomst volgens de trackerregel van de rapporten, wat er rondgaat op X (eerlijk over de stand: uit, schaduw of
+live), de observaties van vandaag en één regel meting; de pagina ververst zichzelf elke 15 seconden. De meting zelf
+(meetweek met go/no-go-toets, dekking van de laatste 24 uur, laatste rapporten, hoe dit werkt) staat op `/meting`; de
+machines op `/eigenaar` achter de login. (2) **Eerlijkheid in elk getal.** Een uur of dag NIET GEDEKT blijft leeg en is in
+de grafieken gearceerd (nooit een nul-balk); onbekend blijft onbekend; een interval staat er pas als de bootstrap er is,
+anders "te weinig data"; de X-kaart zegt "staat uit" zolang er geen sleutel is; de instroom-tabel zegt erbij dat de radar
+alleen de gevolgde munten ziet; nergens een winst-, rendement- of signaalclaim, geen koopknop, geen link naar een
+handelsplaats, het mint-adres hoogstens als tekst. (3) **Eén ontwerpsysteem** (`fart/web/static/app.css`): kleurtokens,
+donker standaard en licht via `prefers-color-scheme`, één accentkleur, een typografische schaal, een 8-puntsraster,
+kaarten met kerncijfer, uitlegregel en statuspil, tabellen met vaste kolommen die op een telefoon stapelen, grafieken als
+server-side inline SVG met een tekstsamenvatting voor schermlezers, contrast WCAG AA. Naam, productwoord, slogan en
+accentkleur staan in `config/web.json` (geen regelbestand); de accentkleur bereikt het stylesheet via een toegevoegd
+tokenblok, nooit als inline stijl, zodat de CSP `'self'` blijft. (4) **Openbaar en toch veilig en snel.** `/api/public/*`
+met alleen openbare velden (een test platwalst elk openbaar JSON-document en bewijst dat geen budget, sleutel, pad, adres
+of eigenaarsveld erin voorkomt), een in-geheugen-cache per onderdeel (15 s live, 30 s de rest) die gelijktijdige
+bezoekers één berekening laat delen, `Cache-Control` en `ETag` op elk openbaar antwoord (304 bij een match), 120 verzoeken
+per minuut per adres op de openbare routes en daarna 429, de eigenaarssectie met login, CSRF en lockout zoals in M8.
+`FART_WEB_PUBLIC=0` zet alles weer achter de login. (5) **Caddy en uitrol**: `www.kingdegen.dev` uit het sitebestand zolang
+er geen DNS-record is; `deploy/DEPLOY.md`, "Milestone 9: website v2": `config/web.json`, de schakelaar, de `curl`-controles
+en de rooktest dat `/api/public/status` geen eigenaarsvelden bevat.
+
+130. **Branch and PR**: all work on the harness branch `claude/wizardly-pascal-rs131r`; the PR targets `main`.
+131. **Public dashboard, owner section behind the login** (`fart/web/server.py`): with `FART_WEB_PUBLIC=1` (the default,
+    also without the line) the dashboard, `/observaties`, `/meting`, `/rapporten` and its pages, `/methode`, `/tools` and
+    `/api/public/*` need no session; `/eigenaar`, the raw Markdown reports (`/rapporten/<file>.md`), `/instellingen`
+    (a redirect to `/eigenaar`) and the milestone-8 JSON under `/api/*` keep the login. A visitor on an unknown path gets
+    404, never a login prompt; an owner route without a session gets 401 as before. `FART_WEB_PUBLIC=0` is milestone 8:
+    everything behind the login; the milestone-8 test suite runs in that mode and stays the regression test for it.
+132. **The dashboard is processed data, live; the measurement has its own page** (`fart/web/public.py`, `pages.dashboard`,
+    `pages.measurement_page`): Jim's redirect during the build ("het dashboard is verwerkte data: wat is nu hot, waar komt
+    het meeste volume binnen, live"). `/` carries the live hero (tempo of new coins, buyers and net SOL inflow on the
+    watched coins in the last five minutes, graduations of the last hour, the SOL price the figures are converted with),
+    the hot coins, the newest coins, the themes, the latest graduations, the X card, today's observations and a one-line
+    measurement strip; `/meting` carries the week card, the coverage card, the reports card and "hoe dit werkt". The live
+    views refresh every 15 s, the rest every 30 s (`config/web.json` → `refresh_s`, `live_refresh_s`).
+133. **Hot coins only from the watched coins, and the page says so** (`public.hot_coins_view`): the radar has every trade of
+    the coins on its watchlist (every new coin for its first five minutes, then the coins the engine keeps) and of no other,
+    so "where the money goes" is computed over the active watchlist with one grouped query per request (the `(mint,
+    received_at)` index serves it) and the card's explain line says exactly that. Net inflow = buy SOL minus sell SOL over
+    five minutes, buyers = distinct buying wallets, the largest buyer's share over fifteen minutes as in the engine, the
+    market cap from the last trade's virtual reserves through `fart/chain/curve.py` (converted to USD with the SOL price the
+    tracker cached, when it is less than an hour old; otherwise SOL only). The row's status (observatie, nieuw, gevolgd,
+    gegradueerd) is a fact about the watchlist, never a verdict.
+134. **Themes through the engine's own functions, read-only** (`public.themes_view`): `features.recent_coins`,
+    `meta.cluster`, `features.meta_features`, `features.rank_metas` and `decide.is_bursting` are called on the read-only
+    connection with the engine's config, so the dashboard shows the clusters the engine sees with the same thresholds and
+    never a second definition of a theme. The rule files are imported, not changed (the fingerprint test proves it). A theme
+    with no baseline is "nieuw woord" (the engine's infinite burst), a cluster below the burst threshold is "rustig".
+135. **Graduation outcomes under the reports' tracker rule** (`public.graduation_outcome`): a stored "no winner" whose
+    `mcap_samples` are not dense enough (`report.tracker_coverage`) is shown as "onbekend", exactly as the daily and week
+    report count it; a winner stays a winner; no row inside the 24 h is "nog bezig". The market cap and 24 h volume of a
+    graduation come from the newest tracker sample and carry its age; a sample older than two hours is "oud", a coin
+    without a sample says "geen sample" (never a zero).
+136. **The X card is honest about its state** (`public.social_view`): with the X layer off the card says so and shows
+    nothing; in shadow mode it shows the keys with the most mentions in the last hour and the fast posts of the big
+    accounts (`x_keys`, `social_posts`) with the sentence that nothing of it reaches the observations; in live mode the
+    same without that sentence. No count is invented: a key without a count yet says "nog niet geteld".
+137. **Only public fields, proven** (`tests/test_m9_public_site.py::test_public_json_carries_no_owner_fields`): the public
+    views are a separate module; the test flattens every `/api/public/*` document (the day and week report documents and
+    the day filter included) and asserts that no key contains the owner vocabulary (budget, caps, USD spend, CU, secret,
+    hash, password, token, bind, planner, daemon, heartbeat, shadow, failures, gaps, paths, logs, schema, cost, ...), that
+    no value carries a path, the fixture root, an IP address, the port or `X_MODE`, and that none of the owner's budget
+    values and none of the secrets occur in the text. The page test does the same for the rendered HTML with the Dutch
+    owner words (budget, plafond, planner, sleutel, daemon, heartbeat, logboek, ...).
+138. **Cache, ETag and rate limit in the application, not in Caddy** (`server.Cache`, `server.RateLimiter`): a view is
+    computed at most once per TTL (15 s live, 30 s the rest), concurrent misses wait for one computation, the oldest entries
+    go when there are more than 128; an anonymous public answer carries `Cache-Control: public, max-age=<ttl>`, `Vary:
+    Cookie` and an `ETag` of its bytes (304 on `If-None-Match`); an answer to a session is `no-store` and carries no ETag,
+    so a shared cache can never serve the owner's navigation to a visitor. The limiter keeps a sliding window of request
+    times per client address (the last `X-Forwarded-For` entry Caddy appends, trusted only from the loopback), 120 per 60 s,
+    bounded to 10,000 addresses with eviction of idle ones; static files, the login page and every request with a session
+    are outside it. Caddy keeps its request-body limit and HSTS; nothing else moved there, so the behaviour is tested.
+139. **One renderer, swapped by region** (`static/app.js`): the server renders the whole page; the script fetches the same
+    page every 15 or 30 s (not while the tab is hidden), parses it in an inert document and replaces the elements that
+    carry `data-live` with their fresh twins (`replaceWith` + `importNode`, no `innerHTML`, no evaluation, no focus theft);
+    the footer line says when the page was last updated and when a refresh failed. The milestone-8 JSON-path refresh is
+    gone: two renderers of one page were one too many.
+140. **Charts without a library** (`fart/web/charts.py`): inline SVG with a `viewBox` and `preserveAspectRatio="none"`
+    so it scales to the card, colours through CSS classes (the CSP forbids inline styles; `fill="url(#hatch)"` is a
+    presentation attribute, not a style), a hatch pattern for NIET GEDEKT (a hatched cell has no height: it is not a
+    zero), whole-number ticks for counts, a line that breaks at a day without a value, a horizontal band for a bootstrap
+    interval only when the week report has one, and a visually hidden paragraph with the figures in words for screen
+    readers (the sentence a test checks).
+141. **The design system** (`static/app.css`): tokens for colours, spacing (4/8/16/24/32/48/64) and type (13/15/17/20/26
+    px plus fluid sizes for the hero and the key figures), dark by default, light under `prefers-color-scheme: light`, one
+    accent (`--accent`, with `--accent-dark` for text on a light background and an RGB triple for the tints), status pills
+    with a leading dot (an outlined dot for the unknown states), tables with `table-layout: fixed`, `<colgroup>` widths and
+    a stacked layout under 640 px (each cell shows its header through `data-label`, so nothing scrolls sideways), visible
+    focus rings, reduced-motion respected, a skip link, a print stylesheet. Contrast of every text colour pair against
+    its background is at least 4.5:1 in both themes (`theme.contrast`, checked by a test for the accent and its dark twin).
+142. **The brand in `config/web.json`, the accent through `theme.py`** (`Settings.web_site`, `theme.accent_override`):
+    site name, product word, tagline, domain, accent and the two refresh intervals; missing or empty keys fall back to the
+    defaults in `fart/config.py`, so an edited file never breaks a page. A valid `#rrggbb` accent becomes a `:root` block
+    appended to the served stylesheet with the colour, its RGB triple, a darkened twin (same hue, lightness 0.27, which
+    keeps 4.5:1 on the light background) and the text colour for an accent surface; an invalid value is ignored. The
+    file is not a rule file: `RULE_FILES` is unchanged and the fingerprint test is the proof.
+143. **The structured report pages come from the JSON, the raw Markdown stays with the owner** (`public.day_report_view`,
+    `public.week_report_view`): the public pages show the coverage, the universe, the observations, the recall, the winners
+    (mint as text), the unknowns and the versions from `out/recall/*.json`, with the NIET GEDEKT rule (a day without a
+    covered hour shows only the hours and says the universe is unknown) and never the operational sections of the Markdown
+    (budget and costs, enrichment and failures, the X shadow economics, the paper trades); `/rapporten/<file>.md` renders
+    the complete Markdown for the owner as in milestone 8.
+144. **The log summary is a tail, counted** (`data.logs_view`): the last 256 KB of every daemon log (JSON lines) give the
+    size, the time of the last line, the warnings and errors counted and the last error named with its time; never a line's
+    fields, so no address and no secret reaches the page (the logs carry none by design, the view adds a second guard).
+145. **`www.kingdegen.dev` out of the Caddy site file**: the subdomain has no DNS record; Caddy would keep trying to obtain a
+    certificate for it and log the failures (the deployer already removed it from the installed copy at the M8 rollout).
+    The comment in the file says when to add it back; DEPLOY.md and UNVERIFIED.md carry the note.

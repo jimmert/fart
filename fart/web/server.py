@@ -1,4 +1,4 @@
-"""`fart web`: the HTTP server of the website (milestone 8).
+"""`fart web`: the HTTP server of the website (milestones 8 and 9).
 
 `App.handle()` turns a `Request` into a `Response` without touching sockets (the tests call it directly and through a
 live server); `Handler` adapts `http.server.BaseHTTPRequestHandler` to it and enforces what only the socket layer can:
@@ -6,23 +6,34 @@ the request-size limit (64 KB for the request line, the headers and the body tog
 closed without reading the body), a socket timeout, HTTP/1.1 with an explicit Content-Length on every response.
 
 Every response carries the security headers: a strict Content-Security-Policy (`default-src 'self'`, no inline
-scripts or styles: the two files under /static/ are the only code and style), `X-Content-Type-Options: nosniff`,
-`Referrer-Policy: no-referrer`, `X-Frame-Options: DENY` and `Cache-Control: no-store` (static files: a short cache).
+scripts or styles: the files under /static/ are the only code and style), `X-Content-Type-Options: nosniff`,
+`Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`; `Cache-Control: no-store` unless a route says otherwise.
 
-Routes: `/login` (GET the form, POST the password with the CSRF token), `/logout` (POST), `/` (dashboard),
-`/observaties`, `/rapporten`, `/rapporten/<file>.md`, `/instellingen`, `/api/status`, `/api/coverage`, `/api/decisions`,
-`/api/x`, `/api/report/latest`, `/api/week/latest`, `/static/app.css`, `/static/app.js`. Without a valid session every
-route but `/login` and the two static files answers 401: the login page for a page, `{"error": ...}` for `/api/*`.
+Milestone 9 splits the site in two:
+
+* the **public section** (`FART_WEB_PUBLIC=1`, the default): `/` (the dashboard), `/observaties`, `/rapporten`,
+  `/rapporten/<day>`, `/rapporten/week-<day>`, `/methode`, `/tools` and the JSON under `/api/public/*` need no session.
+  Every expensive view behind them is computed at most once per `CACHE_TTL_S` (30 s) and shared by every visitor
+  (`Cache`), the public answers carry `Cache-Control: public, max-age=30` and an `ETag` (a matching `If-None-Match` gets
+  304), and a client without a session may make at most `RATE_LIMIT` requests per minute to the public routes (then
+  429 with `Retry-After`). With `FART_WEB_PUBLIC=0` the whole site is behind the login, as in milestone 8;
+* the **owner section**: `/eigenaar` (health, budgets, the X planner, settings, the log summary), the raw Markdown of
+  every report under `/rapporten/<file>.md` and the milestone-8 JSON under `/api/*`, always behind the login (scrypt
+  password, signed session cookie, CSRF, lockout: `fart/web/auth.py`). `/instellingen` redirects to `/eigenaar`.
 
 The log (`logs/web.log` and the journal) carries the method, the path without its query, the status, the duration
 and the client IP (the last `X-Forwarded-For` entry, which the shared Caddy appends, when the peer is the loopback);
 never a cookie, a password, a token or a request body. Failed logins are logged as `web.login_failed` with the IP so
-the login guard can replay them after a restart (`fart/web/auth.py`).
+the login guard can replay them after a restart.
 """
 from __future__ import annotations
 
+import collections
+import hashlib
 import hmac
+import json
 import math
+import re
 import signal
 import socket
 import sys
@@ -36,16 +47,22 @@ from typing import Any, Callable
 
 from .. import db as _db  # noqa: F401  (the read-only connection is opened in data.open_db)
 from ..config import Settings
-from ..log import get_logger
+from ..log import Throttle, get_logger
+from ..notify.format import fmt_time
 from ..util import now as wall_now
-from . import auth, data, markdown, pages
+from . import auth, data, markdown, pages, public, theme
 
 log = get_logger("web")
 
 MAX_REQUEST_BYTES = 64 * 1024
 SOCKET_TIMEOUT_S = 30
+CACHE_TTL_S = 30
+LIVE_TTL_S = 15            # the live dashboard views
+CACHE_MAX_ITEMS = 128
+RATE_LIMIT = 120           # public requests per IP per window
+RATE_WINDOW_S = 60
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-STATIC_TYPES = {"app.css": "text/css; charset=utf-8", "app.js": "text/javascript; charset=utf-8"}
+STATIC_TYPES = {"app.css": "text/css; charset=utf-8", "app.js": "text/javascript; charset=utf-8", "icon.svg": "image/svg+xml"}
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'self'; "
        "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 SECURITY_HEADERS = (
@@ -56,6 +73,9 @@ SECURITY_HEADERS = (
     ("Cache-Control", "no-store"),
 )
 LOOPBACK = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+PUBLIC_CACHE_CONTROL = f"public, max-age={CACHE_TTL_S}"
+REPORT_PAGE = re.compile(r"^(week-)?\d{4}-\d{2}-\d{2}$")
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 @dataclass
@@ -103,8 +123,6 @@ def html_response(status: int, body: str, **kw: Any) -> Response:
 
 
 def json_response(status: int, obj: Any, **kw: Any) -> Response:
-    import json
-
     return Response(status, json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8"), "application/json; charset=utf-8", **kw)
 
 
@@ -112,8 +130,108 @@ def redirect(location: str, cookies: list[str] | None = None) -> Response:
     return Response(303, b"", "text/plain; charset=utf-8", headers=[("Location", location)], cookies=cookies or [])
 
 
+def etag_of(body: bytes) -> str:
+    return '"' + hashlib.sha256(body).hexdigest()[:20] + '"'
+
+
+# ----- the shared cache of the public views ---------------------------------------------------------------------------
+class Cache:
+    """A value per key, computed at most once per `ttl_s`; concurrent requests for a missing key wait for one
+    computation instead of each running the queries. Bounded: the oldest entries go when there are too many."""
+
+    def __init__(self, ttl_s: float = CACHE_TTL_S, clock: Callable[[], float] = wall_now, max_items: int = CACHE_MAX_ITEMS):
+        self.ttl_s = float(ttl_s)
+        self.clock = clock
+        self.max_items = int(max_items)
+        self._lock = threading.Lock()
+        self._items: dict[str, tuple[float, Any]] = {}
+        self._locks: dict[str, threading.Lock] = {}
+        self.computes = 0
+        self.hits = 0
+
+    def _fresh(self, key: str, now: float, ttl: float) -> tuple[bool, Any]:
+        item = self._items.get(key)
+        if item is not None and now - item[0] < ttl and item[0] <= now:
+            return True, item[1]
+        return False, None
+
+    def get(self, key: str, compute: Callable[[], Any], ttl_s: float | None = None) -> Any:
+        ttl = self.ttl_s if ttl_s is None else float(ttl_s)
+        now = self.clock()
+        with self._lock:
+            ok, value = self._fresh(key, now, ttl)
+            if ok:
+                self.hits += 1
+                return value
+            lk = self._locks.setdefault(key, threading.Lock())
+        with lk:
+            with self._lock:
+                ok, value = self._fresh(key, self.clock(), ttl)
+                if ok:
+                    self.hits += 1
+                    return value
+            value = compute()
+            with self._lock:
+                self._items[key] = (self.clock(), value)
+                self.computes += 1
+                if len(self._items) > self.max_items:
+                    for k in sorted(self._items, key=lambda k: self._items[k][0])[: len(self._items) - self.max_items]:
+                        self._items.pop(k, None)
+                        self._locks.pop(k, None)
+            return value
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+
+# ----- the per-IP limit of the public routes ---------------------------------------------------------------------------
+class RateLimiter:
+    """A sliding window per client: at most `limit` requests in the last `window_s` seconds; bounded memory."""
+
+    def __init__(self, limit: int = RATE_LIMIT, window_s: float = RATE_WINDOW_S, max_clients: int = 10000):
+        self.limit = int(limit)
+        self.window_s = float(window_s)
+        self.max_clients = int(max_clients)
+        self._lock = threading.Lock()
+        self._hits: dict[str, collections.deque] = {}
+
+    def check(self, ip: str, now: float) -> float | None:
+        """None when the request may pass (and it is counted); else the seconds to wait."""
+        key = ip or "?"
+        with self._lock:
+            dq = self._hits.get(key)
+            if dq is None:
+                if len(self._hits) >= self.max_clients:
+                    self._evict(now)
+                dq = self._hits[key] = collections.deque()
+            while dq and now - dq[0] >= self.window_s:
+                dq.popleft()
+            if len(dq) >= self.limit:
+                return max(1.0, self.window_s - (now - dq[0]))
+            dq.append(now)
+            return None
+
+    def _evict(self, now: float) -> None:
+        for k in [k for k, dq in self._hits.items() if not dq or now - dq[-1] >= self.window_s]:
+            del self._hits[k]
+        if len(self._hits) >= self.max_clients:
+            for k in sorted(self._hits, key=lambda k: self._hits[k][-1] if self._hits[k] else 0)[: len(self._hits) // 2]:
+                del self._hits[k]
+
+
 class App:
-    """The routes, the session check and the page assembly; one read-only database connection per request."""
+    """The routes, the session check and the page assembly; one read-only database connection per request (or per
+    cache computation on the public side)."""
+
+    PUBLIC_API = {"/api/public/status": "status", "/api/public/coverage": "coverage", "/api/public/observations": "observations",
+                  "/api/public/reports": "reports", "/api/public/week": "week", "/api/public/live": "live", "/api/public/hot": "hot",
+                  "/api/public/new": "new", "/api/public/themes": "themes", "/api/public/graduations": "graduations", "/api/public/social": "social"}
+    LIVE_VIEWS = ("live", "hot", "new", "themes", "graduations", "social", "today")
+    DASHBOARD_VIEWS = ("live", "hot", "new", "themes", "graduations", "social", "today", "week", "coverage")
+    OWNER_API = {"/api/status": "status", "/api/coverage": "coverage", "/api/decisions": "decisions", "/api/x": "x",
+                 "/api/report/latest": "report", "/api/week/latest": "week"}
+    PUBLIC_PAGES = ("/", "/observaties", "/meting", "/rapporten", "/methode", "/tools")
 
     def __init__(self, settings: Settings, clock: Callable[[], float] = wall_now):
         problems = auth.check_config(settings.web_password_hash, settings.web_secret)
@@ -124,7 +242,19 @@ class App:
         self.signer = auth.Signer(settings.web_secret)
         self.guard = auth.LoginGuard(clock)
         self.revoked = auth.Revocations()
-        self.static = {name: (STATIC_DIR / name).read_bytes() for name in STATIC_TYPES}
+        ws = settings.web_site
+        self.site = {"name": str(ws["site_name"]), "product": str(ws["product"]), "tagline": str(ws["tagline"]), "domain": str(ws["domain"]),
+                     "accent": str(ws.get("accent") or ""), "refresh_s": int(ws.get("refresh_s") or 30), "live_refresh_s": int(ws.get("live_refresh_s") or LIVE_TTL_S)}
+        self.cache = Cache(CACHE_TTL_S, clock)
+        self.limiter = RateLimiter()
+        self.limit_log = Throttle(RATE_WINDOW_S)
+        self.static: dict[str, bytes] = {}
+        for name in STATIC_TYPES:
+            body = (STATIC_DIR / name).read_bytes()
+            if name == "app.css":
+                body += theme.accent_override(str(self.site.get("accent") or "")).encode("utf-8")
+            self.static[name] = body
+        self.static_etags = {name: etag_of(body) for name, body in self.static.items()}
 
     # ----- helpers ----------------------------------------------------------------------------------------------------
     def db(self):
@@ -141,19 +271,43 @@ class App:
         return sess
 
     def footer(self, now: float) -> str:
-        return (f"rules_version {pages.esc(data.rules_version())} · vingerafdruk regels {pages.esc(data.rules_fingerprint()[:19])} · "
-                f"pagina gemaakt {pages.esc(data.fmt_time(now))} · alleen-lezen")
+        return (f"regels {pages.esc(data.rules_fingerprint()[:19])} (versie {pages.esc(data.rules_version())}) · alleen-lezen · "
+                f"pagina gemaakt {pages.esc(fmt_time(now))}")
 
-    def page(self, title: str, body: str, sess: dict[str, Any], now: float, active: str, script: bool = True, status: int = 200) -> Response:
-        html = pages.layout(title, body, active=active, logged_in=True, logout_csrf=self.signer.logout_token(sess["nonce"]),
-                            footer=self.footer(now), script=script)
-        return html_response(status, html)
+    def ctx(self, sess: dict[str, Any] | None, now: float) -> dict[str, Any]:
+        return {"site": self.site, "public": bool(self.settings.web_public), "logged_in": sess is not None,
+                "logout_csrf": self.signer.logout_token(sess["nonce"]) if sess else "", "footer": self.footer(now),
+                "banner": public.banner_text(self.settings), "refresh_label": f"Ververst elke {int(self.site.get('refresh_s', 30))} s zolang dit tabblad open staat."}
+
+    def page(self, title: str, body: str, sess: dict[str, Any] | None, now: float, active: str, *, script: bool = True, status: int = 200,
+             robots: str | None = None, cacheable: bool = False, req: Request | None = None, refresh_s: int | None = None) -> Response:
+        html = pages.layout(self.ctx(sess, now), title, body, active=active, script=script, robots=robots, refresh_s=refresh_s)
+        resp = html_response(status, html)
+        if cacheable and sess is None and status == 200:
+            self.public_headers(resp, req, max_age=refresh_s)
+        return resp
+
+    def public_headers(self, resp: Response, req: Request | None, max_age: int | None = None) -> Response:
+        """ETag plus a short public cache on an anonymous public answer; 304 when the client already has it."""
+        tag = etag_of(resp.body)
+        resp.headers += [("Cache-Control", f"public, max-age={int(max_age)}" if max_age else PUBLIC_CACHE_CONTROL), ("ETag", tag), ("Vary", "Cookie")]
+        if req is not None and _etag_matches(req.headers.get("if-none-match"), tag):
+            resp.status = 304
+            resp.body = b""
+        return resp
 
     def login_response(self, now: float, status: int = 200, error: str | None = None, retry_after: float | None = None) -> Response:
         csrf = self.signer.csrf_token(now)
-        html = pages.layout("Inloggen", pages.login_page(csrf, error), footer=self.footer(now))
+        html = pages.layout(self.ctx(None, now), "Inloggen", pages.login_page(self.ctx(None, now), csrf, error), robots="noindex, nofollow", script=False)
         headers = [("Retry-After", str(int(math.ceil(retry_after))))] if retry_after else []
         return html_response(status, html, cookies=[auth.set_cookie(auth.CSRF_COOKIE, csrf, auth.CSRF_TTL_S, path="/login")], headers=headers)
+
+    def error_response(self, status: int, message: str, sess: dict[str, Any] | None = None, now: float | None = None) -> Response:
+        t = self.clock() if now is None else now
+        try:
+            return self.page("Fout", pages.error_page(status, message), sess, t, "", script=False, status=status, robots="noindex, nofollow")
+        except Exception:  # noqa: BLE001  the error page must never fail
+            return Response(status, f"{status} {message}".encode("utf-8"), "text/plain; charset=utf-8")
 
     # ----- routing ----------------------------------------------------------------------------------------------------
     def handle(self, req: Request) -> Response:
@@ -162,12 +316,12 @@ class App:
         if req.method not in ("GET", "HEAD", "POST"):
             return Response(405, b"method not allowed", "text/plain; charset=utf-8", headers=[("Allow", "GET, HEAD, POST")])
         if path.startswith("/static/"):
-            return self.static_file(path[len("/static/"):])
+            return self.static_file(path[len("/static/"):], req)
         if path == "/login":
             if req.method == "POST":
                 return self.login_post(req, now)
             if self.session(req, now) is not None:
-                return redirect("/")
+                return redirect(OWNER_PATH)
             return self.login_response(now)
         sess = self.session(req, now)
         if path == "/logout":
@@ -176,34 +330,171 @@ class App:
             if sess is None:
                 return self.login_response(now, status=401)
             if not self.signer.verify_logout(req.form().get("csrf"), sess["nonce"]):
-                return self.page("Uitloggen", pages.error_page(403, "Het uitlogformulier was ongeldig; gebruik de knop bovenaan."), sess, now, "", status=403)
+                return self.page("Uitloggen", pages.error_page(403, "Het uitlogformulier was ongeldig; gebruik de knop bovenaan."), sess, now, "", status=403, script=False)
             self.revoked.revoke(sess["nonce"], sess["expires"])
             log.info("web.logout", ip=req.ip)
-            return redirect("/login", cookies=[auth.clear_cookie(auth.SESSION_COOKIE)])
-        if sess is None:
+            return redirect("/" if self.settings.web_public else "/login", cookies=[auth.clear_cookie(auth.SESSION_COOKIE)])
+        is_public_route = self.is_public_route(path)
+        if sess is None and not (self.settings.web_public and is_public_route):
+            if self.settings.web_public and not self.is_owner_route(path):
+                return self.page("Niet gevonden", pages.error_page(404, "Deze pagina bestaat niet."), None, now, "", status=404, script=False, robots="noindex, nofollow")
             if path.startswith("/api/"):
                 return json_response(401, {"error": "login required", "login": "/login"})
             return self.login_response(now, status=401)
         if req.method == "POST":
-            return self.page("Niet toegestaan", pages.error_page(405, "Deze site is alleen-lezen: er is niets om te versturen."), sess, now, "", status=405)
+            return self.page("Niet toegestaan", pages.error_page(405, "Deze site is alleen-lezen: er is niets om te versturen."), sess, now, "", status=405, script=False)
+        if sess is None and is_public_route:
+            wait = self.limiter.check(req.ip, now)
+            if wait is not None:
+                if self.limit_log.allow(req.ip, now):
+                    log.warning("web.rate_limited", ip=req.ip, path=path[:80], retry_after_s=round(wait))
+                headers = [("Retry-After", str(int(math.ceil(wait))))]
+                if path.startswith("/api/"):
+                    return json_response(429, {"error": "too many requests", "retry_after_s": int(math.ceil(wait))}, headers=headers)
+                r = self.page("Even wachten", pages.error_page(429, "Te veel verzoeken van dit adres; probeer het over een minuut opnieuw."), None, now, "", status=429, script=False)
+                r.headers += headers
+                return r
+        if path.startswith("/api/public/"):
+            return self.public_api(path, req, now, sess)
         if path.startswith("/api/"):
-            return self.api(path, now)
+            return self.owner_api(path, now)
         if path == "/":
-            return self.page("Dashboard", pages.dashboard(self.views(now, ("status", "coverage", "x", "report", "week"))), sess, now, "/")
+            return self.page("Dashboard", pages.dashboard(self.ctx(sess, now), self.public_views(now, self.DASHBOARD_VIEWS)), sess, now, "/", cacheable=True, req=req,
+                             refresh_s=self.site["live_refresh_s"])
+        if path == "/meting":
+            v = self.public_views(now, ("week", "coverage", "reports"))
+            v["warning"] = public.warning_text(self.settings)
+            return self.page("Meting", pages.measurement_page(self.ctx(sess, now), v), sess, now, "/meting", cacheable=True, req=req)
         if path == "/observaties":
-            return self.page("Observaties", pages.observations_page(self.views(now, ("decisions",))), sess, now, "/observaties")
+            return self.page("Observaties", pages.observations_page(self.ctx(sess, now), self.public_view("observations", now)), sess, now, "/observaties", cacheable=True, req=req)
         if path == "/rapporten":
-            return self.page("Rapporten", pages.reports_page(data.report_files(self.settings)), sess, now, "/rapporten", script=False)
+            return self.page("Rapporten", pages.reports_page(self.ctx(sess, now), self.public_view("reports", now)), sess, now, "/rapporten", cacheable=True, req=req)
         if path.startswith("/rapporten/"):
-            name = path[len("/rapporten/"):]
+            return self.report_page(path[len("/rapporten/"):], req, sess, now)
+        if path == "/methode":
+            return self.page("Methode", pages.method_page(self.ctx(sess, now), self.public_view("method", now)), sess, now, "/methode", script=False, cacheable=True, req=req)
+        if path == "/tools":
+            return self.page("Tools", pages.tools_page(self.ctx(sess, now)), sess, now, "/tools", script=False, cacheable=True, req=req)
+        if path == "/instellingen":
+            return redirect(OWNER_PATH + "#instellingen")
+        if path == OWNER_PATH:
+            return self.page("Eigenaar", pages.owner_page(self.ctx(sess, now), self.owner_views(now)), sess, now, OWNER_PATH, robots="noindex, nofollow")
+        return self.page("Niet gevonden", pages.error_page(404, "Deze pagina bestaat niet."), sess, now, "", status=404, script=False, robots="noindex, nofollow")
+
+    def is_public_route(self, path: str) -> bool:
+        if path in self.PUBLIC_PAGES or path.startswith("/api/public/"):
+            return True
+        if path.startswith("/rapporten/"):
+            return not path.endswith(".md")   # the raw Markdown stays with the owner
+        return False
+
+    def is_owner_route(self, path: str) -> bool:
+        """The routes that exist only behind the login (401 for a visitor); anything else unknown is 404."""
+        return path in (OWNER_PATH, "/instellingen") or path.startswith("/api/") or (path.startswith("/rapporten/") and path.endswith(".md"))
+
+    # ----- the public side (cached) --------------------------------------------------------------------------------------
+    def public_view(self, name: str, now: float, arg: str | None = None) -> Any:
+        key = f"public:{name}" + (f":{arg}" if arg else "")
+        return self.cache.get(key, lambda: self.compute_public(name, arg), ttl_s=self.site["live_refresh_s"] if name in self.LIVE_VIEWS else None)
+
+    def public_views(self, now: float, names: tuple[str, ...]) -> dict[str, Any]:
+        return {n: self.public_view(n, now) for n in names}
+
+    def compute_public(self, name: str, arg: str | None) -> Any:
+        now = self.clock()
+        if name == "method":
+            return public.method_view(self.settings)
+        if name == "reports":
+            return public.reports_view(self.settings, now)
+        if name == "week":
+            return public.week_view(self.settings, now)
+        if name == "report":
+            return public.week_report_view(self.settings, arg or "", now) if (arg or "").startswith("week-") else public.day_report_view(self.settings, arg or "", now)
+        conn = self.db()
+        try:
+            if name == "status":
+                return public.status_view(conn, self.settings, now)
+            if name == "coverage":
+                return public.coverage_view(conn, now)
+            if name == "today":
+                return public.today_view(conn, self.settings, now)
+            if name == "observations":
+                return public.observations_view(conn, self.settings, now, day=arg)
+            if name == "live":
+                return public.live_view(conn, self.settings, now)
+            if name == "hot":
+                return public.hot_coins_view(conn, self.settings, now)
+            if name == "new":
+                return public.new_coins_view(conn, self.settings, now)
+            if name == "themes":
+                return public.themes_view(conn, self.settings, now)
+            if name == "graduations":
+                return public.graduations_view(conn, self.settings, now)
+            if name == "social":
+                return public.social_view(conn, self.settings, now)
+        finally:
+            if conn is not None:
+                conn.close()
+        raise KeyError(name)
+
+    def public_api(self, path: str, req: Request, now: float, sess: dict[str, Any] | None) -> Response:
+        if path.startswith("/api/public/reports/"):
+            name = path[len("/api/public/reports/"):]
+            if not REPORT_PAGE.match(name):
+                return json_response(404, {"error": "unknown report"})
+            v = self.public_view("report", now, name)
+            if v is None:
+                return json_response(404, {"error": "unknown report"})
+            return self.public_json(v, req, sess)
+        name = self.PUBLIC_API.get(path)
+        if name is None:
+            return json_response(404, {"error": "unknown endpoint", "endpoints": sorted(self.PUBLIC_API) + ["/api/public/reports/<day>", "/api/public/reports/week-<day>"]})
+        arg = None
+        if name == "observations":
+            day = req.query.get("day")
+            if day:
+                if not DAY_RE.match(day):
+                    return json_response(400, {"error": "day must be YYYY-MM-DD"})
+                arg = day
+        return self.public_json(self.public_view(name, now, arg), req, sess, live=name in self.LIVE_VIEWS)
+
+    def public_json(self, obj: Any, req: Request, sess: dict[str, Any] | None, live: bool = False) -> Response:
+        resp = json_response(200, obj)
+        if sess is None:
+            self.public_headers(resp, req, max_age=self.site["live_refresh_s"] if live else None)
+        return resp
+
+    def report_page(self, name: str, req: Request, sess: dict[str, Any] | None, now: float) -> Response:
+        if name.endswith(".md"):
+            # the raw report for the owner (the guard above already required a session)
             text = data.read_report(self.settings, name)
             if text is None:
-                return self.page("Niet gevonden", pages.error_page(404, "Dat rapport bestaat niet."), sess, now, "/rapporten", script=False, status=404)
-            body = pages.reports_page(data.report_files(self.settings), markdown.render(text), name)
-            return self.page(name, body, sess, now, "/rapporten", script=False)
-        if path == "/instellingen":
-            return self.page("Instellingen", pages.settings_page(data.settings_view(self.settings)), sess, now, "/instellingen", script=False)
-        return self.page("Niet gevonden", pages.error_page(404, "Deze pagina bestaat niet."), sess, now, "", script=False, status=404)
+                return self.page("Niet gevonden", pages.error_page(404, "Dat rapport bestaat niet."), sess, now, "/rapporten", script=False, status=404, robots="noindex, nofollow")
+            body = pages.raw_report_page(self.ctx(sess, now), markdown.render(text), name, f"/rapporten/{name[:-3]}")
+            return self.page(name, body, sess, now, "/rapporten", script=False, robots="noindex, nofollow")
+        if not REPORT_PAGE.match(name):
+            return self.page("Niet gevonden", pages.error_page(404, "Dat rapport bestaat niet."), sess, now, "/rapporten", script=False, status=404, robots="noindex, nofollow")
+        v = self.public_view("report", now, name)
+        if v is None:
+            return self.page("Niet gevonden", pages.error_page(404, "Dat rapport bestaat niet."), sess, now, "/rapporten", script=False, status=404, robots="noindex, nofollow")
+        if v["kind"] == "week":
+            body = pages.week_report_page(self.ctx(sess, now), v)
+            title = f"Weekrapport {v['window_label']}"
+        else:
+            body = pages.day_report_page(self.ctx(sess, now), v)
+            title = f"Dagrapport {v['day_label']}"
+        return self.page(title, body, sess, now, "/rapporten", script=False, cacheable=True, req=req)
+
+    # ----- the owner side (never cached, never without a session) -------------------------------------------------------
+    def owner_views(self, now: float) -> dict[str, Any]:
+        conn = self.db()
+        try:
+            return {"status": data.status_view(conn, self.settings, now), "coverage": data.coverage_view(conn, now), "x": data.x_view(conn, self.settings, now),
+                    "report": data.report_latest_view(self.settings, now), "week": data.week_latest_view(self.settings, now), "settings": data.settings_view(self.settings),
+                    "logs": data.logs_view(self.settings, now), "report_files": data.report_files(self.settings)}
+        finally:
+            if conn is not None:
+                conn.close()
 
     def views(self, now: float, names: tuple[str, ...]) -> dict[str, Any]:
         conn = self.db()
@@ -231,19 +522,20 @@ class App:
             return data.week_latest_view(self.settings, now)
         raise KeyError(name)
 
-    API = {"/api/status": "status", "/api/coverage": "coverage", "/api/decisions": "decisions", "/api/x": "x",
-           "/api/report/latest": "report", "/api/week/latest": "week"}
-
-    def api(self, path: str, now: float) -> Response:
-        name = self.API.get(path)
+    def owner_api(self, path: str, now: float) -> Response:
+        name = self.OWNER_API.get(path)
         if name is None:
-            return json_response(404, {"error": "unknown endpoint", "endpoints": sorted(self.API)})
+            return json_response(404, {"error": "unknown endpoint", "endpoints": sorted(self.OWNER_API) + sorted(self.PUBLIC_API)})
         return json_response(200, self.views(now, (name,))[name])
 
-    def static_file(self, name: str) -> Response:
+    def static_file(self, name: str, req: Request | None = None) -> Response:
         if name not in self.static:
             return Response(404, b"not found", "text/plain; charset=utf-8")
-        return Response(200, self.static[name], STATIC_TYPES[name], headers=[("Cache-Control", "public, max-age=300")])
+        tag = self.static_etags[name]
+        headers = [("Cache-Control", "public, max-age=300"), ("ETag", tag)]
+        if req is not None and _etag_matches(req.headers.get("if-none-match"), tag):
+            return Response(304, b"", STATIC_TYPES[name], headers=headers)
+        return Response(200, self.static[name], STATIC_TYPES[name], headers=headers)
 
     # ----- login --------------------------------------------------------------------------------------------------------
     def login_post(self, req: Request, now: float) -> Response:
@@ -261,13 +553,28 @@ class App:
             self.guard.record_success(req.ip)
             token = self.signer.session_token(now)
             log.info("web.login_ok", ip=req.ip)
-            return redirect("/", cookies=[auth.set_cookie(auth.SESSION_COOKIE, token, auth.SESSION_TTL_S), auth.clear_cookie(auth.CSRF_COOKIE, path="/login")])
+            return redirect(OWNER_PATH, cookies=[auth.set_cookie(auth.SESSION_COOKIE, token, auth.SESSION_TTL_S), auth.clear_cookie(auth.CSRF_COOKIE, path="/login")])
         locked = self.guard.record_failure(req.ip, now)
         remaining = self.guard.remaining(req.ip, now)
         log.warning(auth.LOG_EVENT_FAILED, ip=req.ip, remaining=remaining, locked_s=None if locked is None else round(locked))
         if locked is not None:
             return self.login_response(now, status=429, error=f"Onjuist wachtwoord. Te veel mislukte pogingen: wacht {math.ceil(locked / 60)} minuten.", retry_after=locked)
         return self.login_response(now, status=401, error=f"Onjuist wachtwoord ({remaining} {'poging' if remaining == 1 else 'pogingen'} over in dit venster).")
+
+
+OWNER_PATH = pages.OWNER_PATH
+
+
+def _etag_matches(header: str | None, tag: str) -> bool:
+    if not header:
+        return False
+    for part in header.split(","):
+        p = part.strip()
+        if p.startswith("W/"):
+            p = p[2:]
+        if p == "*" or p == tag:
+            return True
+    return False
 
 
 # ----- the socket layer ----------------------------------------------------------------------------------------------------
@@ -355,7 +662,7 @@ class Handler(BaseHTTPRequestHandler):
                 ip = req.ip
         except Exception:  # noqa: BLE001  never leak a traceback to the client; the log has it (without the request)
             log.error("web.request_failed", exc_info=True, method=self.command, path=path)
-            resp = html_response(500, pages.layout("Fout", pages.error_page(500, "Er ging iets mis bij het maken van deze pagina. Het log zegt wat.")))
+            resp = self.app.error_response(500, "Er ging iets mis bij het maken van deze pagina. Het log zegt wat.")
         self._write(resp, head)
         log.info("web.request", method=self.command, path=path, status=resp.status, ms=round((time.monotonic() - t0) * 1000), ip=ip)
 
@@ -430,8 +737,8 @@ def run_web(settings: Settings) -> int:
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    log.info("web.started", bind=f"{host}:{port}", db=str(settings.db_path), readonly=True, login_failures_replayed=replayed,
-             session_ttl_s=auth.SESSION_TTL_S, max_request_bytes=MAX_REQUEST_BYTES)
+    log.info("web.started", bind=f"{host}:{port}", db=str(settings.db_path), readonly=True, login_failures_replayed=replayed, public=settings.web_public,
+             site=str(app.site.get("site_name")), cache_ttl_s=CACHE_TTL_S, rate_limit_per_min=RATE_LIMIT, session_ttl_s=auth.SESSION_TTL_S, max_request_bytes=MAX_REQUEST_BYTES)
     t = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.5}, name="fart-web", daemon=True)
     t.start()
     try:

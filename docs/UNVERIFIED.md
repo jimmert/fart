@@ -236,6 +236,13 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
 
 ## Website / Caddy (milestone 8)
 
+Milestone 9 adds two assumptions to verify at the rollout: (a) the rate limit per client address counts the last
+`X-Forwarded-For` entry that Caddy appends (`fart-web` only trusts the header when its peer is the loopback); if the shared
+Caddy sits behind another proxy every visitor would share one address and the limit of 120 requests per minute would hit
+everyone at once: DEPLOY.md section 5h, step 6, is the check; (b) `www.kingdegen.dev` has no DNS record on 26 October 2026
+and was removed from the site file for that reason; add it back in a commit once the record exists.
+
+
 The website was built and tested against its own server in the sandbox (`tests/test_m8_web.py`: a real
 `ThreadingHTTPServer` on the loopback, Chromium screenshots of the pages); what the VPS's shared Caddy and systemd do
 with it is implemented from documentation. Verify at the rollout (`deploy/DEPLOY.md`, "Milestone 8: website"):

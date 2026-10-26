@@ -30,6 +30,9 @@ ENV_KEYS = (
     "X_MODE",
     # milestone 8: the website (fart web): loopback bind, the owner's scrypt password hash, the cookie-signing secret
     "FART_WEB_BIND", "FART_WEB_PASSWORD_HASH", "FART_WEB_SECRET",
+    # milestone 9: the public section of the website (1 = the dashboard, observations, reports, method and tools pages
+    # and /api/public/* need no login; 0 = everything behind the login as in milestone 8)
+    "FART_WEB_PUBLIC",
 )
 
 DEFAULT_WEB_BIND = "127.0.0.1:8792"
@@ -92,6 +95,7 @@ class Settings:
     web_bind: str = DEFAULT_WEB_BIND
     web_password_hash: str = ""
     web_secret: str = ""
+    web_public: bool = True
     configs: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -226,6 +230,19 @@ class Settings:
         """Both `.env` values the website needs exist; `fart web` refuses to start without them (and checks their shape)."""
         return bool(self.web_password_hash) and bool(self.web_secret)
 
+    # ----- milestone 9: the public website -----------------------------------------------------
+    @property
+    def web_site(self) -> dict[str, Any]:
+        """`config/web.json`: the brand (site name, product word, tagline, domain, accent colour) and the two public
+        limits. Not a rule file. Missing keys fall back to the defaults below so an edited file never breaks a page."""
+        cfg = dict(self.configs.get("web") or {})
+        out = dict(WEB_DEFAULTS)
+        for k in WEB_DEFAULTS:
+            v = cfg.get(k)
+            if v is not None and v != "":
+                out[k] = v
+        return out
+
     def config(self, name: str) -> Any:
         return self.configs[name]
 
@@ -258,11 +275,23 @@ class Settings:
             "web_bind": self.web_bind,
             "web_password_hash": "configured" if self.web_password_hash else "not configured",
             "web_secret": "configured" if self.web_secret else "not configured",
+            "web_public": self.web_public,
         }
 
 
 CONFIG_DIR = REPO_ROOT / "config"
-CONFIG_FILES = ("pumpfun", "budget", "engine", "measure", "stopwords", "ingest", "x", "x_kols", "notify")
+CONFIG_FILES = ("pumpfun", "budget", "engine", "measure", "stopwords", "ingest", "x", "x_kols", "notify", "web")
+
+# milestone 9: the brand of the public website (config/web.json overrides these; see Settings.web_site)
+WEB_DEFAULTS: dict[str, Any] = {
+    "site_name": "KingDegen",
+    "product": "radar",
+    "tagline": "Een radar voor nieuwe Solana-memecoins. Observatie, geen advies. Alles wordt achteraf gemeten.",
+    "domain": "kingdegen.dev",
+    "accent": "#F2B33D",
+    "public_observations_limit": 500,
+    "refresh_s": 30,
+}
 
 
 def load_configs(config_dir: Path = CONFIG_DIR) -> dict[str, Any]:
@@ -307,5 +336,6 @@ def load_settings(root: str | os.PathLike | None = None, env: dict[str, str] | N
         web_bind=merged.get("FART_WEB_BIND", "").strip() or DEFAULT_WEB_BIND,
         web_password_hash=merged.get("FART_WEB_PASSWORD_HASH", "").strip(),
         web_secret=merged.get("FART_WEB_SECRET", "").strip(),
+        web_public=_flag(merged.get("FART_WEB_PUBLIC", "1") or "1"),
         configs=load_configs(),
     )

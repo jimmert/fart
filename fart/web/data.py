@@ -651,3 +651,62 @@ def _plain(v: Any) -> Any:
     if v is None:
         return "–"
     return v
+
+
+# ----- /eigenaar: the log summary (milestone 9) -----------------------------------------------------------------------
+LOG_NAMES = ("ingest", "engine", "social", "notify", "measure-track", "measure-report", "measure-week", "web")
+LOG_TAIL_BYTES = 256 * 1024
+
+
+def logs_view(settings: Settings, now: float, tail_bytes: int = LOG_TAIL_BYTES) -> dict[str, Any]:
+    """The tail of every daemon log (JSON lines): size, the time of the last line, warnings and errors counted over the
+    tail, the last error named. The logs never carry a secret by design (fart/log.py); the owner page shows only event
+    names and times, never a line's fields."""
+    rows = []
+    for name in LOG_NAMES:
+        p = settings.logs_dir / f"{name}.log"
+        try:
+            st = p.stat()
+            with open(p, "rb") as fh:
+                if st.st_size > tail_bytes:
+                    fh.seek(st.st_size - tail_bytes)
+                    fh.readline()
+                tail = fh.read()
+        except OSError:
+            rows.append({"name": name, "exists": False, "size": None, "size_label": "–", "modified_at": None, "modified_label": "nooit geschreven",
+                         "warnings": None, "errors": None, "last_error": "–", "last_error_at": None, "last_event": "–", "_class": "never"})
+            continue
+        warnings = errors = 0
+        last_error = None
+        last_error_ts = None
+        last_event = None
+        last_ts = None
+        for raw in tail.splitlines():
+            try:
+                d = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            level = str(d.get("level") or "")
+            if level == "WARNING":
+                warnings += 1
+            elif level in ("ERROR", "CRITICAL"):
+                errors += 1
+                last_error = str(d.get("event") or "")[:80]
+                last_error_ts = _float(d.get("ts"))
+            last_event = str(d.get("event") or "")[:80]
+            last_ts = _float(d.get("ts"))
+        rows.append({"name": name, "exists": True, "size": int(st.st_size), "size_label": _size_label(st.st_size), "modified_at": utc_iso(last_ts or st.st_mtime),
+                     "modified_label": fmt_time(last_ts or st.st_mtime), "warnings": warnings, "errors": errors,
+                     "last_error": f"{last_error} ({fmt_time(last_error_ts)})" if last_error else "geen", "last_error_at": utc_iso(last_error_ts),
+                     "last_event": last_event or "–", "_class": "errors" if errors else ""})
+    return {**stamp(now), "rows": rows, "tail_bytes": int(tail_bytes)}
+
+
+def _size_label(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.0f} kB"
+    return f"{size / (1024 * 1024):.1f} MB".replace(".", ",")
