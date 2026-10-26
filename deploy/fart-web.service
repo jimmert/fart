@@ -1,0 +1,55 @@
+[Unit]
+Description=fart web: the read-only website (dashboard, observations, reports, settings) on the loopback, behind Caddy
+Documentation=file:///opt/fart/app/deploy/DEPLOY.md
+After=network.target
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=/opt/fart/venv/bin/python -m fart --quiet web
+# a missing or malformed FART_WEB_PASSWORD_HASH / FART_WEB_SECRET exits 2 with a clear message: no restart loop
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=15
+TimeoutStopSec=30
+KillSignal=SIGTERM
+# --- hardening (shared host; listens on 127.0.0.1:8792 only; no outbound connections; writes only its log) ---
+User=fart
+Group=fart
+Slice=fart.slice
+WorkingDirectory=/opt/fart/app
+Environment=FART_ROOT=/opt/fart
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/opt/fart/logs
+ReadOnlyPaths=/opt/fart/data /opt/fart/out
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

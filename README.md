@@ -1,5 +1,43 @@
 # fart
 
+## Voor Jim: wat milestone 8 toevoegt
+
+Mijlpaal 8 zet de website `https://kingdegen.dev` neer, met het dashboard als eerste pagina. Alles erop is alleen-lezen,
+ook voor jou: er is geen knop die iets verandert. Geen regel verandert (de vingerafdruk blijft `sha256:e3bf4320c45c`;
+dezelfde test bewaakt dat), geen schema-migratie, geen nieuwe dependency, geen van de bestaande daemons wordt aangeraakt.
+De beslissingen staan in `docs/DECISIONS.md`, de uitrol stap voor stap in `deploy/DEPLOY.md` ("Milestone 8: website"):
+
+1. **Waar de site draait.** Op de VPS zelf, als `fart-web.service` (gebruiker `fart`, dezelfde hardening als de andere
+   units, luistert alleen op `127.0.0.1:8792`, opent de database uitsluitend alleen-lezen en schrijft niets behalve zijn
+   log), achter de gedeelde Caddy die er al staat; die krijgt één sitebestand (`deploy/caddy/fart.caddy`) voor
+   `kingdegen.dev`. Er gaat niets naar een andere host en er gaat geen nieuwe poort open.
+2. **Login.** Eén eigenaarsaccount: jouw wachtwoord staat alleen als scrypt-hash in `.env` (`FART_WEB_PASSWORD_HASH`,
+   gemaakt met `fart web hash-password`, dat het wachtwoord onzichtbaar vraagt en alleen de hash print) naast een
+   geheim voor de ondertekende sessiecookie (`FART_WEB_SECRET`, van `fart web new-secret`; cookie HttpOnly, Secure,
+   SameSite=Strict, 12 uur geldig). Vijf foute wachtwoorden binnen 10 minuten, per adres én voor het account, betekenen
+   15 minuten wachten; de pagina zegt hoeveel minuten. Zonder geldige sessie geeft elke pagina en elk `/api/`-adres de
+   loginpagina of een 401; zonder beide `.env`-waarden start de dienst niet (duidelijke melding, geen herstartlus).
+3. **Pagina's.** `/` dashboard: versheid van de daemons en timers, de dekking van de laatste 24 uur per uur (een uur
+   NIET GEDEKT blijft leeg, nooit nul), beslissingen van vandaag, de X-stand met de planner (actieve sleutels,
+   stopredenen, plan tegenover uitgaven), de budgetten (CU en X tegenover het plafond), de kernpunten van het laatste
+   dagrapport en de go/no-go-tabel van het laatste weekrapport; `/observaties`: de laatste 200 beslissingen met
+   features, rules_version en uitkomst (winnaar / geen winnaar / onbekend / nog bezig); `/rapporten`: elk dag- en
+   weekrapport als pagina; `/instellingen`: versies, vingerafdruk, de bevroren go/no-go-criteria en de actieve
+   instellingen zonder geheimen. Tijden in Nederlandse tijd met UTC erachter; de banner "Observatie, geen advies. Alles
+   wordt achteraf gemeten." staat op elke pagina; de cijfers verversen elke 60 seconden. Dezelfde gegevens als JSON onder
+   `/api/status`, `/api/coverage`, `/api/decisions`, `/api/x`, `/api/report/latest` en `/api/week/latest`.
+4. **Wat de site níet doet.** Niets schrijven (een schrijfpoging op de databaseverbinding faalt; een test bewijst het),
+   niets van buiten laden (geen extern script, lettertype of tracker; een strikte Content-Security-Policy), nooit een
+   cookie, wachtwoord of token in het log, geen winst- of rendementscijfer: wat onbekend is blijft onbekend.
+5. **Uitrol** (door de deployer): `.env` krijgt de twee nieuwe namen via jouw helper (die kent ze nog niet; DEPLOY.md
+   zegt wat erbij moet), `fart-web` start, het Caddy-sitebestand gaat naar `/srv/fart/fart.caddy` en wordt geïmporteerd,
+   `kingdegen.dev` gaat uit het oude meme-radar-launch-blok, eerst `caddy validate`, dan herladen; de controle is
+   `curl -sI https://kingdegen.dev` (de loginpagina met de beveiligingsheaders). Terugdraaien is de bewaarde kopie van de
+   Caddyfile terugzetten.
+
+Na de uitrol: `fart status` toont `web: password hash configured, secret configured, bind 127.0.0.1:8792`; de rooktest
+is `curl -sI http://127.0.0.1:8792/login` op de VPS (200 met de headers) en daarna de site zelf in je browser.
+
 ## Voor Jim: wat milestone 7 toevoegt
 
 Mijlpaal 7 maakt van de X-bevestigingslaag een kostenbewuste planner: binnen jouw dagplafond van $10 tot $20 haalt hij
@@ -231,6 +269,9 @@ python -m fart chain global      # pump.fun Global account vs config (exit 1 on 
 python -m fart measure track     # one tracker run
 python -m fart measure report --day 2026-10-25
 python -m fart measure week --end 2026-11-02 --days 7   # week report with bootstrap intervals and the frozen go/no-go test
+python -m fart web hash-password # the owner's password as an scrypt hash for .env (asked invisibly; prints the hash only)
+python -m fart web new-secret    # the cookie-signing secret for .env
+python -m fart web               # the website on 127.0.0.1:8792 (read-only; needs both .env values)
 make live                        # opt-in 60 s PumpPortal smoke test (FART_LIVE=1), skips offline
 ```
 
@@ -248,8 +289,9 @@ fart/engine/   meta clustering, as-of features (incl. X), decisions, RPC enrichm
 fart/social/   X budget planner (USD), confirmation planner (keys, schedule, stop reasons), X client (mega/KOL/refresh/confirmation/fast posts), dry run, console calibration, daemon
 fart/notify/   outbox, Telegram sender, Dutch formatting (owner + community), daemon with the chat guard
 fart/measure/  prices, outcomes, paper trades, daily report, week report (bootstrap, go/no-go)
+fart/web/      the website (milestone 8): auth (scrypt, signed cookies, CSRF, login guard), read-only data views, Markdown subset, pages, server, static/
 config/        pumpfun, budget, ingest, engine, measure, stopwords, x, x_kols, notify
-deploy/        systemd units, slice, timers (track 5 min, report 06:00, week 06:30, backup 05:30), install.sh, backup.sh, DEPLOY.md
+deploy/        systemd units (incl. fart-web), slice, timers (track 5 min, report 06:00, week 06:30, backup 05:30), install.sh, backup.sh, caddy/fart.caddy, DEPLOY.md
 docs/          ARCHITECTURE (EN), METING (NL), PUMPFUN-EVENTS, UNVERIFIED, DECISIONS
 tests/         pytest suite with synthetic fixtures; opt-in live smoke test
 ```

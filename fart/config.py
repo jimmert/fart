@@ -1,8 +1,8 @@
 """Settings and paths. Loads $FART_ROOT/.env at runtime; values are never logged.
 
-Secrets (RPC URLs with keys, PumpPortal API key, X bearer token, Telegram bot token) live only in
-`$FART_ROOT/.env` (names in `.env.example`). `Settings.describe()` is the only thing that may be
-logged or printed: it carries hosts and configured/not-configured flags, never values.
+Secrets (RPC URLs with keys, PumpPortal API key, X bearer token, Telegram bot token, the website's password
+hash and cookie secret) live only in `$FART_ROOT/.env` (names in `.env.example`). `Settings.describe()` is the
+only thing that may be logged or printed: it carries hosts and configured/not-configured flags, never values.
 """
 from __future__ import annotations
 
@@ -28,7 +28,11 @@ ENV_KEYS = (
     "TELEGRAM_COMMUNITY_CHAT_ID", "TELEGRAM_COMMUNITY_ENABLED", "TELEGRAM_COMMUNITY_PREVIEW",
     # milestone 6: the X mode (off | shadow | live); unset = off without a token, shadow with one
     "X_MODE",
+    # milestone 8: the website (fart web): loopback bind, the owner's scrypt password hash, the cookie-signing secret
+    "FART_WEB_BIND", "FART_WEB_PASSWORD_HASH", "FART_WEB_SECRET",
 )
+
+DEFAULT_WEB_BIND = "127.0.0.1:8792"
 
 X_MODES = ("off", "shadow", "live")
 
@@ -85,6 +89,9 @@ class Settings:
     telegram_community_chat_id: str = ""
     telegram_community_enabled: bool = False
     telegram_community_preview: bool = False
+    web_bind: str = DEFAULT_WEB_BIND
+    web_password_hash: str = ""
+    web_secret: str = ""
     configs: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -213,6 +220,12 @@ class Settings:
         """TELEGRAM_COMMUNITY_PREVIEW=1: the community text goes to the OWNER as an extra message."""
         return self.telegram_enabled and self.telegram_community_preview
 
+    # ----- milestone 8: the website -------------------------------------------------------------
+    @property
+    def web_configured(self) -> bool:
+        """Both `.env` values the website needs exist; `fart web` refuses to start without them (and checks their shape)."""
+        return bool(self.web_password_hash) and bool(self.web_secret)
+
     def config(self, name: str) -> Any:
         return self.configs[name]
 
@@ -242,6 +255,9 @@ class Settings:
             "telegram_community": "configured" if self.community_configured else "not configured",
             "telegram_community_enabled": self.community_enabled,
             "telegram_community_preview": self.community_preview,
+            "web_bind": self.web_bind,
+            "web_password_hash": "configured" if self.web_password_hash else "not configured",
+            "web_secret": "configured" if self.web_secret else "not configured",
         }
 
 
@@ -288,5 +304,8 @@ def load_settings(root: str | os.PathLike | None = None, env: dict[str, str] | N
         telegram_community_chat_id=merged.get("TELEGRAM_COMMUNITY_CHAT_ID", "").strip(),
         telegram_community_enabled=_flag(merged.get("TELEGRAM_COMMUNITY_ENABLED")),
         telegram_community_preview=_flag(merged.get("TELEGRAM_COMMUNITY_PREVIEW")),
+        web_bind=merged.get("FART_WEB_BIND", "").strip() or DEFAULT_WEB_BIND,
+        web_password_hash=merged.get("FART_WEB_PASSWORD_HASH", "").strip(),
+        web_secret=merged.get("FART_WEB_SECRET", "").strip(),
         configs=load_configs(),
     )

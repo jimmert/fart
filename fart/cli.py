@@ -36,6 +36,11 @@
   chain pda <mint>       derive the bonding-curve PDA (and the unverified pump-amm pool PDA) for a mint
   status                 health, budgets, counts (works on an empty database)
   coverage --hours N     per-hour creates/grads/gaps
+  web                    daemon: the read-only website (dashboard, observations, reports, settings) on FART_WEB_BIND
+                         (127.0.0.1:8792) behind the shared Caddy; needs FART_WEB_PASSWORD_HASH and FART_WEB_SECRET in .env,
+                         opens the database read-only and writes nothing but logs/web.log (milestone 8)
+  web hash-password      ask for the owner's password invisibly (twice) and print only its scrypt hash for .env
+  web new-secret         print a fresh cookie-signing secret for .env (a new secret logs every browser out)
 """
 from __future__ import annotations
 
@@ -105,6 +110,8 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("status")
     c = sub.add_parser("coverage")
     c.add_argument("--hours", type=int, default=24)
+    w = sub.add_parser("web")
+    w.add_argument("wcmd", nargs="?", choices=["hash-password", "new-secret"], help="hash-password | new-secret (default: run the server)")
     return p
 
 
@@ -248,6 +255,8 @@ def cmd_status(settings, as_json: bool) -> int:
     print(f"  telegram community: {s.get('telegram_community', 'not configured')}, "
           f"{'ENABLED' if s.get('telegram_community_enabled') else 'disabled (TELEGRAM_COMMUNITY_ENABLED=0 or no chat id)'}, "
           f"preview to owner {'on' if s.get('telegram_community_preview') else 'off'}")
+    print(f"  web: password hash {s.get('web_password_hash', 'not configured')}, secret {s.get('web_secret', 'not configured')}, "
+          f"bind {s.get('web_bind')} (fart-web.service, read-only, behind Caddy)")
     if "note" in out:
         print(f"  {out['note']}")
         return 0
@@ -657,7 +666,7 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings(root=args.root)
     settings.ensure_dirs()
     daemon = ((args.cmd == "ingest" and not args.icmd) or (args.cmd == "engine" and not args.ecmd) or (args.cmd == "social" and not args.scmd)
-              or (args.cmd == "measure") or (args.cmd == "notify" and not args.ncmd))
+              or (args.cmd == "measure") or (args.cmd == "notify" and not args.ncmd) or (args.cmd == "web" and not args.wcmd))
     setup_logging(settings.logs_dir if daemon else None, args.cmd if args.cmd != "measure" else f"measure-{args.mcmd}", stderr=not args.quiet)
     if args.cmd == "status":
         return cmd_status(settings, args.json)
@@ -703,6 +712,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.ncmd == "outbox":
             return ns.cmd_outbox(settings, args.json)
         return ns.run_notify(settings, once=args.once)
+    if args.cmd == "web":
+        from .web import server as ws
+
+        if args.wcmd == "hash-password":
+            return ws.cmd_hash_password()
+        if args.wcmd == "new-secret":
+            return ws.cmd_new_secret()
+        return ws.run_web(settings)
     if args.cmd == "measure":
         if args.mcmd == "track":
             from .measure.outcomes import run_track

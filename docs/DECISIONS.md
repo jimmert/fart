@@ -751,3 +751,129 @@ console.
     line must not raise the spend), and the dry run and DEPLOY.md say that the full load does not fit $3.00. The planner's
     constants live in `config/x.json` → `planner` and `dryrun`, not in a rule file, so the fingerprint test stays green
     and a later tuning is a commit without a new segment in the week report.
+
+## Milestone 8 (26 oktober 2026)
+
+**Samenvatting voor Jim.** Mijlpaal 8 zet de website `https://kingdegen.dev` neer, met het dashboard als eerste pagina.
+Geen regelbestand verandert (de vingerafdruk blijft `sha256:e3bf4320c45c`; dezelfde test bewaakt dat), er is geen
+schema-migratie, geen nieuwe dependency buiten de standaardbibliotheek, en geen van de bestaande daemons wordt
+aangeraakt. (1) **Waar en hoe.** De site draait **op de VPS zelf, achter de gedeelde Caddy die er al staat**, als
+`fart-web.service` (gebruiker `fart`, dezelfde hardening als de andere units, luistert alleen op `127.0.0.1:8792`, mag
+alleen `logs/` schrijven en ziet `data/` en `out/` alleen-lezen); Caddy krijgt één sitebestand
+(`deploy/caddy/fart.caddy`) voor `kingdegen.dev` dat naar die poort proxyt. Het alternatief, een push-architectuur die
+de cijfers naar een andere host of een statische site duwt, is bewust niet gekozen: de data staat hier, de Caddy met
+de certificaten staat hier, er hoeft geen nieuwe poort open en er komt geen derde partij bij; alleen de deployer raakt
+de Caddy-configuratie aan (met een bewaarde kopie en `caddy validate` vóór elke herlaad). (2) **Alleen-lezen,
+aantoonbaar.** Elke pagina opent de database met `mode=ro` plus `PRAGMA query_only`; een schrijfpoging faalt (een test
+bewijst het), en de unit zelf kan de database niet eens beschrijven. Er is geen knop die iets verandert, ook niet voor
+jou. (3) **Login.** Eén eigenaarsaccount: je wachtwoord staat alleen als scrypt-hash in `.env`
+(`FART_WEB_PASSWORD_HASH`, gemaakt met `fart web hash-password`, dat het wachtwoord onzichtbaar vraagt en alleen de
+hash print), naast een geheim voor de ondertekende sessiecookie (`FART_WEB_SECRET`, van `fart web new-secret`). De
+cookie is HttpOnly, Secure, SameSite=Strict en 12 uur geldig; uitloggen maakt hem direct ongeldig; het loginformulier
+draagt een CSRF-token; vijf foute pogingen binnen 10 minuten, per adres én voor het account, betekenen 15 minuten
+wachten (de pagina zegt hoeveel). Zonder geldige sessie geeft elke pagina en elk `/api/`-adres de loginpagina of een
+401; alleen het eigen CSS- en JS-bestand zijn vrij, want die bevatten geen gegevens. Zonder beide `.env`-waarden
+start de dienst niet (duidelijke melding, geen herstartlus). (4) **Eerlijkheidsregels op elk getal.** De banner
+"Observatie, geen advies. Alles wordt achteraf gemeten." staat op elke pagina; een uur of dag NIET GEDEKT blijft leeg
+(nooit nul); een uitkomst die niet bekend is blijft "onbekend", een beslissing binnen haar 24 uur is "nog bezig"; er
+staat nergens een winst- of rendementscijfer. Tijden in Nederlandse tijd met UTC erachter. (5) **Pagina's en API.**
+`/` dashboard (versheid van daemons en timers, dekking per uur van de laatste 24 uur, beslissingen van vandaag, X-stand
+met planner en plan tegenover uitgaven, budgetten, kernpunten van het laatste dagrapport, go/no-go van het laatste
+weekrapport), `/observaties` (laatste 200 beslissingen met features, rules_version en uitkomst), `/rapporten` (elk
+`out/recall/*.md` als pagina, via een veilige Markdown-subset), `/instellingen` (alleen-lezen: versies, vingerafdruk,
+bevroren criteria, actieve instellingen zonder geheimen); dezelfde gegevens als JSON onder `/api/status`,
+`/api/coverage`, `/api/decisions`, `/api/x`, `/api/report/latest`, `/api/week/latest`; één klein eigen JS-bestand
+ververst de cijfers elke 60 seconden. (6) **Veiligheid in de browser.** Elke respons draagt een strikte
+Content-Security-Policy (`default-src 'self'`, geen inline script of stijl, niets van buiten), `nosniff`,
+`no-referrer`, `X-Frame-Options: DENY`; verzoeken boven 64 KB worden geweigerd; het log bevat nooit een cookie,
+wachtwoord of token. (7) **Uitrol**: `deploy/DEPLOY.md`, "Milestone 8: website": de twee `.env`-waarden via jouw helper
+(die kent de namen nog niet; de paragraaf zegt wat erbij moet), `fart-web` starten en op de loopback controleren, het
+sitebestand naar `/srv/fart/fart.caddy` (Caddy draait als DynamicUser en kan `/opt/fart` niet lezen), `kingdegen.dev`
+uit het oude meme-radar-launch-blok, `caddy validate`, herladen via de admin-API (of een korte herstart van de hele
+Caddy, met waarschuwing), controle met `curl -sI https://kingdegen.dev`, rollback met de bewaarde kopieën.
+
+113. **Branch and PR**: all work on the harness branch `claude/zen-albattani-rr70yt`; the PR targets `main`.
+114. **On the VPS, behind the shared Caddy, no push architecture** (`deploy/caddy/fart.caddy`, `deploy/fart-web.service`):
+    the website is a process next to the daemons that reads the same database and the same `out/recall/` files on the
+    same host, and the existing Caddy (`larp-scanner-https.service`, ports 80/443, the certificate machinery) proxies
+    `kingdegen.dev` to its loopback port. A push of rendered pages or JSON to another host would add a second copy of
+    operational data, a credential to push with, a place to keep in sync and a third party to trust; a new public port
+    would add an exposed TLS stack to maintain. The only change outside `/opt/fart` is one site file and one `import`
+    line in the shared Caddyfile, made by the deployer with a saved copy and `caddy validate` first.
+115. **Standard library only** (`http.server.ThreadingHTTPServer`, `hashlib.scrypt`, `hmac`, `sqlite3`, `html`): no web
+    framework, no template engine, no JS framework. The site is six endpoints and four pages; the framework would be
+    larger than the application, would need updating, and would widen what the CSP has to allow. One connection per
+    request keeps SQLite's thread rules simple and the open cheap.
+116. **Read-only in three layers** (`fart/web/data.py::open_db`, the unit): `mode=ro` plus `PRAGMA query_only=1` on every
+    connection (a write raises `OperationalError`: tested), `ReadWritePaths=/opt/fart/logs` only with
+    `ReadOnlyPaths=/opt/fart/data /opt/fart/out` in the unit (even a bug could not write the database or a report), and
+    no route that changes state (a POST to a page is 405; the only POSTs are login and logout). Because `ReadOnlyPaths`
+    also forbids creating the WAL side files, a read-only open fails at its first query when every daemon is stopped
+    (SQLite removes `-wal` and `-shm` at the last clean close); the open then falls back to `immutable=1`, which reads the
+    checkpointed file without locks: correct while no writer runs, which is exactly when the files are absent, and
+    bounded to one request otherwise. Both paths are documented in `docs/UNVERIFIED.md`.
+117. **Login counters in memory, replayed from the log, not in `kv`** (`fart/web/auth.py::LoginGuard.load_from_log`): the
+    brief asked for the failed-attempt counters in memory and in `kv`, but the website may not write the database, and
+    writing `kv` would need a read-write connection and a path in `ReadWritePaths`. Every failed attempt is logged as
+    `web.login_failed` with the client IP and the time (never the password) in `logs/web.log`, the one file the service
+    writes; at start the guard reads the tail of that log and replays the failures that can still matter (window plus
+    lock, 25 minutes), so a restart does not reset a running lock. The lock is per IP and per account (there is one
+    account): an attacker from many addresses can keep the owner out for 15 minutes at a time, which is the price of the
+    per-account rule the brief asked for; the log shows the IPs.
+118. **Static files without a session** (`/static/app.css`, `/static/app.js`): the brief says every route needs a session,
+    and every route that carries data does. The two static files carry no data, and the login page cannot be styled
+    without them (the CSP forbids inline styles, which was the brief's other requirement). They are the only exception;
+    a test lists the routes that answer 401 without a session, `/api/*` included.
+119. **401 with the login page, no redirect** (`App.handle`): a page requested without a session gets the login form in
+    the body with status 401 (an API route gets `{"error": "login required"}`); after a login the browser always lands on
+    `/`. No `next` parameter, so no open-redirect surface; `curl -sI https://kingdegen.dev` shows `401` with the security
+    headers, which DEPLOY.md calls the correct answer.
+120. **Sessions are signed tokens, revocation in memory** (`auth.Signer`, `auth.Revocations`): `<issued>.<nonce>.<HMAC>`
+    under `FART_WEB_SECRET` with a 12 h life measured from issue, no server-side session table (the database is
+    read-only, and a session file would be a second thing to write). Logout revokes the nonce in memory until the token
+    would have expired anyway; a restart forgets the revocations but keeps the 12 h bound; a new secret in `.env` logs
+    every browser out at once. The CSRF token of the login form is the same signed shape under another domain string
+    (`csrf.`), as a cookie scoped to `/login` and a hidden field that must match (double submit plus signature, 1 h);
+    the logout form carries an HMAC of the session nonce. `hmac.compare_digest` everywhere.
+121. **The password hash format** (`scrypt:n:r:p:<salt hex>:<key hex>`, n=2^14, r=8, p=1, 16 salt bytes, 32 key bytes):
+    chosen so the value survives the `.env` parser (no `=` inside), a shell helper (no `$`, no quotes) and a copy-paste by
+    eye; `parse_hash` bounds n, r and p so a garbled value cannot cost seconds or gigabytes per attempt. `fart web
+    hash-password` asks twice, invisibly, requires 12 characters and prints only the hash; `fart web new-secret` prints
+    32 random bytes as hex. Neither writes anything: the deployer (or Jim's helper) puts the lines in `.env`.
+122. **One data model, two mechanical renderers** (`fart/web/data.py`, `fart/web/pages.py`, `static/app.js`): the API
+    returns raw values next to Dutch display strings (`*_label`), and both the server-side HTML and the 60 s refresh in
+    the browser fill the page from the same JSON by dotted path with the same three rules (None is "–", True is "ja",
+    False is "nee"). The JS builds table rows with `textContent` only: no HTML from data, nothing to escape twice, and
+    the page the browser refreshes is the page the server rendered.
+123. **NIET GEDEKT stays empty on the site too** (`data.coverage_view`, `data.report_latest_view`): an hour without an
+    active create source shows no counts (the gap that caused it is shown), and the key points of a daily report whose
+    day was not covered are all "–" with the universe called unknown, exactly like the report itself (milestone 3,
+    item 51). An unknown outcome of a decision stays "onbekend" with an empty peak (never 0); a decision inside its 24 h
+    is "nog bezig"; a theme observation has "geen eigen uitkomst" (item 110). No paper-trade PnL on the dashboard.
+124. **The freshness table is observation, not a verdict** (`data.FRESHNESS`): per daemon and timer the last heartbeat or
+    run with its age and "vers" / "oud (ouder dan ...)" / "nooit gezien" against an expectation per row (3 minutes for
+    the daemons, 15 for the streams and the 5-minute timer, 26 hours for the daily timers and the backup check). The
+    thresholds are display rules, not alarms; the Telegram health alerts (milestone 2) keep their own.
+125. **Markdown subset instead of a Markdown library** (`fart/web/markdown.py`): the reports use headings, lists, pipe
+    tables, bold and code; the renderer escapes everything first and knows no links, images or raw HTML, so a coin name
+    with `<script>` in it stays a coin name on the page (tested). File names are matched against the two report shapes
+    only (`<day>.md`, `week-<day>.md`), never joined from the URL.
+126. **Caddy: a copy in `/srv/fart`, not an import from `/opt/fart`** (DEPLOY.md, step 5): the shared Caddy runs as a
+    `DynamicUser` that cannot traverse `/opt/fart` (`root:fart 0750`). An `import /opt/fart/app/deploy/caddy/fart.caddy`
+    line would make `caddy reload` from a root shell succeed (the CLI adapts the file as root) and the next
+    `systemctl restart larp-scanner-https` fail for every site on it. The installer refreshes `/srv/fart/fart.caddy`
+    when the directory exists and never reloads Caddy itself; DEPLOY.md validates as `nobody` to see what the
+    DynamicUser sees. HSTS, `-Server` and the request-body limit live in the site file; the application's own headers
+    are repeated there only as defaults (`?`, deferred).
+127. **The unit may not talk to the network** (`IPAddressDeny=any`, `IPAddressAllow=localhost`, `After=network.target`):
+    the website needs the loopback and nothing else; `Restart=on-failure` with `RestartPreventExitStatus=2` makes a
+    missing `.env` value a stopped unit with a clear journal line instead of a restart loop. The installer installs the
+    unit on every run and enables and starts it only when both values exist, so the upgrade can go first and the
+    password later.
+128. **Request limits in the application too** (`server.Handler._request`): 64 KB for the request line, headers and body
+    together (431 or 413, the body never read), `Content-Length` required on a POST (411 for chunked), a 30 s socket
+    timeout, HTTP/1.1 with explicit lengths and `Server: fart` (no Python version on the wire). Caddy's `request_body`
+    limit is the first line of defence; the application does not rely on it.
+129. **`.env` names and `fart status`**: `FART_WEB_BIND` (default `127.0.0.1:8792`), `FART_WEB_PASSWORD_HASH`,
+    `FART_WEB_SECRET` join `ENV_KEYS`; `Settings.describe()` reports them as configured / not configured and `fart
+    status` prints a `web:` line; the test that pins `.env.example` to `ENV_KEYS` covers the new names with empty values.

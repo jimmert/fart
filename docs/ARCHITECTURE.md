@@ -1,4 +1,4 @@
-# Architecture (milestone 7)
+# Architecture (milestone 8)
 
 `fart` is a read-only consumer of public Solana / pump.fun data. It never signs, never trades.
 Milestone 1 delivered complete and redundant ingestion, an event-time data model in which hindsight
@@ -24,9 +24,11 @@ fingerprint). It also records per day what the engine saw of every candidate (`e
 adds two read-only tools (`fart social dryrun`, `fart budget calibrate`). Milestone 7 turns the X confirmation layer into a
 cost-aware planner (`fart/social/planner.py`, `fart/social/xbudget.py`): keys only from observations in a hard order, an
 adaptive count schedule with stop rules per key (`x_keys`), a budget planner that defers on the hourly envelope and
-never exceeds the cap, quality-per-dollar lines in the reports and `fart social calibrate` for the console prices. Still
-no ML, no web UI, no trading, and the only outbound write anywhere is `sendMessage` to the owner chat (and, once Jim
-switches it on after the week, to the community chat).
+never exceeds the cap, quality-per-dollar lines in the reports and `fart social calibrate` for the console prices.
+Milestone 8 adds the website (`fart/web/`, `fart-web.service`): a read-only, Dutch, login-protected view of the same
+data on the loopback behind the VPS's shared Caddy, with the database opened read-only and nothing written but its log.
+Still no ML, no trading, and the only outbound write anywhere is `sendMessage` to the owner chat (and, once Jim switches
+it on after the week, to the community chat).
 
 ## Processes
 
@@ -38,6 +40,8 @@ switches it on after the week, to the community chat).
                                         data/raw/...  coins / migrations / trades / coverage / ws_subscriptions
                                                                                     ◄── fart-notify (20 s)  Telegram
                                                                                     ◄── fart-measure-track (5 min), -report (06:00), -week (06:30)
+                                                                       SQLite (mode=ro) ◄── fart-web (127.0.0.1:8792) ◄── shared Caddy ◄── https://kingdegen.dev
+                                                                       out/recall/*.md ──┘
 ```
 
 * **fart-ingest** (`fart/ingest/service.py`): one PumpPortal connection (`pumpportal.py`; trade
@@ -258,6 +262,46 @@ logged as host only.
 counts of `coins`, `migrations`, `decisions` and `outcomes` compared with the live database (live >= archive),
 the copy removed; a failure exits 1 and fails the unit; the result lands in kv `backup.verify.last` for
 `fart status`. The offsite copy (scp from a second machine) and the restore drill are in `deploy/DEPLOY.md`.
+
+## Website (milestone 8)
+
+`fart web` (`fart/web/server.py`) is a `ThreadingHTTPServer` from the standard library on `FART_WEB_BIND`
+(`127.0.0.1:8792`); the shared Caddy of the VPS (`deploy/caddy/fart.caddy`, imported by its Caddyfile) terminates TLS for
+`kingdegen.dev` and proxies to it. The site runs on the VPS because the data is there and the Caddy is there: no push to
+another host, no new public port, no third party. It shows what `fart status`, `fart coverage`, the decisions table,
+the X planner and the reports under `out/recall/` already know, in Dutch, with the banner "Observatie, geen advies.
+Alles wordt achteraf gemeten." on every page and the honesty rules of the reports applied to every number: an hour
+or a day NIET GEDEKT stays empty, an unknown outcome stays "onbekend", a decision inside its 24 h is "nog bezig".
+
+* **Read-only, provably.** Every request opens its own connection with `mode=ro` and `PRAGMA query_only`
+  (`fart/web/data.py::open_db`); a write raises. The unit has `ReadWritePaths=/opt/fart/logs` only and
+  `ReadOnlyPaths=/opt/fart/data /opt/fart/out`, so even a bug could not write the database or the reports. Because the
+  WAL files cannot be created under those paths, the connection falls back to `immutable=1` when the daemons are all
+  stopped and the `-wal`/`-shm` files are gone (the normal open then fails at the first query). The pages carry no
+  button that changes anything, also not for the owner; a POST to a page answers 405.
+* **Login** (`fart/web/auth.py`): one owner account whose scrypt hash (`hashlib.scrypt`, n=2^14, r=8, p=1) lives in
+  `.env` (`FART_WEB_PASSWORD_HASH`, made by `fart web hash-password`); a stateless session token
+  `<issued>.<nonce>.<HMAC-SHA256>` under `FART_WEB_SECRET` (`fart web new-secret`), 12 h, in a cookie that is HttpOnly,
+  Secure and SameSite=Strict, with logout revoking the nonce in memory; a CSRF token on the login form (the same signed
+  shape, as a cookie for `/login` and a hidden field that must match); a login guard of 5 failures per 10 minutes per
+  IP and per account, then 15 minutes of waiting. The guard counts in memory and, because the database's `kv` is off
+  limits to this process, is replayed from the service's own JSON-lines log (`web.login_failed` with the IP) at start,
+  so a restart does not reset a running lock. Without a valid session every route but `/login` and the two static files
+  answers 401 (the login page, or JSON for `/api/*`).
+* **No inline code.** Every response carries `Content-Security-Policy: default-src 'self'; script-src 'self'; ...;
+  frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`,
+  `Cache-Control: no-store`. The one JS file (`static/app.js`) refreshes the JSON endpoints every 60 s and fills the
+  page through `textContent` with the same path-and-format rules the server used to render it (`fart/web/pages.py`):
+  one data model, two mechanical renderers. Reports are rendered by a Markdown subset (`fart/web/markdown.py`: headings,
+  lists, tables, bold, code; everything escaped, no links, no HTML).
+* **Limits and log hygiene.** The request line, headers and body together may not exceed 64 KB (431 / 413 without
+  reading the body; Caddy enforces the same with `request_body`), a socket timeout of 30 s, HTTP/1.1 with explicit
+  lengths. The log has the method, the path without its query, the status, the duration and the client IP (the last
+  `X-Forwarded-For` entry that Caddy appends), never a cookie, a password, a token or a body.
+* **Unit** (`deploy/fart-web.service`): the hardening of the other units plus `IPAddressDeny=any` and
+  `IPAddressAllow=localhost` (the website needs no network beyond the loopback), `Restart=on-failure` with
+  `RestartPreventExitStatus=2` (a missing `.env` value is a configuration error, not a crash loop). The installer
+  installs the unit always and starts it only when both `.env` values exist.
 
 ## What comes after milestone 6
 

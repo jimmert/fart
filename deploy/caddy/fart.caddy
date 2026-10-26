@@ -1,0 +1,34 @@
+# fart website (milestone 8): kingdegen.dev -> fart-web.service on 127.0.0.1:8792 (loopback only).
+#
+# Site file for the VPS's shared Caddy 2.6.2 (larp-scanner-https.service), no plugins. Install it where that Caddy can
+# read it and import it from /srv/larp-scanner/https/Caddyfile (deploy/DEPLOY.md, "Milestone 8: website"):
+#
+#   install -D -m 0644 -o root -g root /opt/fart/app/deploy/caddy/fart.caddy /srv/fart/fart.caddy
+#   echo 'import /srv/fart/fart.caddy' >> /srv/larp-scanner/https/Caddyfile
+#
+# (Caddy runs as a DynamicUser and cannot read /opt/fart itself, which is root:fart 0750: importing the file straight
+# from /opt/fart/app would make `caddy reload` work from a root shell and the next restart of Caddy fail.)
+#
+# The application sets the Content-Security-Policy, X-Content-Type-Options, Referrer-Policy, X-Frame-Options and
+# Cache-Control on every response itself; Caddy adds HSTS, repeats the three simple ones as defaults (`?`: only when the
+# upstream did not send them, e.g. on its own error pages) and hides its Server header. The 64 KB request limit is
+# enforced twice: here (request_body) and in the application (431/413).
+
+kingdegen.dev, www.kingdegen.dev {
+	encode zstd gzip
+
+	request_body {
+		max_size 64KB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		?X-Content-Type-Options nosniff
+		?Referrer-Policy no-referrer
+		?X-Frame-Options DENY
+		-Server
+		defer
+	}
+
+	reverse_proxy 127.0.0.1:8792
+}

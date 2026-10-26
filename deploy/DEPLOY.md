@@ -9,7 +9,7 @@ Target layout (shared host, unprivileged user, outbound HTTPS/WSS only, no inbou
   venv/               python3.12 venv with websockets
   data/               fart.db (SQLite WAL), raw/<source>/YYYYMMDD/HH.jsonl.gz, archive/, backup/
   out/recall/         daily reports <day>.json + <day>.md, week reports week-<end>.json + .md (milestone 5)
-  logs/               ingest.log, engine.log, social.log, notify.log, measure-*.log (JSON lines, 5 MB x 5)
+  logs/               ingest.log, engine.log, social.log, notify.log, measure-*.log, web.log (JSON lines, 5 MB x 5)
   .env                root:fart 0640 - the ONLY place where keys live
 ```
 
@@ -29,12 +29,16 @@ systemd units (all in `deploy/`, installed to `/etc/systemd/system/`):
 | `fart-measure-report.timer` | daily recall report for the previous UTC day | 06:00 UTC |
 | `fart-measure-week.timer` | week report (rolling 7 days ending yesterday; the Monday run is the Monday-Sunday calendar week): universe, hit rate, recall, lead time, bootstrap intervals, costs, the frozen go/no-go test (milestone 5) | 06:30 UTC daily |
 | `fart-backup.timer` | SQLite online backup + quick_check, 14 days kept; since milestone 6 followed by `fart backup verify` (the newest archive unpacked, checked and compared with the live database; a failed check fails the unit) | 05:30 UTC |
+| `fart-web.service` | the website (milestone 8): dashboard, observations, reports, settings, in Dutch, behind a login, on `127.0.0.1:8792` only; the shared Caddy serves it as `https://kingdegen.dev`; the database is opened read-only (`mode=ro`, `PRAGMA query_only`), the unit may write only `logs/`; installed always, started only with `FART_WEB_PASSWORD_HASH` and `FART_WEB_SECRET` in `.env` | daemon |
 
 Hardening on every service: `User=fart`, `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
 `PrivateTmp`, `PrivateDevices`, `ReadWritePaths=/opt/fart/data /opt/fart/out /opt/fart/logs`,
 `CapabilityBoundingSet=`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`,
 `SystemCallArchitectures=native`, `SystemCallFilter=@system-service`, `UMask=0027`, plus the usual
-`Protect*`/`Restrict*` set. The code never signs anything and never opens a listening socket.
+`Protect*`/`Restrict*` set. The code never signs anything. The only listening socket is the website's
+(milestone 8): `fart-web.service` binds `127.0.0.1:8792`, has `ReadWritePaths=/opt/fart/logs` only,
+`ReadOnlyPaths=/opt/fart/data /opt/fart/out`, and `IPAddressDeny=any` + `IPAddressAllow=localhost`, so it
+can neither write the database nor reach the internet; the shared Caddy is the only thing that talks to it.
 
 ## 1. Prerequisites (once, as root)
 
@@ -80,6 +84,9 @@ TELEGRAM_NOTIFY_ENABLED=0           # 1 = send; 0 = build nothing, send nothing
 TELEGRAM_COMMUNITY_CHAT_ID=         # milestone 5, leave empty: the community chat (group/channel id); never sent to without BOTH set
 TELEGRAM_COMMUNITY_ENABLED=0        # milestone 5, leave 0 during the measurement week: 1 = community messages to that chat
 TELEGRAM_COMMUNITY_PREVIEW=0        # milestone 5: 1 = the community text to the OWNER, headed "VOORBEELD community-bericht"
+FART_WEB_BIND=127.0.0.1:8792        # milestone 8: where fart-web listens (loopback only; Caddy proxies kingdegen.dev to it)
+FART_WEB_PASSWORD_HASH=             # milestone 8: the owner's password as an scrypt hash, printed by `fart web hash-password`
+FART_WEB_SECRET=                    # milestone 8: the cookie-signing secret, printed by `fart web new-secret`
 FART_ROOT=/opt/fart
 ```
 
@@ -87,7 +94,7 @@ Leave `RPC_HTTP_URL`/`RPC_WSS_URL` empty to run on the public RPC (`api.mainnet-
 strict rate limits, no key, **no per-mint trade stream**). The file is read by the processes directly
 (`root:fart 0640`); it is never logged and never copied anywhere. `fart status` prints only
 `configured` / `not configured` per key. After editing:
-`sudo systemctl restart fart-ingest fart-engine fart-social fart-notify`.
+`sudo systemctl restart fart-ingest fart-engine fart-social fart-notify` (and `fart-web` for the two website names).
 
 The community channel (milestone 5) is off by default and stays off until two names are set explicitly:
 `TELEGRAM_COMMUNITY_CHAT_ID` (the chat id of the group or channel; the bot must be a member or admin there)
@@ -214,7 +221,7 @@ not running. Step by step:
 3. **Put the CU cap back** in `/opt/fart/.env`: `RPC_DAILY_BUDGET_CU=4500000` → `RPC_DAILY_BUDGET_CU=3000000`
    (the override was only there because the trade stream burned 2.4M CU in two hours; the envelope now
    bounds that stream to 125,000 CU per hour at this cap). Then
-   `sudo systemctl restart fart-ingest fart-engine fart-social fart-notify`.
+   `sudo systemctl restart fart-ingest fart-engine fart-social fart-notify` (and `fart-web` for the two website names).
 4. **Verify the backup fix** (the script, not the syscall filter, changed):
    ```bash
    sudo systemctl start fart-backup.service
@@ -289,7 +296,7 @@ subscriptions, what closed today and why, bytes next to CU. Step by step:
 3. **Put the CU cap back** in `/opt/fart/.env`: `RPC_DAILY_BUDGET_CU=4500000` → `RPC_DAILY_BUDGET_CU=3000000`
    (the stream is bounded to 43,750 CU per hour at this cap by its daily share; the engine, the log stream
    and the enrichment keep the other 65%). Then
-   `sudo systemctl restart fart-ingest fart-engine fart-social fart-notify`.
+   `sudo systemctl restart fart-ingest fart-engine fart-social fart-notify` (and `fart-web` for the two website names).
 4. **Verify after 15 minutes:**
    ```bash
    sudo -u fart /opt/fart/bin/fart status
@@ -651,6 +658,149 @@ Step by step:
    clean way back if you want the table gone. Put `X_DAILY_BUDGET_USD` back to 3.00 when rolling back: the M6 layer
    spends up to the cap.
 
+## 5g. Milestone 8: website (M8)
+
+M8 adds the website `https://kingdegen.dev`: a dashboard as its first page (health and freshness of the daemons and
+timers, the coverage of the last 24 hours per hour, today's decisions, the X state, the planner and plan versus
+spend, the budgets, the key points of the latest daily report and the go/no-go section of the latest week report),
+`/observaties` (the last 200 decisions with features, rules_version and outcome status), `/rapporten` (every
+`out/recall/*.md` rendered as HTML) and `/instellingen` (read-only: rules_version, fingerprint, method_version, the
+frozen go/no-go criteria, the active configuration without secrets), plus the same data as JSON under `/api/status`,
+`/api/coverage`, `/api/decisions`, `/api/x`, `/api/report/latest` and `/api/week/latest`. Everything is behind a
+login (one owner account), everything is read-only, also for the owner: there is no button that changes anything.
+No rule file changes (the fingerprint stays `sha256:e3bf4320c45c`; the same test pins it), no schema migration, no new
+dependency (standard library only), none of the existing daemons is touched.
+
+How it is built on the VPS, and why: the site runs **on the VPS itself**, as `fart-web.service` (user `fart`, the
+hardening of the other units, `127.0.0.1:8792` only, the database opened read-only, writing nothing but
+`logs/web.log`), behind the **existing shared Caddy** (`larp-scanner-https.service`, which already holds the
+certificate machinery and the ports 80/443 for the other projects). Nothing is pushed to another host, no new port is
+opened. The login is a password whose scrypt hash lives in `.env` next to the other secrets, with a signed session
+cookie (HttpOnly, Secure, SameSite=Strict, 12 hours), a CSRF token on the form, and a login guard (5 failed attempts
+per 10 minutes per IP and per account, then 15 minutes of waiting; counted in memory and replayed from `web.log` at a
+restart, because the website may not write the database's `kv`). Every response carries a strict
+Content-Security-Policy (`default-src 'self'`, no inline scripts: one small CSS and one small JS file of our own, no
+external script, font or tracker), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`,
+`X-Frame-Options: DENY`; requests over 64 KB are refused; the log never carries a cookie, a password or a token. The
+honesty rules of the reports apply to every number on the site: observation, no advice; unknown stays unknown; an hour
+or day NIET GEDEKT stays empty; no profit or return figure anywhere.
+
+What the deployer does, step by step (all as root on the VPS unless stated; `.env` is edited by Jim's helper, see
+step 3):
+
+1. **Pull and install** (the usual update; no migration this time):
+   ```bash
+   cd /opt/fart-src && git pull --ff-only && sudo deploy/install.sh
+   ```
+   The installer installs `fart-web.service` but **does not start it**: it prints `fart-web.service installed but NOT
+   started: set FART_WEB_PASSWORD_HASH ... and FART_WEB_SECRET ...` until both values exist in `/opt/fart/.env`. The
+   other daemons restart as always. `fart status` gains the line `web: password hash not configured, secret not
+   configured, bind 127.0.0.1:8792`.
+2. **Make the two values** (nothing is written anywhere by these commands; they only print):
+   ```bash
+   sudo -u fart /opt/fart/bin/fart web hash-password     # asks the password twice, invisibly; prints ONLY the hash (scrypt:16384:8:1:<salt>:<key>)
+   sudo -u fart /opt/fart/bin/fart web new-secret        # prints 64 hex characters
+   ```
+   Jim types the password himself at the first prompt (at least 12 characters); the hash is what goes into `.env`,
+   never the password. The hash carries no `$`, `=` or quote, so a shell helper can pass it as it is.
+3. **Put them in `.env` with Jim's helper.** `/root/fart-setsecret.sh` does not know the two new names yet. What to add
+   to it: the names `FART_WEB_PASSWORD_HASH` and `FART_WEB_SECRET` to its list (or `case`) of allowed keys, and
+   `fart-web.service` to the units it restarts after a change (only `fart-web` needs a restart for these two names; the
+   other daemons never read them). The two lines in `/opt/fart/.env` are then:
+   ```
+   FART_WEB_PASSWORD_HASH=scrypt:16384:8:1:<salt hex>:<key hex>
+   FART_WEB_SECRET=<64 hex characters>
+   ```
+   (`FART_WEB_BIND` may stay absent: the default is `127.0.0.1:8792`; `.env` stays `root:fart 0640`.) Without the
+   helper the same two lines go in with an editor as root, after which `chmod 0640 /opt/fart/.env && chown root:fart
+   /opt/fart/.env`. A new secret logs every browser out; a new hash changes the password; neither touches anything else.
+4. **Start the website on the loopback and check it before Caddy knows it:**
+   ```bash
+   sudo systemctl enable --now fart-web
+   systemctl status fart-web --no-pager                       # active (running)
+   journalctl -u fart-web -n 5 --no-pager                     # web.started bind="127.0.0.1:8792" ... readonly=true
+   curl -sI http://127.0.0.1:8792/login | head -8             # HTTP/1.1 200, Content-Security-Policy, X-Frame-Options: DENY, Set-Cookie: fart_csrf=...
+   curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8792/api/status   # 401 without a session
+   ```
+   A unit that ends at once with `fart web: FART_WEB_PASSWORD_HASH is ...` in the journal means step 3 is incomplete
+   (exit status 2, no restart loop: `RestartPreventExitStatus=2`); after fixing `.env`, `systemctl restart fart-web`.
+   (Re-running `sudo deploy/install.sh` after step 3 also enables and starts the unit.)
+5. **Give Caddy the site file.** Caddy runs as a `DynamicUser` and cannot read `/opt/fart` (`root:fart 0750`), so the
+   file is copied to a place it can read instead of imported from `/opt/fart/app` directly (an import from `/opt/fart`
+   would make `caddy reload` from a root shell succeed and the next restart of Caddy fail for every site):
+   ```bash
+   install -d -m 0755 -o root -g root /srv/fart
+   install -m 0644 -o root -g root /opt/fart/app/deploy/caddy/fart.caddy /srv/fart/fart.caddy
+   ```
+   From now on every `deploy/install.sh` run refreshes `/srv/fart/fart.caddy` when the repository's copy changed (it
+   prints a line saying so) and never reloads Caddy itself. The file holds one site block for `kingdegen.dev,
+   www.kingdegen.dev` with `encode zstd gzip`, `request_body { max_size 64KB }`, HSTS plus the three simple security
+   headers as defaults (`?`, deferred until the upstream answered), `-Server`, and `reverse_proxy 127.0.0.1:8792`:
+   plain Caddy 2.6.2, no plugin. If `www.kingdegen.dev` has no A record, remove it from the first line before
+   validating (Caddy would otherwise keep trying to obtain a certificate for it and log the failures).
+6. **Edit the shared Caddyfile, with a copy first:**
+   ```bash
+   STAMP=$(date -u +%Y%m%d-%H%M%S)
+   cp -a /srv/larp-scanner/https/Caddyfile /srv/larp-scanner/https/Caddyfile.before-fart-$STAMP
+   cp -a /srv/meme-radar-launch/launch.caddy /srv/meme-radar-launch/launch.caddy.before-fart-$STAMP
+   grep -n kingdegen /srv/meme-radar-launch/launch.caddy /srv/larp-scanner/https/Caddyfile
+   ```
+   In `/srv/meme-radar-launch/launch.caddy` take **only** `kingdegen.dev` out of the site address line of the old
+   meme-radar-launch block (the "tijdelijk offline" page): `launch.kingdegen.dev` and the sslip host stay exactly as
+   they are (mind the comma that separated the hosts). Then add the import at the end of
+   `/srv/larp-scanner/https/Caddyfile`, next to the imports of the other projects:
+   ```bash
+   echo 'import /srv/fart/fart.caddy' >> /srv/larp-scanner/https/Caddyfile
+   ```
+   A host that is still in both blocks makes the validation of the next step fail (`ambiguous site definition`), so a
+   forgotten edit cannot go live.
+7. **Validate before anything is reloaded** (`caddy validate`), as a user that cannot read `/opt/fart` (that mimics the DynamicUser):
+   ```bash
+   CADDY=/srv/larp-scanner/https/extracted/usr/bin/caddy
+   sudo -u nobody $CADDY validate --config /srv/larp-scanner/https/Caddyfile --adapter caddyfile
+   ```
+   `Valid configuration` is the only acceptable answer (if `nobody` cannot run that binary, validate as root and check
+   `ls -l /srv/fart/fart.caddy` is `-rw-r--r-- root root` in a `0755` directory by hand). Fix and repeat until valid.
+8. **Reload.** Preferably through the admin API, which touches no other site:
+   ```bash
+   $CADDY reload --config /srv/larp-scanner/https/Caddyfile --adapter caddyfile
+   ```
+   `caddy reload` reads the Caddyfile as root, adapts it and posts the result to the admin endpoint (localhost:2019
+   by default); if that endpoint is off in this Caddy (`admin off`, or the command says it cannot connect), the
+   alternative is `systemctl restart larp-scanner-https`, which **interrupts every site on that Caddy for a few
+   seconds** (the other projects included): say so in the channel before doing it, and prefer a quiet hour. Caddy then
+   obtains the certificate for `kingdegen.dev` (and `www`) on first use; the first request may take a few seconds.
+9. **Check from outside:**
+   ```bash
+   curl -sI https://kingdegen.dev | head -12
+   #   HTTP/2 401 (the login page: correct without a session), content-security-policy, x-content-type-options: nosniff,
+   #   referrer-policy: no-referrer, x-frame-options: DENY, strict-transport-security, no `server:` line
+   curl -sI https://kingdegen.dev/login | head -3          # HTTP/2 200
+   curl -sI https://launch.kingdegen.dev | head -3         # still the old block (200 or whatever it served before)
+   journalctl -u larp-scanner-https --since -10min --no-pager | tail -20   # certificate obtained; no error for kingdegen.dev
+   journalctl -u fart-web -n 20 --no-pager                 # web.request lines with ip=<Jim's address>, never a cookie or token
+   ```
+   Then Jim opens `https://kingdegen.dev` in a browser, logs in with his password and sees the dashboard: the banner
+   "Observatie, geen advies. Alles wordt achteraf gemeten.", the health table (every daemon `vers`; the report and week
+   timers `oud` or `nooit` until their first run after the upgrade is in the past), the coverage table with the hours
+   fart was down as `NIET GEDEKT` and empty, today's decisions, the X card (`uit` until the key goes in), the budgets, the
+   latest daily report's key points and the week report's go/no-go table. The page refreshes its numbers every 60 s;
+   five wrong passwords lock the login for 15 minutes (the page says so with the minutes left).
+10. **Rollback** (any step after 6 goes wrong): put the saved copies back and reload or restart Caddy the same way:
+    ```bash
+    cp -a /srv/larp-scanner/https/Caddyfile.before-fart-$STAMP /srv/larp-scanner/https/Caddyfile
+    cp -a /srv/meme-radar-launch/launch.caddy.before-fart-$STAMP /srv/meme-radar-launch/launch.caddy
+    sudo -u nobody $CADDY validate --config /srv/larp-scanner/https/Caddyfile --adapter caddyfile && $CADDY reload --config /srv/larp-scanner/https/Caddyfile --adapter caddyfile
+    ```
+    `kingdegen.dev` then shows the "tijdelijk offline" page again. The website itself is stopped with `systemctl disable
+    --now fart-web`; removing the two names from `.env` is not needed for that. A rollback of the code to M7 (`git
+    checkout <M7 commit> && sudo deploy/install.sh`) leaves `fart-web.service` in `/etc/systemd/system/` as a unit
+    without a program: disable it first (`systemctl disable --now fart-web`), then roll back.
+
+Notes for the owner, in Dutch, are in `README.md` ("wat milestone 8 toevoegt") and `docs/DECISIONS.md` (milestone
+8); the design is in `docs/ARCHITECTURE.md` ("Website"); the assumptions about this Caddy to verify at the rollout are
+in `docs/UNVERIFIED.md` ("Website / Caddy").
+
 ## 6. First-day checklist (docs/UNVERIFIED.md)
 
 1. `fart chain global`: reserves, supply, `fee_basis_points` 95 and `creator_fee_basis_points` 5 must
@@ -777,6 +927,12 @@ old rows stay, new rows get the old version string again.
 | `x mode note: X_MODE=live refused` in `status` (M6) | `X_MODE=live` without `"x_live": true` in `config/engine.json` | expected during the measurement week: the watch runs in shadow; after the week the key is a commit (new fingerprint) |
 | `x shadow: ... daemons report social=shadow engine=off` (M6) | the two daemons read different `.env` states (one was not restarted) | `sudo systemctl restart fart-social fart-engine`; both must report the same mode |
 | `x planner: ... deferred today: ca_counts N` growing through the peak hours (M7) | the envelope paces more than the morning: the day's plan is bigger than the cap allows (many keys, or a cap under 10.00) | `fart social dryrun`: compare `total` and `full load` with the cap; raise `X_DAILY_BUDGET_USD` within 10.00 to 20.00, or lower `planner.max_active_keys` in a commit; a deferred count is done later, never lost until the key's window ends |
+| `fart-web` inactive right after `install.sh` (M8) | both `.env` names are not set yet: the installer never starts the website without them | steps 2 and 3 of section 5g; then `systemctl enable --now fart-web` |
+| `journalctl -u fart-web` says `fart web: FART_WEB_PASSWORD_HASH is not a hash made by ...` or `... is too short` (M8) | a value in `.env` was pasted incompletely or edited | re-run `fart web hash-password` / `fart web new-secret`, paste the whole line; `systemctl restart fart-web` |
+| `https://kingdegen.dev` gives 502 (Caddy) while `curl -sI http://127.0.0.1:8792/login` works (M8) | Caddy cannot reach the loopback port: a different `FART_WEB_BIND`, or the unit is down | `systemctl status fart-web`; `FART_WEB_BIND` must be `127.0.0.1:8792` (the Caddy site file names that port) |
+| `web.request ... status=500` in `logs/web.log` with `web.request_failed` and `unable to open database file` (M8) | the read-only open could not use the WAL files (the daemons were all stopped, so `-wal`/`-shm` were removed and `ReadOnlyPaths` forbids creating them) and the `immutable` fallback failed too | start `fart-ingest` (it recreates the WAL files); the next page load works; a page error is never a data error |
+| the login says `Te veel mislukte pogingen. Wacht N minuten` for Jim himself (M8) | five wrong passwords within 10 minutes from his IP, or from anyone for the single account (the lock is per IP and per account) | wait the minutes shown; `journalctl -u fart-web | grep login_failed` shows the IPs; a restart of `fart-web` does not reset the lock (it is replayed from `web.log`) |
+| Caddy fails to start after `systemctl restart larp-scanner-https` with `permission denied` on the fart import (M8) | the Caddyfile imports `/opt/fart/app/deploy/caddy/fart.caddy` directly (unreadable for the DynamicUser) instead of `/srv/fart/fart.caddy` | step 5 and 6 of section 5g; validate as `nobody`; `caddy reload` would have hidden this |
 | `budget x ... blocked N` growing with `daily_cost_cap` or `account_watch_reserve` rows in `api_ledger` (M7) | a hard rule refused calls: the cap or the 70% confirmation share is spent | not expected at 15.00 (the full load is 66% of it); check `x spend today` per kind and `select stop_reason, count(*) from x_keys ...`; a run of `exhausted` keys means the stop rules do not bite (docs/UNVERIFIED.md, "Milestone 7") |
 | `x planner: active keys 20` for hours and `stopped today: displaced N` (M7) | more observations than slots; the youngest keep displacing the oldest | expected only on a very busy day; `planner.max_active_keys` is a commit; the displaced keys' counts stay in `shadow_confirmations` |
 | `fart social calibrate` says `verdict: adjust` (M7) | the console's amount differs from our ledger by more than 5% | read the console's per-endpoint breakdown, change `config/x.json` → `prices` in a commit (not a rule file), write the figures into docs/UNVERIFIED.md; a unit mismatch (per request instead of per post) is a code change |

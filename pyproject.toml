@@ -21,6 +21,9 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["fart*"]
 
+[tool.setuptools.package-data]
+fart = ["web/static/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

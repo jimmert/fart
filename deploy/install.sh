@@ -6,6 +6,9 @@
 # - /opt/fart/bin/fart: executable wrapper (cd into the app, FART_ROOT set, exec the venv python -m fart)
 # - applies the database schema migration (PRAGMA user_version) before the daemons restart
 # - systemd units fart-* installed, enabled and (re)started (fart-social / fart-notify when present)
+# - milestone 8: fart-web.service (the website on 127.0.0.1:8792) is installed always but enabled and started only when
+#   /opt/fart/.env carries both FART_WEB_PASSWORD_HASH and FART_WEB_SECRET; the Caddy site file is copied to
+#   /srv/fart/fart.caddy when that directory exists (the deployer created it at the milestone-8 rollout), never reloaded
 # Never overwrites an existing /opt/fart/.env. Prints the verification commands at the end.
 set -euo pipefail
 
@@ -94,7 +97,8 @@ chmod 0640 "$FART_ROOT/.env"
 # watchlist rows and flags migrations without a create (kv schema.v4.cleanup); milestone 5 (user_version 5)
 # trims the meta_burst watchlist rows above the engine's bound of 40 (kv schema.v5.cleanup); milestone 6
 # (user_version 6) only creates the tables shadow_decisions, shadow_confirmations and engine_candidates;
-# milestone 7 (user_version 7) adds the planner table x_keys and the column x_spend.unit; a second run changes nothing.
+# milestone 7 (user_version 7) adds the planner table x_keys and the column x_spend.unit; milestone 8 adds no migration
+# (the website reads only); a second run changes nothing.
 if [ -f "$FART_ROOT/data/fart.db" ]; then
   if STATUS_JSON="$(sudo -u "$FART_USER" "$FART_ROOT/bin/fart" --quiet --json status 2>/dev/null)"; then
     log "database schema: $(printf '%s' "$STATUS_JSON" | "$VENV/bin/python" -c 'import json,sys
@@ -126,6 +130,22 @@ for u in fart-social.service fart-notify.service; do
     OPTIONAL_SERVICES="$OPTIONAL_SERVICES $u"
   fi
 done
+# --- milestone 8: the website runs only when both .env values exist (fart web refuses to start without them) -----
+env_value() { grep -E "^[[:space:]]*$1=" "$FART_ROOT/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '[:space:]"'"'"; }
+WEB_READY=0
+if [ -n "$(env_value FART_WEB_PASSWORD_HASH)" ] && [ -n "$(env_value FART_WEB_SECRET)" ]; then
+  WEB_READY=1
+  systemctl enable fart-web.service >/dev/null
+  OPTIONAL_SERVICES="$OPTIONAL_SERVICES fart-web.service"
+else
+  log "fart-web.service installed but NOT started: set FART_WEB_PASSWORD_HASH (fart web hash-password) and FART_WEB_SECRET (fart web new-secret) in $FART_ROOT/.env, then: systemctl enable --now fart-web"
+fi
+if [ -d /srv/fart ]; then
+  if ! cmp -s "$APP/deploy/caddy/fart.caddy" /srv/fart/fart.caddy 2>/dev/null; then
+    install -m 0644 -o root -g root "$APP/deploy/caddy/fart.caddy" /srv/fart/fart.caddy
+    log "Caddy site file updated at /srv/fart/fart.caddy: validate and reload Caddy (deploy/DEPLOY.md, 'Milestone 8: website')"
+  fi
+fi
 if [ "$START_SERVICES" = "1" ]; then
   systemctl restart fart-ingest.service
   systemctl restart fart-engine.service
@@ -151,4 +171,11 @@ echo "  sudo -u $FART_USER $FART_ROOT/bin/fart social calibrate --day <day> --co
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart engine explain --day $(date -u +%F)             # why (no) observations today (M6)"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart measure week --end $(date -u -d yesterday +%F 2>/dev/null || date -u +%F) --days 1   # week report smoke test (M5), sends nothing"
 echo "  systemctl list-timers 'fart-*' --no-pager                          # fart-measure-week.timer daily 06:30 UTC"
+if [ "$WEB_READY" = "1" ]; then
+  echo "  curl -s -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8792/login   # 200: fart-web answers on the loopback (M8); the site itself: https://kingdegen.dev"
+  echo "  journalctl -u fart-web -n 20 --no-pager                              # web.started ... readonly=true"
+else
+  echo "  sudo -u $FART_USER $FART_ROOT/bin/fart web hash-password                # M8: the owner's password hash for .env (asked invisibly, hash only)"
+  echo "  sudo -u $FART_USER $FART_ROOT/bin/fart web new-secret                   # M8: the cookie secret for .env; then: systemctl enable --now fart-web"
+fi
 echo "  tail -f $FART_ROOT/logs/ingest.log"
