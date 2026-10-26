@@ -6,9 +6,20 @@ The signature sweep (`rpc_sigs`) lists every create/graduation signature since i
 so a complete, successful sweep *recovers* every stream gap that ended before it started
 (`recovered_at`/`recovered_by='sweep'`); a gap caused by the CU budget cap is never recovered by
 the sweep because the sweep is paused by the same cap. The sweep itself opens an `rpc_sigs` gap
-when it fails. An hour is `complete` when it is over and at least one configured create source had
-no unrecovered gap inside it. Event hour = chain time when known, else our received_at
-(documented: docs/METING.md).
+when it fails.
+
+Covered versus complete (milestone 3, after a report called a day fart never ran "complete"):
+
+* a source only counts from the moment it first ran (`ingest.<source>.first_started`, else the
+  earliest gap row it ever wrote); hours before that are not covered by it;
+* a period without any running process is a `down` gap for every stream source (recorded at the
+  next start from the previous process's last heartbeat);
+* an hour is **covered** when at least one create source was active during some part of it with an
+  unrecovered gap that does not span that whole part; a day without a covered hour is "NIET GEDEKT";
+* an hour is **complete** when it is over and at least one create source was active for the whole
+  hour without an unrecovered gap. Not covered is never complete.
+
+Event hour = chain time when known, else our received_at (documented: docs/METING.md).
 """
 from __future__ import annotations
 
@@ -16,11 +27,14 @@ import json
 import sqlite3
 from typing import Any
 
+from ..db import kv_get
 from ..util import hour_bounds, hour_key
 
 CREATE_SOURCES = ("pumpportal", "rpc_logs", "rpc_sigs")
 STREAM_SOURCES = ("pumpportal", "rpc_logs", "rpc_trades")
+DOWNTIME_SOURCES = STREAM_SOURCES + ("rpc_sigs",)
 UNRECOVERABLE_REASONS = ("budget_cap",)
+DOWNTIME_MIN_S = 60.0
 
 
 def gap_open(conn: sqlite3.Connection, source: str, start: float, reason: str) -> int:
@@ -57,6 +71,55 @@ def mark_recovered_by_sweep(conn: sqlite3.Connection, sweep_started_at: float, n
         (now, sweep_started_at, *STREAM_SOURCES, *UNRECOVERABLE_REASONS),
     )
     return cur.rowcount
+
+
+def record_downtime(conn: sqlite3.Connection, last_heartbeat: float | None, now: float,
+                    sources: tuple[str, ...] = DOWNTIME_SOURCES, min_gap_s: float = DOWNTIME_MIN_S) -> int:
+    """At startup, before `close_dangling_gaps`: the previous process's last heartbeat is older than
+    `min_gap_s` and a source has no open gap (crash, kill, host down: nothing wrote a shutdown gap) ->
+    one closed `down` gap per source from that heartbeat until now. Recoverable by the sweep like a
+    restart gap. Returns the number of gaps written."""
+    if last_heartbeat is None or now - float(last_heartbeat) < min_gap_s:
+        return 0
+    n = 0
+    for source in sources:
+        if open_gap_id(conn, source) is not None:
+            continue
+        if source_active_since(conn, source) is None:
+            continue  # never ran: nothing was "down"
+        conn.execute("INSERT INTO coverage_gaps(start, end, source, reason) VALUES(?,?,?,?)", (float(last_heartbeat), now, source, "down"))
+        n += 1
+    return n
+
+
+def source_active_since(conn: sqlite3.Connection, source: str) -> float | None:
+    """Earliest evidence that `source` ever ran: `ingest.<source>.first_started` (milestone 3), the
+    older `.started` key, or the earliest gap row it wrote (every run starts with a `startup` gap).
+    None = the source never ran: it covers nothing and makes no hour complete."""
+    candidates: list[float] = []
+    for key in (f"ingest.{source}.first_started", f"ingest.{source}.started"):
+        v = kv_get(conn, key)
+        if v is not None:
+            try:
+                candidates.append(float(v))
+            except ValueError:
+                pass
+    row = conn.execute("SELECT MIN(start) FROM coverage_gaps WHERE source=?", (source,)).fetchone()
+    if row is not None and row[0] is not None:
+        candidates.append(float(row[0]))
+    return min(candidates) if candidates else None
+
+
+def _spans_whole(gaps: list[dict[str, Any]], source: str, start: float, end: float) -> bool:
+    """Do the unrecovered gaps of `source` (already clipped to the hour) cover [start, end) entirely?"""
+    cur = start
+    for g in sorted((g for g in gaps if g["source"] == source and not g.get("recovered")), key=lambda g: g["start"]):
+        if g["start"] > cur:
+            return False
+        cur = max(cur, g["end"])
+        if cur >= end:
+            return True
+    return cur >= end
 
 
 def open_gap_id(conn: sqlite3.Connection, source: str) -> int | None:
@@ -121,30 +184,25 @@ def compute_hour(conn: sqlite3.Connection, hour: str, now: float) -> dict[str, A
     }
     sources_with_gap = {g["source"] for g in gaps if not g.get("recovered")}
     hour_over = now >= end
-    some_create_source_clean = any(s not in sources_with_gap for s in CREATE_SOURCES if _source_was_configured(conn, s))
-    row["complete"] = bool(hour_over and some_create_source_clean)
+    active = {s: source_active_since(conn, s) for s in CREATE_SOURCES}
+    clean = [s for s in CREATE_SOURCES if active[s] is not None and active[s] <= start and s not in sources_with_gap]
+    covering = [s for s in CREATE_SOURCES if active[s] is not None and active[s] < min(end, now)
+                and not _spans_whole(gaps, s, max(start, active[s]), min(end, now))]
+    row["covered"] = bool(covering)
+    row["covered_by"] = covering
+    row["complete"] = bool(hour_over and clean)
     return row
-
-
-def _source_was_configured(conn: sqlite3.Connection, source: str) -> bool:
-    """A source counts as configured if it ever produced a row or a gap; avoids calling an hour
-    'complete' on the strength of a source that was never running."""
-    if source == "pumpportal":
-        return conn.execute("SELECT 1 FROM kv WHERE key='ingest.pumpportal.started'").fetchone() is not None
-    if source in ("rpc_logs", "rpc_sigs"):
-        return conn.execute("SELECT 1 FROM kv WHERE key=?", (f"ingest.{source}.started",)).fetchone() is not None
-    return False
 
 
 def write_hour(conn: sqlite3.Connection, hour: str, now: float) -> dict[str, Any]:
     row = compute_hour(conn, hour, now)
     conn.execute(
-        "INSERT INTO coverage(hour, creates_pp, creates_rpc, creates_union, grads, grads_without_create, gaps_json, complete, computed_at)"
-        " VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(hour) DO UPDATE SET creates_pp=excluded.creates_pp, creates_rpc=excluded.creates_rpc,"
+        "INSERT INTO coverage(hour, creates_pp, creates_rpc, creates_union, grads, grads_without_create, gaps_json, complete, covered, computed_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(hour) DO UPDATE SET creates_pp=excluded.creates_pp, creates_rpc=excluded.creates_rpc,"
         " creates_union=excluded.creates_union, grads=excluded.grads, grads_without_create=excluded.grads_without_create,"
-        " gaps_json=excluded.gaps_json, complete=excluded.complete, computed_at=excluded.computed_at",
+        " gaps_json=excluded.gaps_json, complete=excluded.complete, covered=excluded.covered, computed_at=excluded.computed_at",
         (hour, row["creates_pp"], row["creates_rpc"], row["creates_union"], row["grads"], row["grads_without_create"],
-         json.dumps(row["gaps"]), 1 if row["complete"] else 0, now),
+         json.dumps(row["gaps"]), 1 if row["complete"] else 0, 1 if row["covered"] else 0, now),
     )
     return row
 

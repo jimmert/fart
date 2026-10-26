@@ -189,28 +189,27 @@ class Tracker:
                 extra = {"bundled_reasons": None if f is None else f.get("bundled_reasons"),
                          "coin_known": f is not None, "graduated_by_end": None if f is None else f.get("graduated"),
                          "data_quality": "ok" if m["peak_mcap_usd"] is not None and m["volume_usd"] is not None else "partial" if m["peak_mcap_usd"] is not None else "unknown"}
-                self.conn.execute("BEGIN")
-                try:
-                    write_outcome(self.conn, s, h, now, m, hit, bundled, self.method_version, extra)
-                    if s["subject"] == "decision" and h == max(horizons):
-                        n_paper += self.paper_for(s, now)
-                    self.conn.execute("COMMIT")
-                except Exception:
-                    self.conn.execute("ROLLBACK")
-                    raise
+                paper_due = s["subject"] == "decision" and h == max(horizons)
+
+                def _write(c, s=s, h=h, m=m, hit=hit, bundled=bundled, extra=extra, paper_due=paper_due) -> int:
+                    write_outcome(c, s, h, now, m, hit, bundled, self.method_version, extra)
+                    return self.paper_for(s, now, c) if paper_due else 0
+
+                n_paper += db.write_tx(self.conn, _write, what="measure.outcome")
                 n_out += 1
         return n_out, n_paper
 
-    def paper_for(self, s: dict[str, Any], now: float) -> int:
-        if self.conn.execute("SELECT 1 FROM paper WHERE decision_id=? AND method_version=?", (s["decision_id"], self.method_version)).fetchone():
+    def paper_for(self, s: dict[str, Any], now: float, conn: sqlite3.Connection | None = None) -> int:
+        conn = self.conn if conn is None else conn
+        if conn.execute("SELECT 1 FROM paper WHERE decision_id=? AND method_version=?", (s["decision_id"], self.method_version)).fetchone():
             return 0
         pcfg = self.cfg["paper"]
-        rows = self.conn.execute(
+        rows = conn.execute(
             f"SELECT block_time, received_at, virtual_sol, virtual_token FROM trades WHERE mint=? AND {ET} >= ? AND {ET} <= ? ORDER BY {ET}",
             (s["mint"], s["anchor_time"], s["anchor_time"] + float(pcfg.get("entry_delay_s", 20)) + float(pcfg.get("max_hold_s", 86400)) + 3600),
         ).fetchall()
         res = simulate(points_from_rows(rows), self.params, pcfg, s["anchor_time"])
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO paper(decision_id, entry_as_of, entry_price, size_sol, fill_price, slippage_bps, fees, exit_as_of, exit_price,"
             " exit_reason, pnl, json, method_version, computed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (s["decision_id"], res.entry_as_of, res.entry_price, res.size_sol, res.fill_price, res.slippage_bps, res.fees_sol,

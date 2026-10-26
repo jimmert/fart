@@ -21,7 +21,7 @@ systemd units (all in `deploy/`, installed to `/etc/systemd/system/`):
 | unit | what | schedule |
 |---|---|---|
 | `fart.slice` | MemoryMax=1G, CPUQuota=100% for everything below | - |
-| `fart-ingest.service` | PumpPortal (creates + migrations) + RPC streams (creates, migrations, per-mint trades), signature sweep, coverage, retention, Global check | daemon, Restart=always |
+| `fart-ingest.service` | PumpPortal (creates + migrations) + RPC streams (creates, migrations, per-mint trades before graduation), signature sweep, coverage, retention, Global check | daemon, Restart=always |
 | `fart-engine.service` | candidate engine v0, observations only | daemon, 15 s loop |
 | `fart-social.service` | X mega-account / KOL watch, CA/ticker confirmation counts (milestone 2; idle without `X_BEARER_TOKEN`) | daemon, 15 s loop |
 | `fart-notify.service` | Telegram outbox to the owner chat (milestone 2; idle unless `TELEGRAM_NOTIFY_ENABLED=1`) | daemon, 20 s loop |
@@ -86,9 +86,12 @@ strict rate limits, no key, **no per-mint trade stream**). The file is read by t
 
 `RPC_DAILY_BUDGET_CU` is a hard daily cap on *estimated* compute units (cost table in
 `config/budget.json`). Reconcile the estimate with the Alchemy dashboard after the first days and
-adjust the table or the cap (see `docs/UNVERIFIED.md`). At 80% of the cap the trade stream drops the
-probation subscriptions (keeps observe / early_buyers / meta_burst); at the cap the RPC side stops
-(log streams disconnect, enrichment pauses); PumpPortal keeps running; a warning is logged once per hour.
+adjust the table or the cap (see `docs/UNVERIFIED.md`). The per-mint trade stream (milestone 3) may spend
+at most 1/24 of the cap per UTC hour on its own notifications (`config/ingest.json` →
+`rpc_trades.hourly_cu_fraction`; above it every trade subscription is dropped until the next hour) and
+drops any single subscription that passes 2,000 notifications in an hour; at 80% of the daily cap it also
+drops the probation subscriptions; at the cap the whole RPC side stops (log streams disconnect, enrichment
+pauses); PumpPortal keeps running; a warning is logged once per hour.
 
 ## 4. Verify
 
@@ -107,9 +110,10 @@ ls /opt/fart/data/raw/pumpportal/$(date -u +%Y%m%d)/
 Healthy after 10 minutes: `status` shows `ingest.pumpportal.last_msg_at` and `ingest.rpc_logs.last_msg_at`
 a few seconds old, `ingest.rpc_trades.last_msg_at` fresh as soon as a watched coin trades, coins counting
 up, `trades today by source` with `rpc_trades`, no open gaps except `rpc_trades` while the watchlist is
-empty, budget rows with `errors 0`; `coverage` shows `pp` and `rpc` counts of the same order of
-magnitude for the current hour (the hour is only `complete` once it is over; a `recov(s)` column shows
-gap seconds the sweep recovered).
+empty, budget rows with `errors 0`, `failures: none` (or counters that do not grow: `engine.tick_failed`,
+`ingest.handle_failed.*`); `coverage` shows `pp` and `rpc` counts of the same order of magnitude for the
+current hour (`covered` yes for every hour fart was running; the hour is only `complete` once it is over
+and a source ran through the whole of it; a `recov(s)` column shows gap seconds the sweep recovered).
 
 The 60-second live smoke test (one extra PumpPortal connection, no key) from the checkout:
 
@@ -156,17 +160,92 @@ rule for the shared VPS IP (the test itself only holds a connection for 60 s).
 Rollback to milestone 1 code after the migration is possible (milestone-1 code ignores the new
 tables and columns), but restoring the pre-upgrade backup is the clean way back.
 
+
+## 5b. Upgrade to milestone 3 (M3)
+
+M3 changes nothing in `.env` except the cap you temporarily raised, and nothing in the units. What it
+changes on the server: every database write is one short `BEGIN IMMEDIATE` transaction with retries
+(the engine writes again, the `database is locked` storm of 26 Oct is gone), the schema goes to
+`user_version` 3 and removes the rows the USDC/PUMP "migrations" caused, the per-mint trade stream
+only runs before graduation under an hourly CU envelope, the backup script compresses without the
+`fchown` call that the syscall filter killed, and the daily report says NIET GEDEKT for hours fart was
+not running. Step by step:
+
+1. **Back up first.** On an M2 install `fart-backup.service` ends in `Result=signal` (exit 159, SIGSYS in
+   gzip) *after* writing a complete `fart-<stamp>.db`; the `.gz` next to it may be truncated:
+   ```bash
+   sudo systemctl start fart-backup.service; systemctl show -p Result,ExecMainStatus fart-backup.service
+   ls -la /opt/fart/data/backup/        # keep the newest fart-<stamp>.db; a half-written .gz of the same stamp can go
+   ```
+2. **Pull and install:**
+   ```bash
+   cd /opt/fart-src && git pull --ff-only && sudo deploy/install.sh
+   ```
+   * The rsync replaces `/opt/fart/app/config/ingest.json`: the temporary VPS override
+     `rpc_trades.enabled=false` disappears and the repository value applies (`true`, with
+     `reasons`, `max_notifications_per_subscription_per_hour` 2000 and `hourly_cu_fraction` 1/24).
+     To keep the stream off for a day of observation instead, set `rpc_trades.enabled` to `false` again
+     in `/opt/fart/app/config/ingest.json` after the installer ran and `systemctl restart fart-ingest`
+     (every `install.sh` run resets it; a config change is normally a commit).
+   * The installer opens the database once as the `fart` user. That applies schema migration 2 → 3
+     (table `rejected_messages`, column `ws_subscriptions.sub_id`, column `coverage.covered`, index
+     `migrations(pool_address)`) **and the cleanup**: rows whose mint is USDC, USDT, WSOL or PUMP are
+     deleted from `trades`, `migrations`, `mcap_samples` and `coins`, their `watchlist` and
+     `ws_subscriptions` rows closed. The installer prints `v3 cleanup of system-mint rows: {"trades": N, ...}`;
+     on the VPS expect `trades` close to 2729, `migrations` 2, `watchlist` 2. A second run prints zeros.
+     The counts stay in kv (`fart status` → `schema v3 cleanup`).
+3. **Put the CU cap back** in `/opt/fart/.env`: `RPC_DAILY_BUDGET_CU=4500000` → `RPC_DAILY_BUDGET_CU=3000000`
+   (the override was only there because the trade stream burned 2.4M CU in two hours; the envelope now
+   bounds that stream to 125,000 CU per hour at this cap). Then
+   `sudo systemctl restart fart-ingest fart-engine fart-social fart-notify`.
+4. **Verify the backup fix** (the script, not the syscall filter, changed):
+   ```bash
+   sudo systemctl start fart-backup.service
+   systemctl show -p Result,ExecMainStatus,ExecMainCode fart-backup.service   # Result=success ExecMainStatus=0 ExecMainCode=1 (exited)
+   journalctl -u fart-backup -n 6 --no-pager                                  # "backup: compressed ... (gzip -t ok)" and "backup: done N file(s) kept"
+   ls -la /opt/fart/data/backup/                                              # only fart-<stamp>.db.gz files, no .db, no .tmp
+   gzip -t /opt/fart/data/backup/fart-*.db.gz && echo archives ok
+   ```
+5. **Verify the rest** after 15 minutes:
+   ```bash
+   sudo -u fart /opt/fart/bin/fart status
+   #   schema_version: 3; freshness engine.heartbeat a few seconds; failures: none (engine.tick_failed must not appear or grow)
+   #   rpc CU today by method: ws_trade_notification separate from ws_notification; stays under 125,000 per hour
+   #   top subscriptions: curve/probation|early_buyers|meta_burst only, never USDC/PUMP, never a pool
+   #   rejected messages today: system_mint:USDC / system_mint:PUMP counting up is expected (PumpPortal keeps sending them)
+   #   enrich (getTransaction): used/limit (7627 at the 3M cap), backlog migrations=... creates=...
+   journalctl -u fart-engine --since -15min --no-pager | grep -c tick_failed      # 0
+   journalctl -u fart-ingest --since -15min --no-pager | grep -c handle_failed    # 0
+   sudo -u fart /opt/fart/bin/fart chain global          # exit 0: creator_fee_basis_points 5 = config creator_fee_bps 5
+   sudo -u fart /opt/fart/bin/fart events classify       # ae7c4af90451f611 = InitBoostEvent (pump-amm), 9ba7... / a537... named too
+   sudo -u fart /opt/fart/bin/fart coverage --hours 6    # 'covered' column; 'complete' only for full hours
+   ```
+   The next morning: `out/recall/<day>.md` has a "Verrijking en fouten" section and a `gedekt` column;
+   a day fart did not run is headed **NIET GEDEKT** with empty percentages (the 25 Oct report that said
+   COMPLEET was wrong for this reason).
+6. **If handlers failed** (`failures:` in `status` shows `ingest.handle_failed.<source>`), re-feed the
+   raw hour files of that period; it is idempotent:
+   ```bash
+   sudo -u fart /opt/fart/bin/fart status --json | grep -o '"ingest.handle_failed[^,]*'   # the .last key names the raw file
+   sudo -u fart /opt/fart/bin/fart ingest replay --source rpc_logs --since 2026-10-26T08:00Z --until 2026-10-26T10:00Z
+   ```
+7. **Rollback** to M2 code is possible after the migration (M2 ignores the new table and columns; the
+   deleted system-mint rows do not come back), the pre-upgrade `.db` from step 1 is the clean way back.
+
 ## 6. First-day checklist (docs/UNVERIFIED.md)
 
-1. `fart chain global`: reserves, supply and `fee_basis_points` 95 must match; note the
-   `creator_fee_basis_points` the account carries and compare with `config/pumpfun.json`
-   (`creator_fee_bps` 30, `total_curve_fee_bps` 125).
+1. `fart chain global`: reserves, supply, `fee_basis_points` 95 and `creator_fee_basis_points` 5 must
+   match `config/pumpfun.json` (`creator_fee_bps` 5, `total_curve_fee_bps` 100; verified against the IDL
+   and the live account on 26 Oct 2026).
 2. `fart events classify`: every remaining unknown discriminator should carry an emitting program;
    unknown ones emitted by the pump.fun or pump-amm program are real gaps (`fart/chain/events.py`).
    `--fetch 5` attributes rows written before milestone 2 (five budget-gated `getTransaction` calls).
 3. Compare one real create transaction and one pump-amm trade (`trades` with `source='pump_amm'`) with
-   `docs/PUMPFUN-EVENTS.md`; `decode.pump_amm_pool_mismatch` in `fart status` must stay 0.
-4. Compare `fart status` → `rpc CU today by method` with the Alchemy dashboard; adjust `config/budget.json`.
+   `docs/PUMPFUN-EVENTS.md`; `decode.pump_amm_pool_unknown` / `quote_not_wsol` in `fart status` should
+   stay small (a swap on a pool we never saw created is expected now and then).
+4. Compare `fart status` → `rpc CU today by method` with the Alchemy dashboard, in particular whether
+   websocket notifications (`ws_notification`, `ws_trade_notification`) are billed at all; adjust
+   `config/budget.json` (docs/UNVERIFIED.md, "Solana RPC / Alchemy").
 5. Watch `coverage --hours 24` for a day: `grads_without_create` should be close to zero.
 6. X: compare the prices in `config/x.json` with the developer console; `fart status` → `x spend today`.
 7. Telegram: `fart notify test`, then watch `fart notify outbox` for `sent` rows.
@@ -206,6 +285,12 @@ old rows stay, new rows get the old version string again.
 | `pp.disconnected ... http_status=403/429` repeatedly, `pumpportal last HTTP refusal` | PumpPortal refusing the shared IP | stop other PumpPortal clients on the host (momentdesk also holds one); one connection only; the health alert fires once per hour |
 | `rpc_trades.disabled reason=public RPC fallback` | no keyed RPC URL | fill `RPC_HTTP_URL`/`RPC_WSS_URL`; the per-mint trade stream needs Alchemy |
 | `rpc_trades.cu_policy_dropping_probation` | the day's CU spend passed 80% of the cap | expected degradation; raise `RPC_DAILY_BUDGET_CU` or lower `rpc_trades_cap` in `config/engine.json` |
+| `rpc_trades.envelope_paused` / `status` → `rpc_trades.envelope_paused` counting up | the trade stream spent its hourly share (1/24 of the cap) | expected: subscriptions come back at the next UTC hour; lower `rpc_trades_cap` or raise `hourly_cu_fraction` in `config/ingest.json` only after reconciling the CU estimate with Alchemy |
+| `rpc_trades.subscription_capped` (and `rpc_trades.last_capped` in `status --json`) | one coin produced more than 2,000 notifications in an hour | expected: that subscription is dropped for the rest of the hour; the trades it already delivered stay |
+| `pp.migration_rejected reason=system_mint:USDC` / `rejected messages today` | PumpPortal put a quote mint in a migration message's `mint` field | expected and harmless now; inspect `rejected_messages` (docs/PUMPFUN-EVENTS.md) |
+| `engine.tick_failed` in `failures:` growing | a tick still fails after 3 retries | read `engine.tick_failed.last` in `status --json` and `journalctl -u fart-engine`; a lock holder longer than 15 s is a bug, not expected |
+| `ingest.handle_failed.<source>` in `failures:` growing | a handler could not write after 3 retries | the message is in the raw store: `fart ingest replay --source <source> --since <time>` after fixing the cause |
+| `fart-backup.service` `Result=signal` (exit 159) | the M2 script's `gzip -f` was killed by the syscall filter (`fchown`) | upgrade to M3 (`deploy/backup.sh` uses `gzip -n -c`); the `.db` written before the kill is complete |
 | `ws_subscriptions.notifications` grows but `trades` with `source='rpc_trades'` stays 0 | TradeEvents do not arrive on the bonding-curve address | set `config/ingest.json` → `rpc_trades.mention` to `"mint"` and restart |
 | `decode.pump_amm_pool_mismatch` counting up | the pump-amm BuyEvent/SellEvent layout differs from `fart/chain/events.py` | inspect `raw_undecoded` / `fart events classify`; fix the layout (docs/PUMPFUN-EVENTS.md) |
 | `global.check_mismatch` at ingest start / `fart chain global` exit 1 | config/pumpfun.json differs from the chain | update the config (one commit = new `rules_version`); a mismatch never stops the daemons |
@@ -216,4 +301,4 @@ old rows stay, new rows get the old version string again.
 | `grads_without_create` high | creates missed by both streams | check `sweep.done missed=` and `enrich.done`; RPC key present? |
 | `decode.truncated_or_drift` counting up | pump.fun changed an event layout | inspect `raw_undecoded`, update `fart/chain/events.py` LAYOUTS |
 | `outbox` rows stuck in `pending` with `error` | Telegram unreachable or wrong token/chat id | `fart notify outbox`; fix `.env`; rows retry 15 s → 1 h then `gave_up` |
-| database is locked | another process holds a long write | all writers use 5 s busy timeout; check for a stuck `sqlite3` shell |
+| `database is locked` | another connection held the write lock for more than 15 s (busy timeout), or a writer used a plain `BEGIN` after reading | every writer uses `BEGIN IMMEDIATE` with 3 retries (`fart/db.py`); a `sqlite3` shell left in a transaction is the usual culprit |

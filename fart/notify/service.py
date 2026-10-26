@@ -7,6 +7,8 @@ Builders (only while enabled):
   digest    once a day at 06:10 UTC from the recall report of the previous day (+ X spend, CU spend)
   health    stream silent > 5 min, CU/X budget at 80% and at the cap, PumpPortal 403/429; 1 h cooldown per kind
 Sender: pending rows due, max 20 per minute, 429 retry_after honored, retry ladder then gave_up.
+Every builder reads first and writes in one short IMMEDIATE transaction with retries (milestone 3);
+the digest's report build (heavy, no network) happens before its write.
 """
 from __future__ import annotations
 
@@ -49,11 +51,11 @@ class Notifier:
         self.stats[k] = self.stats.get(k, 0) + n
 
     # ----- builders ----------------------------------------------------------------------------------------
-    def _pointer(self, key: str, table_max: int) -> int | None:
+    def _pointer(self, key: str, table_max: int, now: float) -> int | None:
         """Last processed decision id; on the first run start at the current maximum (no history dump)."""
         v = db.kv_get(self.conn, key)
         if v is None:
-            db.kv_set(self.conn, key, str(table_max), self.clock())
+            db.write_tx(self.conn, lambda c: db.kv_set(c, key, str(table_max), now), what="notify.pointer")
             return None
         return int(v)
 
@@ -63,15 +65,15 @@ class Notifier:
         if now - last_batch < float(ocfg.get("batch_interval_s", 300)):
             return 0
         max_id = int(self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM decisions").fetchone()[0])
-        last_id = self._pointer("notify.observe.last_id", max_id)
+        last_id = self._pointer("notify.observe.last_id", max_id, now)
         if last_id is None:
-            db.kv_set(self.conn, "notify.observe.last_batch_at", str(now), now)
+            db.write_tx(self.conn, lambda c: db.kv_set(c, "notify.observe.last_batch_at", str(now), now), what="notify.observe")
             return 0
         rows = self.conn.execute(
             "SELECT * FROM decisions WHERE id > ? AND kind IN ('observe', 'observe_meta') AND verdict='observe' ORDER BY id", (last_id,)
         ).fetchall()
         if not rows:
-            db.kv_set(self.conn, "notify.observe.last_batch_at", str(now), now)
+            db.write_tx(self.conn, lambda c: db.kv_set(c, "notify.observe.last_batch_at", str(now), now), what="notify.observe")
             return 0
         n_hour = int(self.conn.execute("SELECT COUNT(*) FROM outbox WHERE kind='observe' AND created_at > ?", (now - 3600,)).fetchone()[0])
         if n_hour >= int(ocfg.get("max_batches_per_hour", 6)):
@@ -83,23 +85,34 @@ class Notifier:
         sol_usd, _ = sol_usd_at(self.conn, now)
         text = fmt.observe_batch(decisions, sol_usd, self.footer, int(ocfg.get("max_items_per_message", 8)))
         key = f"observe:{decisions[0]['id']}-{decisions[-1]['id']}"
-        queued = outbox.enqueue(self.conn, "observe", key, self.chat, text, now)
-        db.kv_set(self.conn, "notify.observe.last_id", str(decisions[-1]["id"]), now)
-        db.kv_set(self.conn, "notify.observe.last_batch_at", str(now), now)
-        return 1 if queued else 0
+
+        def _write(c) -> int:
+            queued = outbox.enqueue(c, "observe", key, self.chat, text, now)
+            db.kv_set(c, "notify.observe.last_id", str(decisions[-1]["id"]), now)
+            db.kv_set(c, "notify.observe.last_batch_at", str(now), now)
+            return 1 if queued else 0
+
+        return db.write_tx(self.conn, _write, what="notify.observe")
 
     def build_fast_posts(self, now: float) -> int:
         max_id = int(self.conn.execute("SELECT COALESCE(MAX(id), 0) FROM decisions").fetchone()[0])
-        last_id = self._pointer("notify.fast_post.last_id", max_id)
+        last_id = self._pointer("notify.fast_post.last_id", max_id, now)
         if last_id is None:
             return 0
-        n = 0
-        for r in self.conn.execute("SELECT * FROM decisions WHERE id > ? AND kind='fast_post' ORDER BY id", (last_id,)).fetchall():
-            d = fmt.decision_to_dict(r)
-            if outbox.enqueue(self.conn, "fast_post", f"fast_post:{d['id']}", self.chat, fmt.fast_post(d, self.footer), now):
-                n += 1
-            db.kv_set(self.conn, "notify.fast_post.last_id", str(d["id"]), now)
-        return n
+        rows = self.conn.execute("SELECT * FROM decisions WHERE id > ? AND kind='fast_post' ORDER BY id", (last_id,)).fetchall()
+        if not rows:
+            return 0
+        items = [(d, fmt.fast_post(d, self.footer)) for d in (fmt.decision_to_dict(r) for r in rows)]
+
+        def _write(c) -> int:
+            n = 0
+            for d, text in items:
+                if outbox.enqueue(c, "fast_post", f"fast_post:{d['id']}", self.chat, text, now):
+                    n += 1
+            db.kv_set(c, "notify.fast_post.last_id", str(items[-1][0]["id"]), now)
+            return n
+
+        return db.write_tx(self.conn, _write, what="notify.fast_post")
 
     def build_digest(self, now: float) -> int:
         hhmm = str(self.cfg.get("digest", {}).get("time_utc", "06:10"))
@@ -110,7 +123,7 @@ class Notifier:
         day = day_key(now - 86400)
         if db.kv_get(self.conn, "notify.digest.last_day") == day:
             return 0
-        rep = self._report_for(day, now)
+        rep = self._report_for(day, now)  # heavy (no network): outside every transaction
         start = now - 86400 - (now % 86400)  # UTC midnight of `day`
         x_spend = float(self.conn.execute("SELECT COALESCE(SUM(usd), 0) FROM x_spend WHERE day=?", (day,)).fetchone()[0])
         rpc_source = "rpc_public" if self.settings.rpc_is_public else "rpc"
@@ -119,9 +132,13 @@ class Notifier:
         cu_cap = None if self.settings.rpc_is_public else float(self.settings.rpc_daily_budget_cu)
         text = fmt.digest(day, rep, x_spend if self.settings.x_configured else None, self.settings.x_daily_budget_usd if self.settings.x_configured else None,
                           cu, cu_cap, self.footer)
-        queued = outbox.enqueue(self.conn, "digest", f"digest:{day}", self.chat, text, now)
-        db.kv_set(self.conn, "notify.digest.last_day", day, now)
-        return 1 if queued else 0
+
+        def _write(c) -> int:
+            queued = outbox.enqueue(c, "digest", f"digest:{day}", self.chat, text, now)
+            db.kv_set(c, "notify.digest.last_day", day, now)
+            return 1 if queued else 0
+
+        return db.write_tx(self.conn, _write, what="notify.digest")
 
     def _report_for(self, day: str, now: float) -> dict[str, Any]:
         path = Path(self.settings.out_dir) / "recall" / f"{day}.json"
@@ -170,26 +187,31 @@ class Notifier:
         at = kv.get("ingest.pumpportal.last_http_status_at")
         if at is not None and now - float(at) < 3600:
             alerts.append(("pumpportal_refused", {"status": kv.get("ingest.pumpportal.last_http_status"), "at": fmt.fmt_time(float(at))}))
-        n = 0
+        due = []
         for kind, params in alerts:
             last = db.kv_get(self.conn, f"notify.health.{kind}.last")
             if last is not None and now - float(last) < cooldown:
                 continue
-            text = fmt.health(kind.split(":")[0], params, now, self.footer)
-            if outbox.enqueue(self.conn, "health", f"health:{kind}:{int(now)}", self.chat, text, now):
-                n += 1
-            db.kv_set(self.conn, f"notify.health.{kind}.last", str(now), now)
-        return n
+            due.append((kind, fmt.health(kind.split(":")[0], params, now, self.footer)))
+        if not due:
+            return 0
+
+        def _write(c) -> int:
+            n = 0
+            for kind, text in due:
+                if outbox.enqueue(c, "health", f"health:{kind}:{int(now)}", self.chat, text, now):
+                    n += 1
+                db.kv_set(c, f"notify.health.{kind}.last", str(now), now)
+            return n
+
+        return db.write_tx(self.conn, _write, what="notify.health")
 
     def build(self, now: float) -> dict[str, int]:
         out = {"observe": 0, "fast_post": 0, "digest": 0, "health": 0}
         for name, fn in (("observe", self.build_observe), ("fast_post", self.build_fast_posts), ("digest", self.build_digest), ("health", self.build_health)):
-            self.conn.execute("BEGIN")
             try:
                 out[name] = fn(now)
-                self.conn.execute("COMMIT")
             except Exception:
-                self.conn.execute("ROLLBACK")
                 log.error("notify.build_failed", builder=name, exc_info=True)
         return out
 
@@ -205,25 +227,26 @@ class Notifier:
         if room <= 0:
             return out
         for row in outbox.due(self.conn, now, limit=room):
-            res: SendResult = self.sender.send(row["chat"], row["text"])
+            res: SendResult = self.sender.send(row["chat"], row["text"])  # network: outside every transaction
             if res.ok:
-                outbox.mark_sent(self.conn, row["id"], res.message_id, now)
+                db.write_tx(self.conn, lambda c: outbox.mark_sent(c, row["id"], res.message_id, now), what="notify.sent")
                 out["sent"] += 1
                 continue
             if res.blocked:
-                outbox.mark_retry(self.conn, row["id"], now + max(5.0, res.retry_after_s or 5.0), res.error or "blocked", count_attempt=False)
+                db.write_tx(self.conn, lambda c: outbox.mark_retry(c, row["id"], now + max(5.0, res.retry_after_s or 5.0), res.error or "blocked", count_attempt=False),
+                            what="notify.blocked")
                 out["blocked"] += 1
                 break
             attempts = int(row["attempts"]) + 1
             if res.permanent or attempts > len(schedule):
-                outbox.mark_gave_up(self.conn, row["id"], res.error or "failed")
+                db.write_tx(self.conn, lambda c: outbox.mark_gave_up(c, row["id"], res.error or "failed"), what="notify.gave_up")
                 out["gave_up"] += 1
                 log.warning("notify.gave_up", outbox_id=row["id"], kind=row["kind"], status=res.status, error=res.error)
                 continue
             wait = schedule[attempts - 1]
             if res.status == 429 and res.retry_after_s:
                 wait = max(float(res.retry_after_s), 1.0)
-            outbox.mark_retry(self.conn, row["id"], now + wait, res.error or "failed")
+            db.write_tx(self.conn, lambda c: outbox.mark_retry(c, row["id"], now + wait, res.error or "failed"), what="notify.retry")
             out["retry"] += 1
             if res.status == 429:
                 break  # the whole chat is throttled: stop this round

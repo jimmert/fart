@@ -3,29 +3,48 @@
 (The brief names this module `global.py`; `global` is a Python keyword, so the file is
 `global_account.py`.)
 
-Layout (Anchor account, 8-byte discriminator sha256("account:Global")[:8] first):
+Layout (Anchor account, 8-byte discriminator sha256("account:Global")[:8] first), verified on
+26 Oct 2026 against the official IDL (github.com/pump-fun/pump-public-docs, idl/pump.json, type
+`Global`) and, for the first 155 bytes, against the live account on the VPS:
 
-    offset  field                            type      status
+    offset  field                            type       status
     0       discriminator                    8 bytes
-    8       initialized                      u8        verified on the VPS (26 Oct 2026)
-    9       authority                        pubkey    verified
-    41      fee_recipient                    pubkey    verified
-    73      initial_virtual_token_reserves   u64       verified (1073000000000000)
-    81      initial_virtual_sol_reserves     u64       verified (30000000000)
-    89      initial_real_token_reserves      u64       verified (793100000000000)
-    97      token_total_supply               u64       verified (1000000000000000)
-    105     fee_basis_points                 u64       verified (95)
-    113     withdraw_authority               pubkey    TO VERIFY (newer program versions)
-    145     enable_migrate                   u8        TO VERIFY
-    146     pool_migration_fee               u64       TO VERIFY
-    154     creator_fee_basis_points         u64       TO VERIFY
-    162     fee_recipients                   7 pubkeys TO VERIFY
-    386     set_creator_authority            pubkey    TO VERIFY
-    418     admin_set_creator_authority      pubkey    TO VERIFY
-    450     (anything further)               raw       reported as extra bytes
+    8       initialized                      bool       verified (VPS + IDL)
+    9       authority                        pubkey     verified
+    41      fee_recipient                    pubkey     verified
+    73      initial_virtual_token_reserves   u64        verified (1073000000000000)
+    81      initial_virtual_sol_reserves     u64        verified (30000000000)
+    89      initial_real_token_reserves      u64        verified (793100000000000)
+    97      token_total_supply               u64        verified (1000000000000000)
+    105     fee_basis_points                 u64        verified (95)
+    113     withdraw_authority               pubkey     verified (IDL)
+    145     enable_migrate                   bool       verified (IDL)
+    146     pool_migration_fee               u64        verified (IDL)
+    154     creator_fee_basis_points         u64        verified (IDL; the VPS read 5 here: 0.05%)
+    162     fee_recipients                   7 pubkeys  verified (IDL)
+    386     set_creator_authority            pubkey     verified (IDL)
+    418     admin_set_creator_authority      pubkey     verified (IDL)
+    450     create_v2_enabled                bool       IDL (newer fields, not yet seen on the VPS)
+    451     whitelist_pda                    pubkey     IDL
+    483     reserved_fee_recipient           pubkey     IDL
+    515     mayhem_mode_enabled              bool       IDL
+    516     reserved_fee_recipients          7 pubkeys  IDL
+    740     is_cashback_enabled              bool       IDL
+    741     buyback_fee_recipients           8 pubkeys  IDL
+    997     buyback_basis_points             u64        IDL
+    1005    initial_virtual_quote_reserves   u64        IDL
+    1013    whitelisted_quote_mints          1 pubkey   IDL
+    1045    creator_fee_configurable         bool       IDL
+    1046    max_configurable_creator_fee_bps u64        IDL
+    1054    holder_reward_claim_authority    pubkey     IDL
+    1086    is_holder_reward_enabled         bool       IDL
+    1087    max_curve_depth                  u8         IDL
+    1088    (anything further)               raw        reported as extra bytes
 
-Everything past offset 113 is decoded tolerantly and reported as to-verify; a basis-point field
-above 10,000 marks the decode suspect. Nothing here ever raises on odd data.
+Fees: fee_basis_points 95 + creator_fee_basis_points 5 = 100 bps, the public 1% curve fee with a
+0.05% creator share (config/pumpfun.json: fee_bps, creator_fee_bps, total_curve_fee_bps).
+Everything is decoded tolerantly: a shorter account stops at the last complete field, a
+basis-point field above 10,000 marks the decode suspect. Nothing here ever raises on odd data.
 """
 from __future__ import annotations
 
@@ -40,18 +59,30 @@ from .base58 import b58encode
 GLOBAL_ADDRESS = "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf"
 ACCOUNT_DISCRIMINATOR = hashlib.sha256(b"account:Global").digest()[:8]
 
-# (field, type); types: u8 | u64 | pubkey | pubkey7
+# (field, type); types: u8 | u64 | pubkey | pubkey7 | pubkey8
+# Verified: the VPS read (offsets 8-154) plus the IDL field order (26 Oct 2026).
 VERIFIED_LAYOUT: list[tuple[str, str]] = [
     ("initialized", "u8"), ("authority", "pubkey"), ("fee_recipient", "pubkey"),
     ("initial_virtual_token_reserves", "u64"), ("initial_virtual_sol_reserves", "u64"),
     ("initial_real_token_reserves", "u64"), ("token_total_supply", "u64"), ("fee_basis_points", "u64"),
-]
-TO_VERIFY_LAYOUT: list[tuple[str, str]] = [
     ("withdraw_authority", "pubkey"), ("enable_migrate", "u8"), ("pool_migration_fee", "u64"),
     ("creator_fee_basis_points", "u64"), ("fee_recipients", "pubkey7"), ("set_creator_authority", "pubkey"),
     ("admin_set_creator_authority", "pubkey"),
 ]
-VERIFIED_END_OFFSET = 113
+# From the IDL only (newer program versions); decoded tolerantly, absent fields are not an error.
+IDL_LAYOUT: list[tuple[str, str]] = [
+    ("create_v2_enabled", "u8"), ("whitelist_pda", "pubkey"), ("reserved_fee_recipient", "pubkey"),
+    ("mayhem_mode_enabled", "u8"), ("reserved_fee_recipients", "pubkey7"), ("is_cashback_enabled", "u8"),
+    ("buyback_fee_recipients", "pubkey8"), ("buyback_basis_points", "u64"), ("initial_virtual_quote_reserves", "u64"),
+    ("whitelisted_quote_mints", "pubkey"), ("creator_fee_configurable", "u8"), ("max_configurable_creator_fee_bps", "u64"),
+    ("holder_reward_claim_authority", "pubkey"), ("is_holder_reward_enabled", "u8"), ("max_curve_depth", "u8"),
+]
+TO_VERIFY_LAYOUT = IDL_LAYOUT  # name kept for the CLI; nothing in the layout is a guess any more
+# The first eight fields (through fee_basis_points) are the part every program version carried; a
+# shorter account than this is undecodable.
+MINIMUM_END_OFFSET = 113
+VERIFIED_END_OFFSET = 450
+IDL_END_OFFSET = 1088
 
 # config key -> account field
 CONFIG_MAP = {
@@ -105,10 +136,11 @@ def _read(data: bytes, pos: int, ftype: str) -> tuple[Any, int]:
         if pos + 32 > len(data):
             raise EOFError
         return b58encode(data[pos:pos + 32]), pos + 32
-    if ftype == "pubkey7":
-        if pos + 224 > len(data):
+    if ftype in ("pubkey7", "pubkey8"):
+        n = 7 if ftype == "pubkey7" else 8
+        if pos + 32 * n > len(data):
             raise EOFError
-        return [b58encode(data[pos + 32 * i:pos + 32 * (i + 1)]) for i in range(7)], pos + 224
+        return [b58encode(data[pos + 32 * i:pos + 32 * (i + 1)]) for i in range(n)], pos + 32 * n
     raise ValueError(ftype)
 
 
@@ -119,15 +151,16 @@ def decode_global(data: bytes) -> GlobalAccount:
         return g
     g.discriminator_ok = bytes(data[:8]) == ACCOUNT_DISCRIMINATOR
     pos = 8
-    try:
-        for name, ftype in VERIFIED_LAYOUT:
+    for name, ftype in VERIFIED_LAYOUT:
+        try:
             g.verified[name], pos = _read(data, pos, ftype)
-    except EOFError:
-        g.error = f"truncated in verified layout at {pos}"
-        g.consumed = pos
-        return g
-    g.consumed = pos
-    for name, ftype in TO_VERIFY_LAYOUT:
+            g.consumed = pos
+        except EOFError:
+            if pos < MINIMUM_END_OFFSET:
+                g.error = f"truncated in verified layout at {pos}"
+                return g
+            break  # an older, shorter account: the fields it carries are kept
+    for name, ftype in IDL_LAYOUT:
         try:
             g.to_verify[name], pos = _read(data, pos, ftype)
             g.consumed = pos
@@ -159,10 +192,11 @@ def compare_with_config(g: GlobalAccount, cfg: dict[str, Any]) -> list[dict[str,
             out.append({"field": acc_field, "config_key": cfg_key, "chain": int(chain_val), "config": int(cfg[cfg_key]), "verified_layout": verified})
     total = cfg.get("total_curve_fee_bps")
     fee = g.verified.get("fee_basis_points")
-    creator = g.to_verify.get("creator_fee_basis_points")
+    creator = g.fields.get("creator_fee_basis_points")
     if total is not None and fee is not None and creator is not None and int(fee) + int(creator) != int(total):
         out.append({"field": "fee_basis_points+creator_fee_basis_points", "config_key": "total_curve_fee_bps",
-                    "chain": int(fee) + int(creator), "config": int(total), "verified_layout": False})
+                    "chain": int(fee) + int(creator), "config": int(total),
+                    "verified_layout": "creator_fee_basis_points" in g.verified})
     return out
 
 

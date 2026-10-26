@@ -1,5 +1,5 @@
 {
-  "_comment": "pump.fun bonding curve parameters. Checked against the pump.fun Global account on the VPS (26 Oct 2026): reserves/supply match, fee_basis_points is 95 (not 100). creator_fee_bps and total_curve_fee_bps are TO VERIFY (`fart chain global` decodes creator_fee_basis_points when the account carries it). Base units: lamports and 1e-6 tokens.",
+  "_comment": "pump.fun bonding curve parameters. Checked against the pump.fun Global account on the VPS (26 Oct 2026) and the official IDL (github.com/pump-fun/pump-public-docs idl/pump.json): reserves/supply match, fee_basis_points is 95 and creator_fee_basis_points is 5 (0.95% + 0.05% = the public 1% curve fee). `fart chain global` exits 1 when the chain differs. system_mints: quote/system mints that are never a pump coin, a migration or a watchlist candidate (PumpPortal put USDC and PUMP in migration messages on 26 Oct 2026). Base units: lamports and 1e-6 tokens.",
   "program_id": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
   "mint_authority": "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM",
   "migration_account": "39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg",
@@ -7,6 +7,12 @@
   "event_authority": "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
   "pump_amm_program_id": "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",
   "wsol_mint": "So11111111111111111111111111111111111111112",
+  "system_mints": {
+    "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "USDT": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "WSOL": "So11111111111111111111111111111111111111112",
+    "PUMP": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+  },
   "token_decimals": 6,
   "sol_decimals": 9,
   "initial_virtual_sol_reserves": 30000000000,
@@ -14,8 +20,8 @@
   "initial_real_token_reserves": 793100000000000,
   "token_total_supply": 1000000000000000,
   "fee_bps": 95,
-  "creator_fee_bps": 30,
-  "total_curve_fee_bps": 125,
+  "creator_fee_bps": 5,
+  "total_curve_fee_bps": 100,
   "graduation_real_sol": 85000000000,
   "bundled_graduation_window_s": 60,
   "bundled_dev_buy_fraction": 0.5

@@ -117,9 +117,15 @@ async def _main(settings: Settings) -> None:
     conn = db.connect(settings.db_path)
     budget = Budget.from_settings(conn, settings)
     now = wall_now()
+    # a crash or a host reboot leaves no shutdown gap: the previous heartbeat tells how long we were down
+    last_hb = db.kv_get(conn, "ingest.heartbeat")
+    down = coverage.record_downtime(conn, float(last_hb) if last_hb else None, now)
+    if down:
+        log.warning("gaps.downtime_recorded", n=down, since=last_hb, seconds=round(now - float(last_hb)))
     closed = coverage.close_dangling_gaps(conn, now, relabel="restart")
     if closed:
         log.info("gaps.closed_at_startup", n=closed, reason="restart")
+    db.kv_setdefault(conn, "ingest.first_started", str(now), now)
     icfg = settings.config("ingest")
     wcfg = settings.config("engine")["watchlist"]
     pf = settings.config("pumpfun")
@@ -135,7 +141,7 @@ async def _main(settings: Settings) -> None:
              else "creates+migrations only (no PUMPPORTAL_API_KEY); per-mint trades via RPC")
     pp_raw = RawWriter(settings.raw_dir, "pumpportal", icfg["pumpportal"].get("raw_flush_interval_s", 5), icfg["pumpportal"].get("raw_flush_lines", 200))
     pp = PumpPortalClient(conn, budget, pp_raw, settings.pumpportal_connect_url, icfg["pumpportal"], wcfg,
-                          trades_enabled=settings.pumpportal_trades_enabled)
+                          trades_enabled=settings.pumpportal_trades_enabled, pumpfun_cfg=pf)
     tasks = [asyncio.create_task(pp.run(stop), name="pumpportal")]
     rpc_source = "rpc_public" if settings.rpc_is_public else "rpc"
     rl = None
@@ -152,6 +158,11 @@ async def _main(settings: Settings) -> None:
             rt_raw = RawWriter(settings.raw_dir, "rpc_trades", 5, 200)
             rt = RpcTradesClient(conn, budget, rt_raw, settings.rpc_wss_url, rpc_source, tcfg, wcfg, pf)
             tasks.append(asyncio.create_task(rt.run(stop), name="rpc_trades"))
+            log.info("rpc_trades.limits", reasons=tcfg.get("reasons"), hourly_cu_allowance=rt.hourly_allowance(),
+                     max_notifications_per_subscription_per_hour=tcfg.get("max_notifications_per_subscription_per_hour"),
+                     cap=wcfg.get("rpc_trades_cap"))
+    else:
+        log.info("rpc_trades.disabled", reason="config/ingest.json rpc_trades.enabled is false")
     tasks.append(asyncio.create_task(_periodic(settings, conn, stop, float(icfg["backfill"].get("sweep_interval_s", 300))), name="periodic"))
     check_task = asyncio.create_task(_global_check(settings), name="global_check")
     log.info("ingest.started", **settings.describe(), rpc_logs=rl is not None, rpc_trades=rt is not None)
@@ -179,3 +190,66 @@ def run_ingest(settings: Settings) -> int:
     settings.ensure_dirs()
     asyncio.run(_main(settings))
     return 0
+
+
+# ----- replay of raw hour files (milestone 3) --------------------------------------------------------
+REPLAY_SOURCES = ("pumpportal", "rpc_logs", "rpc_trades")
+
+
+def replay_raw(settings: Settings, source: str, since: float, until: float | None = None, log_every: int = 5000) -> dict[str, Any]:
+    """Re-feed the raw hour files of one source to its handler with the recorded received_at, data
+    writes only (no raw copy, no costs, no counters). Idempotent: coins/migrations merge, trades
+    de-duplicate on (signature, mint). Use after `ingest.handle_failed.<source>` counted failures:
+    `fart ingest replay --source rpc_logs --since 2026-10-26T08:00Z`."""
+    from .raw import RawWriter, iter_raw
+
+    if source not in REPLAY_SOURCES:
+        raise ValueError(f"unknown source {source!r}; one of {REPLAY_SOURCES}")
+    until = wall_now() if until is None else until
+    conn = db.connect(settings.db_path)
+    try:
+        budget = Budget.from_settings(conn, settings)
+        icfg = settings.config("ingest")
+        wcfg = settings.config("engine")["watchlist"]
+        pf = settings.config("pumpfun")
+        raw = RawWriter(settings.raw_dir, source)
+        rpc_source = "rpc_public" if settings.rpc_is_public else "rpc"
+        if source == "pumpportal":
+            client: Any = PumpPortalClient(conn, budget, raw, "wss://replay.invalid", icfg["pumpportal"], wcfg,
+                                           connect=lambda *a, **k: None, trades_enabled=settings.pumpportal_trades_enabled, pumpfun_cfg=pf)
+        elif source == "rpc_logs":
+            client = RpcLogsClient(conn, budget, raw, "wss://replay.invalid", rpc_source, icfg["rpc_logs"], pf, wcfg, connect=lambda *a, **k: None)
+        else:
+            client = RpcTradesClient(conn, budget, raw, "wss://replay.invalid", rpc_source, icfg.get("rpc_trades", {}), wcfg, pf,
+                                     connect=lambda *a, **k: None)
+        client.replay = True
+        stats: dict[str, Any] = {"source": source, "files": 0, "records": 0, "replayed": 0, "skipped": 0, "errors": 0, "kinds": {}}
+        hour = since - (since % 3600.0)
+        while hour < until:
+            path = raw.path_for(hour)
+            hour += 3600.0
+            if not path.exists():
+                continue
+            stats["files"] += 1
+            for rec in iter_raw(path):
+                stats["records"] += 1
+                t = rec.get("received_at")
+                msg = rec.get("msg")
+                if not isinstance(t, (int, float)) or t < since or t > until:
+                    stats["skipped"] += 1
+                    continue
+                text = msg if isinstance(msg, str) else json.dumps(msg, separators=(",", ":"), ensure_ascii=False)
+                try:
+                    kind = client.handle_text(text, float(t))
+                    stats["replayed"] += 1
+                    stats["kinds"][kind] = stats["kinds"].get(kind, 0) + 1
+                except Exception as e:  # keep going: one bad line must not stop the replay
+                    stats["errors"] += 1
+                    if stats["errors"] <= 5:
+                        log.error("replay.record_failed", error=f"{type(e).__name__}: {str(e)[:160]}", received_at=t)
+                if stats["replayed"] % log_every == 0 and stats["replayed"]:
+                    log.info("replay.progress", **{k: v for k, v in stats.items() if k != "kinds"})
+        log.info("replay.done", **{k: v for k, v in stats.items() if k != "kinds"}, kinds=json.dumps(stats["kinds"]))
+        return stats
+    finally:
+        conn.close()

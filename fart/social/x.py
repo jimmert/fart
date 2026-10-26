@@ -20,6 +20,7 @@ import sqlite3
 import urllib.parse
 from typing import Any, Callable
 
+from .. import db
 from ..db import kv_get, kv_set
 from ..engine import decide
 from ..engine.meta import normalize, words
@@ -284,14 +285,12 @@ class XClient:
         if resp is None:
             return [], None
         posts = booked.get("posts", posts_from_response(resp, post_kind, now, query_key))
-        self.conn.execute("BEGIN")
-        try:
+
+        def _write(c) -> list[dict[str, Any]]:
             self.xb.book(kind, booked.get("n", len(posts)), booked.get("usd", 0.0), now)
-            new = [p for p in posts if upsert_post(self.conn, p)]
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
+            return [p for p in posts if upsert_post(c, p)]
+
+        new = db.write_tx(self.conn, _write, what="x.search")
         newest = (resp.get("meta") or {}).get("newest_id") if isinstance(resp, dict) else None
         self._bump(f"{kind}_posts", len(new))
         return new, (str(newest) if newest else None)
@@ -337,18 +336,17 @@ class XClient:
         if resp is None:
             return {"refreshed": 0, "fast": 0}
         posts = posts_from_response(resp, "mega", now)
-        newly_fast = 0
-        self.conn.execute("BEGIN")
-        try:
+
+        def _write(c) -> int:
+            n = 0
             self.xb.book("refresh", len(posts), unit * len(posts), now)
             for p in posts:
-                upsert_post(self.conn, p)
+                upsert_post(c, p)
                 if self._update_velocity(p["id"], now, mcfg):
-                    newly_fast += 1
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
+                    n += 1
+            return n
+
+        newly_fast = db.write_tx(self.conn, _write, what="x.refresh")
         self._bump("refreshed", len(posts))
         return {"refreshed": len(posts), "fast": newly_fast}
 
@@ -403,15 +401,13 @@ class XClient:
             if resp is None:
                 break  # budget or transport: stop this round, keep the keys due
             n1h, n24 = counts_from_response(resp, now)
-            self.conn.execute("BEGIN")
-            try:
+
+            def _write(c, k=k, n1h=n1h, n24=n24) -> None:
                 self.xb.book("ca_counts", 1, unit, now)
-                self.conn.execute("INSERT OR REPLACE INTO social_counts(key, kind, ts, n_last_hour, n_24h, query) VALUES(?,?,?,?,?,?)",
-                                  (k["key"], k["kind"], now, n1h, n24, k["query"]))
-                self.conn.execute("COMMIT")
-            except Exception:
-                self.conn.execute("ROLLBACK")
-                raise
+                c.execute("INSERT OR REPLACE INTO social_counts(key, kind, ts, n_last_hour, n_24h, query) VALUES(?,?,?,?,?,?)",
+                          (k["key"], k["kind"], now, n1h, n24, k["query"]))
+
+            db.write_tx(self.conn, _write, what="x.counts")
             stats["counts"] += 1
             if n1h is not None and n1h >= int(ccfg.get("search_when_count_1h", 10)):
                 new, _ = self._search("ca_search", "ca", k["query"], int(ccfg.get("search_max_results", 10)), None, now - 3600.0, k["key"])
@@ -462,13 +458,8 @@ class XClient:
             if m is None:
                 continue
             reasons = [f"fast_post likes_per_min={m['likes_per_min']}", *(f"{x['word']}: {x['n_coins']} coins / {x['n_creators']} creators" for x in m["matched"][:3])]
-            self.conn.execute("BEGIN")
-            try:
-                decide.write_decision(self.conn, now, now, "fast_post", None, f"x:{post['id']}", m, self.rules_version, "observe", reasons)
-                self.conn.execute("COMMIT")
-            except Exception:
-                self.conn.execute("ROLLBACK")
-                raise
+            db.write_tx(self.conn, lambda c, post=post, m=m, reasons=reasons: decide.write_decision(
+                c, now, now, "fast_post", None, f"x:{post['id']}", m, self.rules_version, "observe", reasons), what="x.fast_post")
             n += 1
             log.info("x.fast_post_decision", post_id=post["id"], words=[x["word"] for x in m["matched"]], mints=len(m["mints"]))
         return n

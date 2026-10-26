@@ -172,17 +172,19 @@ def test_migration_v1_to_v2_preserves_milestone1_data(tmp_path):
     c.close()
     conn = db.connect(path)
     try:
-        assert db.schema_version(conn) == 2
+        assert db.schema_version(conn) == db.SCHEMA_VERSION == 3  # v1 -> v2 -> v3 in one go
         counts = db.table_counts(conn, ("coins", "migrations", "trades", "decisions", "outcomes", "coverage", "coverage_gaps", "raw_undecoded"))
         assert all(v == 1 for v in counts.values()), counts
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        for t in ("social_posts", "social_post_metrics", "social_counts", "x_spend", "x_dedupe", "outbox", "ws_subscriptions"):
+        for t in ("social_posts", "social_post_metrics", "social_counts", "x_spend", "x_dedupe", "outbox", "ws_subscriptions", "rejected_messages"):
             assert t in tables
         cols = {r[1] for r in conn.execute("PRAGMA table_info(coverage_gaps)")}
         assert {"recovered_at", "recovered_by"} <= cols
         assert "program" in {r[1] for r in conn.execute("PRAGMA table_info(raw_undecoded)")}
+        assert "sub_id" in {r[1] for r in conn.execute("PRAGMA table_info(ws_subscriptions)")}
+        assert "covered" in {r[1] for r in conn.execute("PRAGMA table_info(coverage)")}
         assert conn.execute("SELECT recovered_at FROM coverage_gaps").fetchone()[0] is None
-        assert db.migrate(conn) == 2  # idempotent
+        assert db.migrate(conn) == 3  # idempotent
         # the append-only triggers survived
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute("DELETE FROM decisions")

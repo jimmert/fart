@@ -11,6 +11,7 @@ import json
 import sqlite3
 from typing import Any
 
+from .. import db
 from ..db import kv_get, kv_set
 from ..log import get_logger
 from ..net.budget import Blocked, Budget
@@ -139,23 +140,18 @@ class PriceFeed:
             stats["calls"] += 1
             best = best_pair_per_token(pairs)
             now = self.clock()
-            self.conn.execute("BEGIN")
-            try:
-                for mint in chunk:
-                    p = best.get(mint)
-                    if p is None:
-                        stats["no_pair"] += 1
-                        continue
-                    s = pair_to_sample(p)
-                    self.conn.execute(
+            samples = [(mint, pair_to_sample(best[mint])) for mint in chunk if best.get(mint) is not None]
+            stats["no_pair"] += len(chunk) - len(samples)
+
+            def _write(c, samples=samples) -> None:
+                for mint, s in samples:
+                    c.execute(
                         "INSERT OR REPLACE INTO mcap_samples(mint, ts, src, mcap_usd, fdv_usd, liquidity_usd, volume_h24_usd, price_usd, sol_usd, json)"
                         " VALUES(?,?,?,?,?,?,?,?,?,?)",
                         (mint, now, "dexscreener", s["mcap_usd"], s["fdv_usd"], s["liquidity_usd"], s["volume_h24_usd"], s["price_usd"],
                          sol_usd, json.dumps(s)),
                     )
-                    stats["stored"] += 1
-                self.conn.execute("COMMIT")
-            except Exception:
-                self.conn.execute("ROLLBACK")
-                raise
+
+            db.write_tx(self.conn, _write, what="prices.samples")
+            stats["stored"] += len(samples)
         return stats

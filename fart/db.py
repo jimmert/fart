@@ -1,16 +1,56 @@
-"""SQLite access: WAL mode, schema versioning via PRAGMA user_version, idempotent migrations.
+"""SQLite access: WAL mode, schema versioning via PRAGMA user_version, idempotent migrations,
+and the ONE way to write: `write_tx()`.
 
 Time columns: `slot`/`block_time` are chain time, `received_at`/`created_at`/`measured_at`
 are our clock. `decisions` and `outcomes` are append-only (enforced by triggers).
+
+Write rules (milestone 3, after the VPS lock storm of 26 Oct 2026):
+
+* Every transaction that writes starts with `BEGIN IMMEDIATE` (`immediate()` / `write_tx()`).
+  A plain `BEGIN` that reads first and writes later fails at once with SQLITE_BUSY_SNAPSHOT in WAL
+  mode as soon as any other connection committed in between; the busy handler is *not* consulted
+  for that error, so `busy_timeout` never helped. `BEGIN IMMEDIATE` takes the write lock up front
+  and waits (busy handler, `BUSY_TIMEOUT_MS`) instead of failing.
+* Keep write transactions short: compute features, cluster, decode, call the network *outside*
+  (plain SELECTs or a closed `read_tx()` snapshot), then write in one short IMMEDIATE transaction.
+* `write_tx()` retries a busy/locked error up to `WRITE_RETRY_ATTEMPTS` times with a short jitter
+  instead of failing the whole tick or handler. The function it runs must only touch the database
+  (it may run more than once).
+* A write that still fails is counted (`record_failure()`: `<key>` and `<key>.<day>` in kv) so
+  `fart status` and the daily report show it.
 """
 from __future__ import annotations
 
+import json
+import random
 import sqlite3
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
-SCHEMA_VERSION = 2
+from .log import get_logger
+from .util import day_key
+
+log = get_logger("db")
+
+SCHEMA_VERSION = 3
+
+BUSY_TIMEOUT_MS = 15000
+WRITE_RETRY_ATTEMPTS = 3
+WRITE_RETRY_BASE_S = 0.05
+WRITE_RETRY_MAX_S = 1.0
+
+# Quote / system mints that can never be a pump.fun coin. PumpPortal migration messages put USDC and
+# PUMP in their `mint` field on 26 Oct 2026 (docs/PUMPFUN-EVENTS.md); schema v3 removes the rows they
+# caused. The runtime filter reads the same list from config/pumpfun.json -> system_mints (tests keep
+# both in sync).
+SCHEMA_V3_SYSTEM_MINTS = (
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",   # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",   # USDT
+    "So11111111111111111111111111111111111111112",    # WSOL
+    "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",    # PUMP
+)
 
 # One migration per schema version. Each must be idempotent (CREATE ... IF NOT EXISTS, guarded
 # ALTER TABLE). A migration is either an SQL script or a callable taking the connection; both run
@@ -371,9 +411,71 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
 
 MIGRATIONS[2] = _migrate_v2
 
+# ----- schema version 3 (milestone 3) --------------------------------------------------------------
+# * `rejected_messages`: raw PumpPortal / RPC messages the ingest refused (system mint, unknown coin,
+#   unknown pool) so the case can be inspected without digging through the hourly gzip files.
+# * `ws_subscriptions.sub_id`: the server-side subscription id, so a raw rpc_trades notification can be
+#   mapped back to its mint when it is replayed (`fart ingest replay`).
+# * index on `migrations(pool_address)`: pump-amm swaps resolve their mint through the pool.
+# * cleanup of the rows the USDC / PUMP "migrations" caused (trades, migrations, mcap_samples,
+#   watchlist, ws_subscriptions, coins); the counts land in kv `schema.v3.cleanup` for the deployer.
+#   `decisions` / `outcomes` are append-only and stay; the report's universe comes from `migrations`.
+# Every statement is idempotent: a second run deletes nothing and changes nothing.
+SCHEMA_V3_SQL = [
+    """CREATE TABLE IF NOT EXISTS rejected_messages(
+        id          INTEGER PRIMARY KEY,
+        received_at REAL NOT NULL,
+        source      TEXT NOT NULL,
+        kind        TEXT,
+        reason      TEXT NOT NULL,
+        mint        TEXT,
+        raw_json    TEXT,
+        raw_ref     TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS rejected_messages_received ON rejected_messages(received_at)",
+    "CREATE INDEX IF NOT EXISTS migrations_pool ON migrations(pool_address)",
+]
+SCHEMA_V3_COLUMNS = [
+    ("ws_subscriptions", "sub_id", "INTEGER"),
+    ("coverage", "covered", "INTEGER"),
+]
+
+
+def _cleanup_system_mints(conn: sqlite3.Connection, mints: Iterable[str], now: float) -> dict[str, int]:
+    mints = tuple(mints)
+    if not mints:
+        return {}
+    marks = ",".join("?" for _ in mints)
+    out: dict[str, int] = {}
+    out["trades"] = conn.execute(f"DELETE FROM trades WHERE mint IN ({marks})", mints).rowcount
+    out["migrations"] = conn.execute(f"DELETE FROM migrations WHERE mint IN ({marks})", mints).rowcount
+    out["mcap_samples"] = conn.execute(f"DELETE FROM mcap_samples WHERE mint IN ({marks})", mints).rowcount
+    out["coins"] = conn.execute(f"DELETE FROM coins WHERE mint IN ({marks})", mints).rowcount
+    out["watchlist"] = conn.execute(
+        f"UPDATE watchlist SET active=0, until=COALESCE(until, ?) WHERE active=1 AND mint IN ({marks})", (now, *mints)
+    ).rowcount
+    out["ws_subscriptions"] = conn.execute(
+        f"UPDATE ws_subscriptions SET until=? WHERE until IS NULL AND mint IN ({marks})", (now, *mints)
+    ).rowcount
+    return out
+
+
+def _migrate_v3(conn: sqlite3.Connection) -> None:
+    for stmt in SCHEMA_V3_SQL:
+        conn.execute(stmt)
+    for table, column, ctype in SCHEMA_V3_COLUMNS:
+        if not _column_exists(conn, table, column):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ctype}")
+    now = time.time()
+    counts = _cleanup_system_mints(conn, SCHEMA_V3_SYSTEM_MINTS, now)
+    kv_set(conn, "schema.v3.cleanup", json.dumps({"at": now, "mints": list(SCHEMA_V3_SYSTEM_MINTS), "deleted": counts}), now)
+
+
+MIGRATIONS[3] = _migrate_v3
+
 
 def _apply_pragmas(conn: sqlite3.Connection, readonly: bool) -> None:
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     if not readonly:
         # Changing the journal mode needs an exclusive lock; only do it when not already WAL.
         for attempt in range(5):
@@ -395,7 +497,7 @@ def connect(path: str | Path, migrate_schema: bool = True) -> sqlite3.Connection
     p = Path(path)
     if str(p) != ":memory:":
         p.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(p), timeout=5.0, isolation_level=None, check_same_thread=False)
+    conn = sqlite3.connect(str(p), timeout=BUSY_TIMEOUT_MS / 1000.0, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     _apply_pragmas(conn, readonly=False)
     if migrate_schema:
@@ -407,7 +509,7 @@ def connect_ro(path: str | Path) -> sqlite3.Connection:
     """Read-only connection (mode=ro). Fails if the database does not exist."""
     p = Path(path)
     uri = f"file:{p.as_posix()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=5.0, isolation_level=None, check_same_thread=False)
+    conn = sqlite3.connect(uri, uri=True, timeout=BUSY_TIMEOUT_MS / 1000.0, isolation_level=None, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     _apply_pragmas(conn, readonly=True)
     return conn
@@ -443,6 +545,111 @@ def migrate(conn: sqlite3.Connection) -> int:
     return current
 
 
+# ----- transactions ---------------------------------------------------------------------------------
+def is_busy_error(exc: BaseException) -> bool:
+    """SQLITE_BUSY / SQLITE_LOCKED family (the only errors a short wait can cure)."""
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _rollback(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.OperationalError:
+        pass  # no transaction is active (BEGIN itself failed)
+
+
+@contextmanager
+def immediate(conn: sqlite3.Connection):
+    """One short write transaction: BEGIN IMMEDIATE ... COMMIT, ROLLBACK on any error."""
+    conn.execute("BEGIN IMMEDIATE")
+    ok = False
+    try:
+        yield conn
+        conn.execute("COMMIT")
+        ok = True
+    finally:
+        if not ok:
+            _rollback(conn)
+
+
+@contextmanager
+def read_tx(conn: sqlite3.Connection):
+    """A closed read-only snapshot (deferred BEGIN ... COMMIT). Never write inside it: the first write
+    after another connection's commit would fail with SQLITE_BUSY_SNAPSHOT."""
+    conn.execute("BEGIN")
+    ok = False
+    try:
+        yield conn
+        conn.execute("COMMIT")
+        ok = True
+    finally:
+        if not ok:
+            _rollback(conn)
+
+
+def write_tx(conn: sqlite3.Connection, fn: Callable[[sqlite3.Connection], Any], *, what: str = "write",
+             attempts: int | None = None, base_sleep_s: float | None = None) -> Any:
+    """Run `fn(conn)` inside BEGIN IMMEDIATE and return its result. A busy/locked error (another
+    writer held the lock longer than busy_timeout) is retried `attempts` times with a short random
+    sleep; any other error rolls back and propagates at once. `fn` must only touch the database."""
+    n = WRITE_RETRY_ATTEMPTS if attempts is None else int(attempts)
+    base = WRITE_RETRY_BASE_S if base_sleep_s is None else float(base_sleep_s)
+    for i in range(1, max(1, n) + 1):
+        try:
+            with immediate(conn):
+                return fn(conn)
+        except sqlite3.OperationalError as e:
+            if not is_busy_error(e) or i >= n:
+                raise
+            wait = min(WRITE_RETRY_MAX_S, base * (2 ** (i - 1))) * random.uniform(0.5, 1.5)
+            log.warning("db.write_retry", what=what, attempt=i, wait_s=round(wait, 3), error=str(e)[:100])
+            time.sleep(wait)
+    raise AssertionError("unreachable")
+
+
+def counter_bump(conn: sqlite3.Connection, key: str, n: int = 1, ts: float = 0.0) -> None:
+    """Integer counter in kv (created at n)."""
+    conn.execute(
+        "INSERT INTO kv(key, value, updated_at) VALUES(?, ?, ?)"
+        " ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+? AS TEXT), updated_at=?",
+        (key, str(int(n)), ts, int(n), ts),
+    )
+
+
+def day_of(ts: float) -> str:
+    return day_key(ts)
+
+
+def counter_bump_daily(conn: sqlite3.Connection, key: str, n: int = 1, ts: float = 0.0) -> None:
+    """`key` (all time) plus `key.<UTC day>` (the daily report reads the latter)."""
+    counter_bump(conn, key, n, ts)
+    counter_bump(conn, f"{key}.{day_key(ts)}", n, ts)
+
+
+def record_failure(conn: sqlite3.Connection, key: str, ts: float, n: int = 1, detail: str | None = None) -> bool:
+    """Count a failure under `key` (all time) and `key.<UTC day>` (for the daily report), remember
+    `key.last_at` / `key.last`. Best effort: returns False (and logs) when even this write fails, so
+    a lock storm never turns into an exception storm. Callers keep their own in-memory count."""
+    def _w(c: sqlite3.Connection) -> None:
+        counter_bump_daily(c, key, n, ts)
+        kv_set(c, f"{key}.last_at", str(ts), ts)
+        if detail is not None:
+            kv_set(c, f"{key}.last", str(detail)[:300], ts)
+
+    try:
+        write_tx(conn, _w, what=f"failure:{key}", attempts=2)
+        return True
+    except sqlite3.OperationalError as e:
+        log.warning("db.failure_not_recorded", key=key, error=str(e)[:100])
+        return False
+
+
+def counters(conn: sqlite3.Connection, prefixes: tuple[str, ...]) -> dict[str, str]:
+    where = " OR ".join("key LIKE ?" for _ in prefixes)
+    return {r["key"]: r["value"] for r in conn.execute(f"SELECT key, value FROM kv WHERE {where} ORDER BY key", tuple(f"{p}%" for p in prefixes))}
+
+
 def kv_get(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
     row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
     return default if row is None else row["value"]
@@ -454,6 +661,12 @@ def kv_set(conn: sqlite3.Connection, key: str, value: str, ts: float) -> None:
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
         (key, value, ts),
     )
+
+
+def kv_setdefault(conn: sqlite3.Connection, key: str, value: str, ts: float) -> bool:
+    """Write only when the key does not exist yet (first-start timestamps). Returns True when written."""
+    cur = conn.execute("INSERT OR IGNORE INTO kv(key, value, updated_at) VALUES(?,?,?)", (key, value, ts))
+    return bool(cur.rowcount)
 
 
 def table_counts(conn: sqlite3.Connection, tables: Iterable[str]) -> dict[str, int]:

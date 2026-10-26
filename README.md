@@ -1,5 +1,32 @@
 # fart
 
+## Voor Jim: wat milestone 3 repareert
+
+Mijlpaal 3 voegt niets toe; het repareert wat de VPS op 26 oktober 2026 liet zien (details en de
+beslissingen in `docs/DECISIONS.md`, de upgrade stap voor stap in `deploy/DEPLOY.md`, "Upgrade to
+milestone 3"):
+
+1. **De engine schrijft weer.** Elke schrijftransactie begint nu met `BEGIN IMMEDIATE`, blijft kort en
+   wordt bij een lock tot drie keer herhaald; de busy-timeout is 15 s. Wat tóch mislukt staat in
+   `fart status` onder `failures:` en in het dagrapport; `fart ingest replay --source rpc_logs --since <tijd>`
+   verwerkt de ruwe regels van zo'n periode opnieuw.
+2. **De trade-stroom kost niet meer de hele dag CU.** USDC en PUMP (en USDT, WSOL) kunnen nooit meer een
+   munt, migratie of watchlist-item worden; geweigerde PumpPortal-berichten staan in `rejected_messages`;
+   de valse `trades`-rijen worden bij de upgrade opgeruimd; `rpc_trades` volgt munten alleen nog vóór
+   graduatie, met maximaal 2.000 notificaties per abonnement per uur en 1/24 van het dagplafond per uur
+   voor de hele stroom (`rpc CU today by method` toont de stroom apart als `ws_trade_*`). Gegradueerde
+   munten meet de tracker via DexScreener.
+3. **De backup werkt weer** (`gzip -n -c` in plaats van `gzip -f`, plus `gzip -t`): controleer met
+   `systemctl show -p Result fart-backup.service`.
+4. **Het dagrapport is eerlijk over uren zonder fart**: `NIET GEDEKT` met lege percentages, een kolom
+   `gedekt` per uur, en een sectie "Verrijking en fouten" met de verrijkingslimiet (nu een deel van het
+   CU-plafond, migraties eerst) en de fouten van de dag.
+5. **De fees kloppen**: `fart chain global` is tegen de officiële IDL gecontroleerd; 0,95% + 0,05% =
+   1,00% (`config/pumpfun.json`), en `fart events classify` noemt de resterende events bij hun naam
+   (`InitBoostEvent` van pump-amm was de grootste onbekende).
+
+Na de upgrade zet je in `/opt/fart/.env` `RPC_DAILY_BUDGET_CU` terug op `3000000`.
+
 ## Voor Jim: wat milestone 2 toevoegt
 
 1. **Trades per munt via de RPC.** PumpPortal geeft alleen trades aan een betaalde API-sleutel; zonder
@@ -63,7 +90,8 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'          # or: pip install websockets pytest
 make check                       # py_compile + pytest + systemd-analyze verify + bash -n
 python -m fart status            # works on an empty database
-python -m fart ingest            # daemon; creates+migrations via PumpPortal and RPC, per-mint trades via a keyed RPC
+python -m fart ingest            # daemon; creates+migrations via PumpPortal and RPC, per-mint trades (pre-graduation) via a keyed RPC
+python -m fart ingest replay --source rpc_logs --since 2026-10-26T08:00Z   # re-feed raw hour files after handler failures
 python -m fart engine            # daemon; 15 s loop
 python -m fart social --once     # one X tick (idle without X_BEARER_TOKEN)
 python -m fart notify outbox     # last 20 Telegram outbox rows; `notify test` sends one message when enabled
@@ -80,7 +108,7 @@ Configuration: `config/*.json` (thresholds, cost tables, curve parameters) and
 Layout:
 
 ```
-fart/          package: config, db (schema v2), log, util, version, cli
+fart/          package: config, db (schema v3, write_tx), log, util, version, cli
 fart/net/      budget gate (rate, daily caps, health, backoff) + urllib JSON client
 fart/chain/    base58, PDA derivation, Anchor event decoder (pump.fun + pump-amm), tx parsing, curve math, Global account, RPC client
 fart/ingest/   raw store, normalization, PumpPortal + RPC log + RPC per-mint trade clients, sweep, coverage, retention

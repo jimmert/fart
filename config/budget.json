@@ -19,10 +19,14 @@
         "ws_connect": 10,
         "ws_subscribe": 10,
         "ws_notification": 10,
-        "ws_unsubscribe": 10
+        "ws_unsubscribe": 10,
+        "ws_trade_notification": 10,
+        "ws_trade_subscribe": 10,
+        "ws_trade_unsubscribe": 10
       },
       "backoff_base_s": 2,
-      "backoff_max_s": 300
+      "backoff_max_s": 300,
+      "_comment": "ws_notification/ws_subscribe = the creates+migrations log stream (rpc_logs); ws_trade_* = the per-mint trade stream (rpc_trades), booked separately so `fart status` -> rpc CU today by method shows what each stream costs. Whether Alchemy bills websocket notifications at all is TO VERIFY (docs/UNVERIFIED.md)."
     },
     "rpc_public": {
       "rate_per_s": 1,
