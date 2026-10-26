@@ -1,19 +1,27 @@
-"""Tolerant decoding of pump.fun Anchor events.
+"""Tolerant decoding of pump.fun and pump-amm (PumpSwap) Anchor events.
 
 Events arrive as `Program data: <base64>` log lines (logsSubscribe / getTransaction logMessages)
 or as self-CPI inner-instruction payloads prefixed with the 8-byte anchor event-CPI
 discriminator. Payload = 8-byte event discriminator (sha256('event:<Name>')[:8]) + Borsh fields.
 
-Layouts below are from the published pump.fun IDL history and are to be VERIFIED against real
-transactions (docs/PUMPFUN-EVENTS.md, docs/UNVERIFIED.md). Decoding never raises on drift:
-fields are parsed in order until bytes run out; a payload with fewer than the required fields
-is returned as Undecoded with a reason, and plausibility checks mark suspect layouts.
+The pump.fun layouts come from the published IDL history; CreateEvent / TradeEvent /
+CompletePumpAmmMigrationEvent decode on mainnet (VPS, 26 Oct 2026). The pump-amm layouts
+(BuyEvent, SellEvent, CreatePoolEvent) are from the PumpSwap IDL as remembered and are TO VERIFY
+(docs/PUMPFUN-EVENTS.md): decoding never raises on drift, fields are parsed in order until bytes run
+out, a payload with fewer than the required fields is returned as Undecoded with a reason, and
+plausibility checks (timestamps, basis points) mark suspect layouts.
+
+`attribute_program_data()` walks the `Program X invoke [n]` / `Program X success` nesting so every
+payload is attributed to the program that emitted it: unknown discriminators from Jupiter, Orca or
+Raydium in the same transaction are then counted per program instead of being mistaken for new
+pump.fun events.
 """
 from __future__ import annotations
 
 import base64
 import binascii
 import hashlib
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import Any
@@ -25,11 +33,14 @@ PROGRAM_DATA_PREFIX = "Program data: "
 # serialized little-endian on the wire -> these bytes prefix every self-CPI event payload.
 ANCHOR_EVENT_CPI_DISC = bytes.fromhex("e445a52e51cb9a1d")
 
+PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+
 MAX_STRING_LEN = 2048
 TS_MIN = 1_577_836_800  # 2020-01-01
 TS_MAX = 4_102_444_800  # 2100-01-01
 
-# (field name, type). Types: string | pubkey | u64 | i64 | bool
+# (field name, type). Types: string | pubkey | u64 | i64 | bool | u8 | u16
 LAYOUTS: dict[str, tuple[list[tuple[str, str]], int]] = {
     "CreateEvent": (
         [
@@ -67,15 +78,97 @@ LAYOUTS: dict[str, tuple[list[tuple[str, str]], int]] = {
         [("user", "pubkey"), ("mint", "pubkey"), ("bonding_curve", "pubkey"), ("timestamp", "i64")],
         2,
     ),
+    # ----- pump-amm (PumpSwap) events: TO VERIFY -------------------------------------------------
+    "BuyEvent": (
+        [
+            ("timestamp", "i64"), ("base_amount_out", "u64"), ("max_quote_amount_in", "u64"),
+            ("user_base_token_reserves", "u64"), ("user_quote_token_reserves", "u64"),
+            ("pool_base_token_reserves", "u64"), ("pool_quote_token_reserves", "u64"),
+            ("quote_amount_in", "u64"), ("lp_fee_basis_points", "u64"), ("lp_fee", "u64"),
+            ("protocol_fee_basis_points", "u64"), ("protocol_fee", "u64"),
+            ("quote_amount_in_with_lp_fee", "u64"), ("user_quote_amount_in", "u64"),
+            ("pool", "pubkey"), ("user", "pubkey"), ("user_base_token_account", "pubkey"),
+            ("user_quote_token_account", "pubkey"), ("protocol_fee_recipient", "pubkey"),
+            ("protocol_fee_recipient_token_account", "pubkey"),
+            ("coin_creator", "pubkey"), ("coin_creator_fee_basis_points", "u64"), ("coin_creator_fee", "u64"),
+            ("track_volume", "bool"), ("total_unclaimed_tokens", "u64"), ("total_claimed_tokens", "u64"),
+            ("current_sol_volume", "u64"), ("last_update_timestamp", "i64"),
+        ],
+        16,
+    ),
+    "SellEvent": (
+        [
+            ("timestamp", "i64"), ("base_amount_in", "u64"), ("min_quote_amount_out", "u64"),
+            ("user_base_token_reserves", "u64"), ("user_quote_token_reserves", "u64"),
+            ("pool_base_token_reserves", "u64"), ("pool_quote_token_reserves", "u64"),
+            ("quote_amount_out", "u64"), ("lp_fee_basis_points", "u64"), ("lp_fee", "u64"),
+            ("protocol_fee_basis_points", "u64"), ("protocol_fee", "u64"),
+            ("quote_amount_out_without_lp_fee", "u64"), ("user_quote_amount_out", "u64"),
+            ("pool", "pubkey"), ("user", "pubkey"), ("user_base_token_account", "pubkey"),
+            ("user_quote_token_account", "pubkey"), ("protocol_fee_recipient", "pubkey"),
+            ("protocol_fee_recipient_token_account", "pubkey"),
+            ("coin_creator", "pubkey"), ("coin_creator_fee_basis_points", "u64"), ("coin_creator_fee", "u64"),
+        ],
+        16,
+    ),
+    "CreatePoolEvent": (
+        [
+            ("timestamp", "i64"), ("index", "u16"), ("creator", "pubkey"), ("base_mint", "pubkey"), ("quote_mint", "pubkey"),
+            ("base_mint_decimals", "u8"), ("quote_mint_decimals", "u8"), ("base_amount_in", "u64"), ("quote_amount_in", "u64"),
+            ("pool_base_amount", "u64"), ("pool_quote_amount", "u64"), ("minimum_liquidity", "u64"), ("initial_liquidity", "u64"),
+            ("lp_token_amount_out", "u64"), ("pool_bump", "u8"), ("pool", "pubkey"), ("lp_mint", "pubkey"),
+            ("user_base_token_account", "pubkey"), ("user_quote_token_account", "pubkey"), ("coin_creator", "pubkey"),
+        ],
+        5,
+    ),
 }
 
-# Known pump.fun events we recognise by name but do not need; counted, payload not stored.
+# Known events we recognise by name but do not need; counted, payload not stored.
 IGNORED_EVENT_NAMES = (
+    # pump.fun
     "SetParamsEvent", "CollectCreatorFeeEvent", "ExtendAccountEvent", "UpdateGlobalAuthorityEvent",
     "SetCreatorEvent", "SetMetaplexCreatorEvent", "ClaimTokenIncentivesEvent", "InitUserVolumeAccumulatorEvent",
     "SyncUserVolumeAccumulatorEvent", "AdminSetCreatorEvent", "AdminUpdateTokenIncentivesEvent",
-    "CloseUserVolumeAccumulatorEvent", "ReservesSyncedEvent",
+    "CloseUserVolumeAccumulatorEvent", "ReservesSyncedEvent", "AdminSetIdlAuthorityEvent", "ReserveEvent",
+    "CreateEventV2", "TradeEventV2",
+    # pump-amm
+    "DepositEvent", "WithdrawEvent", "DisableEvent", "UpdateAdminEvent", "UpdateFeeConfigEvent",
+    "CollectCoinCreatorFeeEvent", "SetCoinCreatorEvent", "AdminSetCoinCreatorEvent", "CreateConfigEvent",
+    "UpdateConfigEvent", "BuyExactQuoteInEvent", "SellExactQuoteOutEvent",
 )
+
+# name -> programs whose IDL carries an event of that name. Names shared by pump.fun and
+# pump-amm have the same discriminator (sha256 of the name only), so the program is ambiguous.
+EVENT_PROGRAMS: dict[str, tuple[str, ...]] = {
+    "CreateEvent": ("pump",), "TradeEvent": ("pump",), "CompleteEvent": ("pump",),
+    "CompletePumpAmmMigrationEvent": ("pump",), "SetParamsEvent": ("pump",), "CollectCreatorFeeEvent": ("pump",),
+    "UpdateGlobalAuthorityEvent": ("pump",), "SetCreatorEvent": ("pump",), "SetMetaplexCreatorEvent": ("pump",),
+    "AdminSetCreatorEvent": ("pump",), "ReservesSyncedEvent": ("pump",), "AdminSetIdlAuthorityEvent": ("pump",),
+    "ReserveEvent": ("pump",), "CreateEventV2": ("pump",), "TradeEventV2": ("pump",),
+    "ExtendAccountEvent": ("pump", "pump_amm"), "ClaimTokenIncentivesEvent": ("pump", "pump_amm"),
+    "InitUserVolumeAccumulatorEvent": ("pump", "pump_amm"), "SyncUserVolumeAccumulatorEvent": ("pump", "pump_amm"),
+    "CloseUserVolumeAccumulatorEvent": ("pump", "pump_amm"), "AdminUpdateTokenIncentivesEvent": ("pump", "pump_amm"),
+    "BuyEvent": ("pump_amm",), "SellEvent": ("pump_amm",), "CreatePoolEvent": ("pump_amm",), "DepositEvent": ("pump_amm",),
+    "WithdrawEvent": ("pump_amm",), "DisableEvent": ("pump_amm",), "UpdateAdminEvent": ("pump_amm",),
+    "UpdateFeeConfigEvent": ("pump_amm",), "CollectCoinCreatorFeeEvent": ("pump_amm",), "SetCoinCreatorEvent": ("pump_amm",),
+    "AdminSetCoinCreatorEvent": ("pump_amm",), "CreateConfigEvent": ("pump_amm",), "UpdateConfigEvent": ("pump_amm",),
+    "BuyExactQuoteInEvent": ("pump_amm",), "SellExactQuoteOutEvent": ("pump_amm",),
+}
+
+# Event names of other Anchor programs commonly found in the same transactions (best guesses for
+# classification only; never decoded). program label -> names.
+OTHER_PROGRAM_EVENT_NAMES: dict[str, tuple[str, ...]] = {
+    "jupiter_v6": ("SwapEvent", "FeeEvent"),
+    "raydium": ("SwapEvent", "LpChangeEvent", "PoolCreateEvent", "TradeEvent", "ClaimVestedEvent", "CreateVestingEvent",
+                "SwapBaseInEvent", "SwapBaseOutEvent", "IncreaseLiquidityEvent", "DecreaseLiquidityEvent",
+                "CollectPersonalFeeEvent", "CreatePersonalPositionEvent", "LiquidityChangeEvent", "LiquidityCalculateEvent",
+                "ConfigChangeEvent", "CollectProtocolFeeEvent", "MigrateEvent"),
+    "orca_whirlpool": ("Traded", "LiquidityIncreased", "LiquidityDecreased", "PoolInitialized"),
+    "meteora": ("Swap", "AddLiquidity", "RemoveLiquidity", "PositionCreate", "PositionClose", "ClaimFee", "ClaimReward",
+                "LbPairCreate", "CompositionFee", "EvtSwap", "EvtSwap2", "EvtCreatePool", "EvtAddLiquidity", "EvtRemoveLiquidity",
+                "EvtClaimPositionFee", "EvtInitializePool", "EvtCurveComplete", "EvtClaimTradingFee", "EvtClaimProtocolFee",
+                "EvtCreatorWithdrawSurplus", "EvtCreateDammV2MigrationMetadata", "EvtClaimCreatorTradingFee"),
+}
 
 
 def event_discriminator(name: str) -> bytes:
@@ -83,6 +176,47 @@ def event_discriminator(name: str) -> bytes:
 
 
 DISCRIMINATORS: dict[bytes, str] = {event_discriminator(n): n for n in list(LAYOUTS) + list(IGNORED_EVENT_NAMES)}
+
+_OTHER_DISCRIMINATORS: dict[bytes, list[tuple[str, str]]] = {}
+for _prog, _names in OTHER_PROGRAM_EVENT_NAMES.items():
+    for _n in _names:
+        _OTHER_DISCRIMINATORS.setdefault(event_discriminator(_n), []).append((_prog, _n))
+
+
+def classify_discriminator(disc_hex: str) -> dict[str, Any]:
+    """Best-guess name(s) for an 8-byte event discriminator.
+
+    status: 'decoded' (we have a layout), 'ignored' (known pump/pump-amm event we skip),
+    'other_program' (name matches an event of another Anchor program; the program is a guess),
+    'emit_cpi_tag' (the anchor event-CPI tag itself), 'unknown'.
+    """
+    try:
+        disc = bytes.fromhex(disc_hex)
+    except ValueError:
+        return {"discriminator": disc_hex, "name": None, "programs": [], "status": "unknown"}
+    if disc == ANCHOR_EVENT_CPI_DISC:
+        return {"discriminator": disc_hex, "name": "anchor event-CPI tag (next 8 bytes are the event)", "programs": ["anchor"], "status": "emit_cpi_tag"}
+    name = DISCRIMINATORS.get(disc)
+    if name is not None:
+        return {"discriminator": disc_hex, "name": name, "programs": list(EVENT_PROGRAMS.get(name, ())),
+                "status": "decoded" if name in LAYOUTS else "ignored"}
+    others = _OTHER_DISCRIMINATORS.get(disc)
+    if others:
+        return {"discriminator": disc_hex, "name": "/".join(sorted({n for _, n in others})),
+                "programs": sorted({p for p, _ in others}), "status": "other_program"}
+    return {"discriminator": disc_hex, "name": None, "programs": [], "status": "unknown"}
+
+
+def discriminator_table() -> list[dict[str, Any]]:
+    """Every discriminator we know about, for docs and `fart events classify`."""
+    rows = []
+    for name in list(LAYOUTS) + list(IGNORED_EVENT_NAMES):
+        rows.append({"name": name, "discriminator": event_discriminator(name).hex(), "programs": list(EVENT_PROGRAMS.get(name, ())),
+                     "status": "layout" if name in LAYOUTS else "ignored"})
+    for prog, names in OTHER_PROGRAM_EVENT_NAMES.items():
+        for n in names:
+            rows.append({"name": n, "discriminator": event_discriminator(n).hex(), "programs": [prog], "status": "other_program"})
+    return rows
 
 
 @dataclass
@@ -94,6 +228,7 @@ class DecodedEvent:
     consumed: int
     size: int
     suspect: list[str] = field(default_factory=list)
+    program: str | None = None
 
     @property
     def layout(self) -> str:
@@ -113,6 +248,7 @@ class Undecoded:
     payload_b64: str
     reason: str
     name: str | None = None
+    program: str | None = None
 
 
 class _Reader:
@@ -129,6 +265,12 @@ class _Reader:
         b = self.data[self.pos:self.pos + n]
         self.pos += n
         return b
+
+    def u8(self) -> int:
+        return self.take(1)[0]
+
+    def u16(self) -> int:
+        return struct.unpack("<H", self.take(2))[0]
 
     def u64(self) -> int:
         return struct.unpack("<Q", self.take(8))[0]
@@ -152,18 +294,18 @@ class _Reader:
         return self.take(n).decode("utf-8", errors="replace")
 
 
-def decode_event_bytes(data: bytes) -> DecodedEvent | Undecoded:
+def decode_event_bytes(data: bytes, program: str | None = None) -> DecodedEvent | Undecoded:
     """Decode one event payload (discriminator + fields). Never raises."""
     if data[:8] == ANCHOR_EVENT_CPI_DISC:
         data = data[8:]
     if len(data) < 8:
-        return Undecoded(data.hex(), base64.b64encode(data).decode(), "too_short")
+        return Undecoded(data.hex(), base64.b64encode(data).decode(), "too_short", program=program)
     disc = bytes(data[:8])
     name = DISCRIMINATORS.get(disc)
     if name is None:
-        return Undecoded(disc.hex(), base64.b64encode(data).decode(), "unknown_discriminator")
+        return Undecoded(disc.hex(), base64.b64encode(data).decode(), "unknown_discriminator", program=program)
     if name not in LAYOUTS:
-        return Undecoded(disc.hex(), "", "ignored_event", name=name)
+        return Undecoded(disc.hex(), "", "ignored_event", name=name, program=program)
     fields_spec, required = LAYOUTS[name]
     r = _Reader(data, 8)
     out: dict[str, Any] = {}
@@ -180,36 +322,68 @@ def decode_event_bytes(data: bytes) -> DecodedEvent | Undecoded:
         parsed += 1
     if parsed < required:
         reason = f"truncated_or_drift: parsed {parsed}/{required} required" + (f" ({err})" if err else "")
-        return Undecoded(disc.hex(), base64.b64encode(data).decode(), reason, name=name)
-    ev = DecodedEvent(name, out, parsed, len(fields_spec), r.pos, len(data))
+        return Undecoded(disc.hex(), base64.b64encode(data).decode(), reason, name=name, program=program)
+    ev = DecodedEvent(name, out, parsed, len(fields_spec), r.pos, len(data), program=program)
     if err:
         ev.suspect.append(f"stopped at {err}")
     ts = out.get("timestamp")
     if isinstance(ts, int) and not (TS_MIN <= ts <= TS_MAX):
         ev.suspect.append(f"timestamp {ts} implausible")
+    for fname, val in out.items():
+        if fname.endswith("basis_points") and isinstance(val, int) and val > 10_000:
+            ev.suspect.append(f"{fname} {val} implausible")
     return ev
 
 
-def extract_program_data(logs: list[str] | None) -> list[bytes]:
-    """All `Program data:` payloads in a log list, base64-decoded. Garbage is skipped silently here;
-    callers see it as fewer payloads (the raw logs are kept by the caller when needed)."""
-    out: list[bytes] = []
+_INVOKE = re.compile(r"^Program (\S+) invoke \[(\d+)\]$")
+_END = re.compile(r"^Program (\S+) (success|failed.*)$")
+
+
+def attribute_program_data(logs: list[str] | None) -> list[tuple[str | None, bytes]]:
+    """All `Program data:` payloads with the program that emitted them (from the invoke nesting).
+
+    Garbage base64 becomes b'' (recorded as too_short by the decoder, never a crash). A payload
+    outside any invoke frame (should not happen) gets program None.
+    """
+    out: list[tuple[str | None, bytes]] = []
+    stack: list[str] = []
     for line in logs or []:
-        if not isinstance(line, str) or not line.startswith(PROGRAM_DATA_PREFIX):
+        if not isinstance(line, str):
             continue
-        b64 = line[len(PROGRAM_DATA_PREFIX):].strip()
-        try:
-            out.append(base64.b64decode(b64, validate=True))
-        except (binascii.Error, ValueError):
-            out.append(b"")  # recorded as too_short -> counted, never crashes
+        if line.startswith(PROGRAM_DATA_PREFIX):
+            b64 = line[len(PROGRAM_DATA_PREFIX):].strip()
+            try:
+                payload = base64.b64decode(b64, validate=True)
+            except (binascii.Error, ValueError):
+                payload = b""
+            out.append((stack[-1] if stack else None, payload))
+            continue
+        m = _INVOKE.match(line)
+        if m:
+            stack.append(m.group(1))
+            continue
+        m = _END.match(line)
+        if m and stack:
+            # pop to the matching program (tolerate missing frames)
+            prog = m.group(1)
+            if prog in stack:
+                while stack and stack[-1] != prog:
+                    stack.pop()
+                if stack:
+                    stack.pop()
     return out
+
+
+def extract_program_data(logs: list[str] | None) -> list[bytes]:
+    """All `Program data:` payloads in a log list, base64-decoded (program attribution dropped)."""
+    return [payload for _, payload in attribute_program_data(logs)]
 
 
 def decode_logs(logs: list[str] | None) -> tuple[list[DecodedEvent], list[Undecoded]]:
     events: list[DecodedEvent] = []
     undecoded: list[Undecoded] = []
-    for payload in extract_program_data(logs):
-        res = decode_event_bytes(payload)
+    for program, payload in attribute_program_data(logs):
+        res = decode_event_bytes(payload, program=program)
         (events if isinstance(res, DecodedEvent) else undecoded).append(res)
     return events, undecoded
 

@@ -1,0 +1,43 @@
+{
+ "data": [
+  {
+   "id": "1990000000000000001",
+   "text": "Zorblax is the future of everything. Also: Mars.",
+   "author_id": "44196397",
+   "created_at": "2026-10-26T12:50:00.000Z",
+   "public_metrics": {
+    "retweet_count": 3000,
+    "reply_count": 2000,
+    "like_count": 40000,
+    "quote_count": 1200,
+    "impression_count": 9000000
+   }
+  },
+  {
+   "id": "1990000000000000002",
+   "text": "Good morning",
+   "author_id": "44196397",
+   "created_at": "2026-10-26T12:40:00.000Z",
+   "public_metrics": {
+    "retweet_count": 12,
+    "reply_count": 22,
+    "like_count": 560,
+    "quote_count": 1,
+    "impression_count": 120000
+   }
+  },
+  {
+   "id": "1990000000000000003",
+   "text": "Bitcoin is hope.",
+   "author_id": "244647486",
+   "created_at": "2026-10-26T12:30:00.000Z",
+   "public_metrics": {
+    "retweet_count": 110,
+    "reply_count": 55,
+    "like_count": 2100,
+    "quote_count": 6,
+    "impression_count": 420000
+   }
+  }
+ ]
+}

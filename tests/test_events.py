@@ -176,3 +176,76 @@ def test_real_recordings_if_present(fixtures_dir, name, kind):
         rec = migration_from_tx(te)
         assert rec and rec["mint"] and rec["pool_address"]
     assert ev is not None and not ev.suspect and ev.extra_bytes == 0, (ev.layout, ev.suspect, ev.extra_bytes)
+
+
+# ----- milestone 2: pump-amm events, program attribution, classification -------------------------------
+def test_decode_pump_amm_events(payloads):
+    exp = payloads["expected"]
+    b = ev.decode_event_bytes(base64.b64decode(payloads["amm_buy"]))
+    assert isinstance(b, ev.DecodedEvent) and b.layout == "BuyEvent/full/28of28" and not b.suspect
+    assert b.fields["pool"] == exp["pool"] and b.fields["user"] == exp["amm_buyer"]
+    assert b.fields["quote_amount_in"] == 2_000_000_000 and b.fields["base_amount_out"] == 10_000_000_000_000
+    assert b.fields["pool_quote_token_reserves"] == 100_000_000_000 and b.fields["timestamp"] == exp["ts"] + 600
+    s = ev.decode_event_bytes(base64.b64decode(payloads["amm_sell"]))
+    assert isinstance(s, ev.DecodedEvent) and s.layout == "SellEvent/full/23of23" and s.fields["quote_amount_out"] == 800_000_000
+    c = ev.decode_event_bytes(base64.b64decode(payloads["amm_create_pool"]))
+    assert isinstance(c, ev.DecodedEvent) and c.layout == "CreatePoolEvent/full/20of20"
+    assert c.fields["base_mint"] == exp["mint"] and c.fields["pool"] == exp["pool"] and c.fields["index"] == 0 and c.fields["pool_bump"] == 254
+    # basis points above 10,000 mark a layout suspect
+    raw = base64.b64decode(payloads["amm_buy"])
+    off = 8 + 8 * 8  # lp_fee_basis_points
+    bad = raw[:off] + (50_000).to_bytes(8, "little") + raw[off + 8:]
+    d = ev.decode_event_bytes(bad)
+    assert isinstance(d, ev.DecodedEvent) and d.suspect and "lp_fee_basis_points" in d.suspect[0]
+
+
+def test_attribute_program_data_nested_frames(fixtures_dir):
+    data = json.loads((fixtures_dir / "logs_nested_jupiter.json").read_text())
+    attributed = ev.attribute_program_data(data["logs"])
+    assert [p for p, _ in attributed] == [data["programs"]["pump"], data["programs"]["jupiter"]]
+    events, undecoded = ev.decode_logs(data["logs"])
+    assert [e.name for e in events] == ["TradeEvent"] and events[0].program == data["programs"]["pump"]
+    assert len(undecoded) == 1 and undecoded[0].program == data["programs"]["jupiter"] and undecoded[0].reason == "unknown_discriminator"
+    c = ev.classify_discriminator(undecoded[0].discriminator_hex)
+    assert c["status"] == "other_program" and "jupiter_v6" in c["programs"] and c["name"] == "SwapEvent"
+    # garbage lines and unbalanced frames never raise
+    assert ev.attribute_program_data(["Program data: !!!", "Program X success", None, 5]) == [(None, b"")]
+    assert ev.extract_program_data(["Program data: " + base64.b64encode(b"abc").decode()]) == [b"abc"]
+
+
+def test_classify_discriminators_seen_on_the_vps():
+    expect = {
+        "b1310cd2a076a774": ("CreatePoolEvent", "decoded"),
+        "67f4521f2cf57777": ("BuyEvent", "decoded"),
+        "40c6cde8260871e2": ("SwapEvent", "other_program"),
+        "e1ca49af932ba096": ("Traded", "other_program"),
+        "bddb7fd34ee661ee": ("TradeEvent", "decoded"),
+        "e445a52e51cb9a1d": (None, "emit_cpi_tag"),
+        "ae7c4af90451f611": (None, "unknown"),
+        "zz": (None, "unknown"),
+    }
+    for disc, (name, status) in expect.items():
+        c = ev.classify_discriminator(disc)
+        assert c["status"] == status, disc
+        if name:
+            assert c["name"] == name
+    table = ev.discriminator_table()
+    assert {"CreateEvent", "BuyEvent", "SellEvent", "CreatePoolEvent"} <= {r["name"] for r in table}
+    assert ev.event_discriminator("SellEvent").hex() == "3e2f370aa503dc2a"
+
+
+def test_pump_amm_trade_records_and_pool_check(payloads):
+    from fart.ingest import store
+
+    exp = payloads["expected"]
+    events = [ev.decode_event_bytes(base64.b64decode(payloads[k])) for k in ("amm_buy", "amm_sell", "amm_create_pool")]
+    recs, rejected = store.pump_amm_trade_records(events, "sig", 5, exp["mint"], exp["pool"])
+    assert rejected == [] and [r["is_buy"] for r in recs] == [True, False]
+    assert recs[0]["signature"] == "sig:0" and recs[1]["signature"] == "sig:1"
+    assert recs[0]["sol"] == pytest.approx(2.0) and recs[0]["tokens"] == pytest.approx(10_000_000.0) and recs[0]["mint"] == exp["mint"]
+    assert recs[0]["block_time"] == exp["ts"] + 600 and recs[0]["slot"] == 5 and recs[0]["buyer"] == exp["amm_buyer"]
+    recs2, rejected2 = store.pump_amm_trade_records(events, "sig", 5, exp["mint"], "SomeOtherPool1111111111111111111111111111111")
+    assert recs2 == [] and rejected2 == ["pool_mismatch", "pool_mismatch"]
+    recs3, _ = store.pump_amm_trade_records(events, "sig", 5, exp["mint"], None)  # pool unknown: accepted
+    assert len(recs3) == 2
+    assert store.pool_from_create_pool_event(events) == {"mint": exp["mint"], "pool_address": exp["pool"], "dex": "pump-amm"}

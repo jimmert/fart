@@ -111,7 +111,8 @@ class Budget:
     @classmethod
     def from_settings(cls, conn: sqlite3.Connection, settings, clock: Callable[[], float] = _now) -> "Budget":
         cfg = settings.config("budget")
-        env = {"RPC_DAILY_BUDGET_CU": str(settings.rpc_daily_budget_cu)}
+        env = {"RPC_DAILY_BUDGET_CU": str(settings.rpc_daily_budget_cu),
+               "X_DAILY_BUDGET_USD": str(getattr(settings, "x_daily_budget_usd", 3.0))}
         srcs = load_source_configs(cfg, env)
         return cls(conn, srcs, settings.lock_path, clock=clock,
                    warning_period_s=float(cfg.get("blocked_warning_period_s", 3600)))
@@ -152,6 +153,13 @@ class Budget:
         v = self.acquire(source, method, cost)
         if not v.allowed:
             raise Blocked(source, method, v.reason or "blocked", v.retry_in_s)
+        return v
+
+    def block(self, source: str, method: str, reason: str, retry_in_s: float = 0.0) -> Verdict:
+        """Record a call refused by a caller-side policy (e.g. the X hourly envelope) exactly like a
+        gate refusal: ledger row with blocked_reason, health counter, log line."""
+        v = Verdict(False, reason, retry_in_s, 0.0)
+        self._record_blocked(self.source(source), method, v)
         return v
 
     def record(

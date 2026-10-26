@@ -1,8 +1,9 @@
 """pump.fun bonding curve math: constant product on virtual reserves.
 
 All state is in base units (lamports; tokens with 6 decimals) as integers, like the program.
-Parameters come from config/pumpfun.json and must be verified against the pump.fun Global
-account at deploy (docs/UNVERIFIED.md).
+Parameters come from config/pumpfun.json; reserves, supply and the 0.95% protocol fee were
+checked against the pump.fun Global account on the VPS (`fart chain global`). Quotes charge
+`trade_fee_bps` = total_curve_fee_bps (protocol 95 + creator 30 = 125, creator part TO VERIFY).
 """
 from __future__ import annotations
 
@@ -18,23 +19,34 @@ class CurveParams:
     initial_virtual_token: int
     initial_real_token: int
     token_total_supply: int
-    fee_bps: int
+    fee_bps: int                   # protocol fee (Global.fee_basis_points, 95 on mainnet)
     graduation_real_sol: int
     token_decimals: int = 6
     sol_decimals: int = 9
+    creator_fee_bps: int = 0       # creator fee on curve trades (TO VERIFY, default 30)
+    total_fee_bps: int | None = None  # what a trader pays in total; the paper trade uses this
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any]) -> "CurveParams":
+        fee = int(cfg["fee_bps"])
+        creator = int(cfg.get("creator_fee_bps", 0))
         return cls(
             initial_virtual_sol=int(cfg["initial_virtual_sol_reserves"]),
             initial_virtual_token=int(cfg["initial_virtual_token_reserves"]),
             initial_real_token=int(cfg["initial_real_token_reserves"]),
             token_total_supply=int(cfg["token_total_supply"]),
-            fee_bps=int(cfg["fee_bps"]),
+            fee_bps=fee,
             graduation_real_sol=int(cfg["graduation_real_sol"]),
             token_decimals=int(cfg.get("token_decimals", 6)),
             sol_decimals=int(cfg.get("sol_decimals", 9)),
+            creator_fee_bps=creator,
+            total_fee_bps=int(cfg.get("total_curve_fee_bps", fee + creator)),
         )
+
+    @property
+    def trade_fee_bps(self) -> int:
+        """Fee basis points applied to quotes: the configured total, else protocol + creator."""
+        return self.total_fee_bps if self.total_fee_bps is not None else self.fee_bps + self.creator_fee_bps
 
     @property
     def token_unit(self) -> int:
@@ -120,7 +132,7 @@ def buy_quote(state: CurveState, p: CurveParams, sol_in_total: int) -> BuyQuote:
     """Spend `sol_in_total` lamports (fee included). tokens = vT - k/(vS + x)."""
     if sol_in_total <= 0:
         raise ValueError("sol_in_total must be positive")
-    sol_to_curve, fee = split_fee(sol_in_total, p.fee_bps)
+    sol_to_curve, fee = split_fee(sol_in_total, p.trade_fee_bps)
     spot = state.price_sol(p)
     new_vsol = state.virtual_sol + sol_to_curve
     new_vtok = state.k // new_vsol + 1
@@ -134,7 +146,7 @@ def buy_quote(state: CurveState, p: CurveParams, sol_in_total: int) -> BuyQuote:
         new_vtok = state.virtual_token - tokens_out
         new_vsol = -(-state.k // new_vtok) if new_vtok > 0 else new_vsol
         sol_to_curve = new_vsol - state.virtual_sol
-        fee = sol_to_curve * p.fee_bps // 10_000
+        fee = sol_to_curve * p.trade_fee_bps // 10_000
         sol_in_total = sol_to_curve + fee
     new_state = CurveState(
         new_vsol,
@@ -160,7 +172,7 @@ def sell_quote(state: CurveState, p: CurveParams, tokens_in: int) -> SellQuote:
     spot = state.price_sol(p)
     new_vtok = state.virtual_token + tokens_in
     gross = state.virtual_sol * tokens_in // new_vtok
-    fee = gross * p.fee_bps // 10_000
+    fee = gross * p.trade_fee_bps // 10_000
     net = gross - fee
     new_state = CurveState(
         state.virtual_sol - gross,

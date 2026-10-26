@@ -19,9 +19,11 @@ from ..log import get_logger
 from ..net.budget import Blocked
 from ..net.http import HttpError
 from ..util import day_key
-from . import store
+from . import coverage, store
 
 log = get_logger("sweep")
+
+SIGS_SOURCE = "rpc_sigs"
 
 KINDS = {"create": ("coins", "ingest.sweep.create.last_sig", "create_tx"),
          "migrate": ("migrations", "ingest.sweep.migrate.last_sig", "migrate_tx")}
@@ -38,6 +40,8 @@ def sweep_signatures(conn: sqlite3.Connection, rpc: RpcClient, addresses: dict[s
     out: dict[str, Any] = {}
     max_sigs = int(cfg.get("max_signatures_per_gap", 1000))
     kv_set(conn, "ingest.rpc_sigs.started", str(now), now)
+    complete = True   # every kind listed without error, below the bound, not a first run
+    failed_reason: str | None = None
     for kind, address in addresses.items():
         table, last_key, enrich_kind = KINDS[kind]
         last_sig = kv_get(conn, last_key)
@@ -55,6 +59,8 @@ def sweep_signatures(conn: sqlite3.Connection, rpc: RpcClient, addresses: dict[s
         except (Blocked, HttpError, RpcError) as e:
             log.warning("sweep.rpc_unavailable", kind=kind, error=str(e)[:200])
             out[kind] = {"error": str(e)[:200]}
+            complete = False
+            failed_reason = "budget_cap" if isinstance(e, Blocked) and e.reason in ("daily_cost_cap", "daily_requests_cap") else "sweep_error"
             continue
         filled = missed = failed = 0
         conn.execute("BEGIN")
@@ -86,8 +92,21 @@ def sweep_signatures(conn: sqlite3.Connection, rpc: RpcClient, addresses: dict[s
             conn.execute("ROLLBACK")
             raise
         out[kind] = {"signatures": len(collected), "pages": pages, "filled": filled, "missed": missed, "failed_tx": failed,
-                     "first_run": last_sig is None}
+                     "first_run": last_sig is None, "truncated": len(collected) >= max_sigs}
+        if last_sig is None or len(collected) >= max_sigs:
+            complete = False
         log.info("sweep.done", kind=kind, **out[kind])
+    # the sweep is itself a create source: it has a gap while it fails, and a complete run recovers stream gaps
+    gap_id = coverage.open_gap_id(conn, SIGS_SOURCE)
+    if failed_reason is not None:
+        if gap_id is None:
+            coverage.gap_open(conn, SIGS_SOURCE, now, failed_reason)
+        out["gap"] = failed_reason
+    else:
+        if gap_id is not None:
+            coverage.gap_close(conn, gap_id, now)
+        if complete:
+            out["recovered_gaps"] = coverage.mark_recovered_by_sweep(conn, now, now)
     return out
 
 

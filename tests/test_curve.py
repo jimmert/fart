@@ -21,7 +21,7 @@ def test_buy_quote_matches_constant_product(params):
     s = cv.CurveState.initial(params)
     q = cv.buy_quote(s, params, 1_000_000_000)  # 1 SOL incl. fee
     assert q.sol_to_curve + q.fee == 1_000_000_000
-    assert q.fee == pytest.approx(q.sol_to_curve * 0.01, abs=2)
+    assert q.fee == pytest.approx(q.sol_to_curve * 0.0125, abs=2)  # protocol 0.95% + creator 0.30%
     k = s.k
     expected = s.virtual_token - (k // (s.virtual_sol + q.sol_to_curve) + 1)
     assert q.tokens_out == expected
@@ -39,7 +39,7 @@ def test_buy_then_sell_round_trip_loses_only_fees(params):
     assert abs(sq.sol_out_gross - q.sol_to_curve) <= 2
     total_fees = q.fee + sq.fee
     assert 2_000_000_000 - sq.sol_out_net == pytest.approx(total_fees, abs=2)
-    assert 0.019 < total_fees / 2e9 < 0.021  # ~2% round trip
+    assert 0.024 < total_fees / 2e9 < 0.026  # ~2.5% round trip at 1.25% each way
     # curve back to (almost) initial
     assert abs(sq.new_state.virtual_sol - s.virtual_sol) <= 2
     assert sq.new_state.virtual_token == s.virtual_token
@@ -96,3 +96,12 @@ def test_invalid_inputs(params):
         cv.buy_quote(s, params, 0)
     with pytest.raises(ValueError):
         cv.sell_quote(s, params, 0)
+
+
+def test_fee_split_from_config(params, settings):
+    assert params.fee_bps == 95 and params.creator_fee_bps == 30 and params.trade_fee_bps == 125
+    cfg = dict(settings.config("pumpfun"))
+    del cfg["total_curve_fee_bps"]
+    assert cv.CurveParams.from_config(cfg).trade_fee_bps == 125  # protocol + creator when no total is given
+    del cfg["creator_fee_bps"]
+    assert cv.CurveParams.from_config(cfg).trade_fee_bps == 95

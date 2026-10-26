@@ -42,6 +42,10 @@ def enc(fields: list[tuple[str, object]]) -> bytes:
             out += struct.pack("<Q", int(v))
         elif t == "i64":
             out += struct.pack("<q", int(v))
+        elif t == "u16":
+            out += struct.pack("<H", int(v))
+        elif t == "u8":
+            out += struct.pack("<B", int(v))
         elif t == "bool":
             out += b"\x01" if v else b"\x00"
         else:
@@ -75,6 +79,39 @@ migration = disc("CompletePumpAmmMigrationEvent") + enc([
     ("pubkey", CURVE), ("i64", TS + 90), ("pubkey", POOL),
 ])
 complete = disc("CompleteEvent") + enc([("pubkey", pk("buyer-9")), ("pubkey", MINT), ("pubkey", CURVE), ("i64", TS + 80)])
+# a later buy by a third party on the curve (0.7 SOL), as delivered by a per-mint logsSubscribe
+BUYER3 = pk("buyer-3")
+trade_buyer3 = disc("TradeEvent") + enc([
+    ("pubkey", MINT), ("u64", 700_000_000), ("u64", 22_000_000_000_000), ("bool", True), ("pubkey", BUYER3), ("i64", TS + 30),
+    ("u64", 32_200_000_000), ("u64", 1_000_000_000_000_000), ("u64", 2_200_000_000), ("u64", 720_100_000_000_000),
+    ("pubkey", pk("fee-recipient")), ("u64", 95), ("u64", 6_650_000), ("pubkey", CREATOR), ("u64", 30), ("u64", 2_100_000),
+])
+# pump-amm (PumpSwap) events after graduation: layouts TO VERIFY (docs/PUMPFUN-EVENTS.md)
+AMM_BUYER = pk("amm-buyer")
+POOL_AUTHORITY = pk("pool-authority")
+amm_buy = disc("BuyEvent") + enc([
+    ("i64", TS + 600), ("u64", 10_000_000_000_000), ("u64", 2_100_000_000),
+    ("u64", 0), ("u64", 5_000_000_000), ("u64", 200_000_000_000_000), ("u64", 100_000_000_000),
+    ("u64", 2_000_000_000), ("u64", 20), ("u64", 4_000_000), ("u64", 5), ("u64", 1_000_000), ("u64", 2_004_000_000), ("u64", 2_005_000_000),
+    ("pubkey", POOL), ("pubkey", AMM_BUYER), ("pubkey", pk("amm-buyer-base-ata")), ("pubkey", pk("amm-buyer-quote-ata")),
+    ("pubkey", pk("protocol-fee-recipient")), ("pubkey", pk("protocol-fee-recipient-ata")), ("pubkey", CREATOR), ("u64", 5), ("u64", 1_000_000),
+    ("bool", True), ("u64", 0), ("u64", 0), ("u64", 2_000_000_000), ("i64", TS + 600),
+])
+amm_sell = disc("SellEvent") + enc([
+    ("i64", TS + 660), ("u64", 4_000_000_000_000), ("u64", 700_000_000),
+    ("u64", 6_000_000_000_000), ("u64", 5_800_000_000), ("u64", 190_000_000_000_000), ("u64", 102_000_000_000),
+    ("u64", 800_000_000), ("u64", 20), ("u64", 1_600_000), ("u64", 5), ("u64", 400_000), ("u64", 801_600_000), ("u64", 798_000_000),
+    ("pubkey", POOL), ("pubkey", AMM_BUYER), ("pubkey", pk("amm-buyer-base-ata")), ("pubkey", pk("amm-buyer-quote-ata")),
+    ("pubkey", pk("protocol-fee-recipient")), ("pubkey", pk("protocol-fee-recipient-ata")), ("pubkey", CREATOR), ("u64", 5), ("u64", 400_000),
+])
+amm_create_pool = disc("CreatePoolEvent") + enc([
+    ("i64", TS + 90), ("u16", 0), ("pubkey", POOL_AUTHORITY), ("pubkey", MINT), ("pubkey", "So11111111111111111111111111111111111111112"),
+    ("u8", 6), ("u8", 9), ("u64", 206_900_000_000_000), ("u64", 84_990_000_000), ("u64", 206_900_000_000_000), ("u64", 84_990_000_000),
+    ("u64", 100), ("u64", 4_193_000_000), ("u64", 4_192_999_900), ("u8", 254), ("pubkey", POOL), ("pubkey", pk("lp-mint")),
+    ("pubkey", pk("pa-base-ata")), ("pubkey", pk("pa-quote-ata")), ("pubkey", CREATOR),
+])
+# an event of another program in the same transaction (Jupiter v6 SwapEvent name; payload shape is made up)
+jup_swap = disc("SwapEvent") + b"\x07" * 72
 set_params = disc("SetParamsEvent") + b"\x00" * 40
 unknown = hashlib.sha256(b"event:SomethingNew").digest()[:8] + b"\x01" * 20
 truncated = create_v2[: 8 + 4 + 12]  # cuts inside the name string
@@ -87,6 +124,8 @@ def b64(b: bytes) -> str:
 
 
 PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+JUP_PROGRAM = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
 
 logs_create = [
     f"Program {PROGRAM} invoke [1]",
@@ -115,17 +154,65 @@ logs_mixed_bad = [
     f"Program data: {b64(bad_ts)}",
 ]
 
+logs_trade_curve = [
+    f"Program {PROGRAM} invoke [1]",
+    "Program log: Instruction: Buy",
+    "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA invoke [2]",
+    "Program log: Instruction: Transfer",
+    "Program TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA success",
+    f"Program {PROGRAM} invoke [2]",
+    f"Program {PROGRAM} success",
+    f"Program data: {b64(trade_buyer3)}",
+    f"Program {PROGRAM} success",
+]
+logs_trade_pool = [
+    f"Program {AMM_PROGRAM} invoke [1]",
+    "Program log: Instruction: Buy",
+    f"Program data: {b64(amm_buy)}",
+    f"Program {AMM_PROGRAM} success",
+]
+logs_trade_pool_sell = [
+    f"Program {AMM_PROGRAM} invoke [1]",
+    "Program log: Instruction: Sell",
+    f"Program data: {b64(amm_sell)}",
+    f"Program {AMM_PROGRAM} success",
+]
+logs_migration_with_pool = [
+    f"Program {PROGRAM} invoke [1]",
+    "Program log: Instruction: Migrate",
+    f"Program {AMM_PROGRAM} invoke [2]",
+    "Program log: Instruction: CreatePool",
+    f"Program data: {b64(amm_create_pool)}",
+    f"Program {AMM_PROGRAM} success",
+    f"Program data: {b64(migration)}",
+    f"Program {PROGRAM} success",
+]
+# nested frames: a pump.fun trade and a Jupiter swap in one transaction
+logs_nested_jupiter = [
+    f"Program {JUP_PROGRAM} invoke [1]",
+    "Program log: Instruction: Route",
+    f"Program {PROGRAM} invoke [2]",
+    "Program log: Instruction: Buy",
+    f"Program data: {b64(trade_buyer3)}",
+    f"Program {PROGRAM} success",
+    f"Program data: {b64(jup_swap)}",
+    f"Program {JUP_PROGRAM} success",
+]
+
 SIG_CREATE = b58encode(hashlib.sha256(b"sig-create").digest() * 2)
 SIG_MIGR = b58encode(hashlib.sha256(b"sig-migr").digest() * 2)
+SIG_TRADE3 = b58encode(hashlib.sha256(b"sig-trade-3").digest() * 2)
+SIG_AMM_BUY = b58encode(hashlib.sha256(b"sig-amm-buy").digest() * 2)
+SIG_AMM_SELL = b58encode(hashlib.sha256(b"sig-amm-sell").digest() * 2)
 
 
-def logs_notification(sig: str, logs: list[str], slot: int) -> dict:
+def logs_notification(sig: str, logs: list[str], slot: int, subscription: int = 1) -> dict:
     return {
         "jsonrpc": "2.0",
         "method": "logsNotification",
         "params": {
             "result": {"context": {"slot": slot}, "value": {"signature": sig, "err": None, "logs": logs}},
-            "subscription": 1,
+            "subscription": subscription,
         },
     }
 
@@ -190,10 +277,18 @@ fixtures = {
         "migration": b64(migration), "complete": b64(complete), "set_params": b64(set_params),
         "unknown": b64(unknown), "truncated": b64(truncated), "bad_len": b64(bad_len), "bad_ts": b64(bad_ts),
         "cpi_wrapped_trade": b64(ANCHOR_CPI + trade_dev),
-        "expected": {"mint": MINT, "curve": CURVE, "creator": CREATOR, "pool": POOL, "ts": TS},
+        "trade_buyer3": b64(trade_buyer3), "amm_buy": b64(amm_buy), "amm_sell": b64(amm_sell), "amm_create_pool": b64(amm_create_pool),
+        "jup_swap": b64(jup_swap),
+        "expected": {"mint": MINT, "curve": CURVE, "creator": CREATOR, "pool": POOL, "ts": TS, "buyer3": BUYER3, "amm_buyer": AMM_BUYER,
+                     "pool_authority": POOL_AUTHORITY},
     },
     "logs_notification_create.json": logs_notification(SIG_CREATE, logs_create, 370_000_001),
     "logs_notification_migration.json": logs_notification(SIG_MIGR, logs_migration, 370_000_900),
+    "logs_notification_trade_curve.json": logs_notification(SIG_TRADE3, logs_trade_curve, 370_000_050, subscription=11),
+    "logs_notification_trade_pool.json": logs_notification(SIG_AMM_BUY, logs_trade_pool, 370_001_500, subscription=12),
+    "logs_notification_trade_pool_sell.json": logs_notification(SIG_AMM_SELL, logs_trade_pool_sell, 370_001_650, subscription=12),
+    "logs_notification_migration_with_pool.json": logs_notification(SIG_MIGR, logs_migration_with_pool, 370_000_900, subscription=11),
+    "logs_nested_jupiter.json": {"logs": logs_nested_jupiter, "programs": {"pump": PROGRAM, "jupiter": JUP_PROGRAM}},
     "logs_mixed_bad.json": {"logs": logs_mixed_bad},
     "tx_create.json": tx_response(SIG_CREATE, logs_create, 370_000_001, TS, [create_v2, trade_dev], [CREATOR, MINT, CURVE]),
     "tx_create_cpi_only.json": tx_response(SIG_CREATE, ["Program log: Instruction: Create"], 370_000_001, TS, [create_v2, trade_dev], [CREATOR, MINT, CURVE]),

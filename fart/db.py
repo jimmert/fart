@@ -8,12 +8,14 @@ from __future__ import annotations
 import sqlite3
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-# One migration per schema version. Each must be idempotent (CREATE ... IF NOT EXISTS).
-MIGRATIONS: dict[int, str] = {
+# One migration per schema version. Each must be idempotent (CREATE ... IF NOT EXISTS, guarded
+# ALTER TABLE). A migration is either an SQL script or a callable taking the connection; both run
+# inside one transaction together with the PRAGMA user_version bump.
+MIGRATIONS: dict[int, "str | Callable[[sqlite3.Connection], None]"] = {
     1: """
     CREATE TABLE IF NOT EXISTS coins(
         mint            TEXT PRIMARY KEY,
@@ -252,6 +254,123 @@ MIGRATIONS: dict[int, str] = {
     """,
 }
 
+# ----- schema version 2 (milestone 2) --------------------------------------------------------------
+# New tables for the social layer (X), the Telegram outbox, per-mint websocket subscriptions and
+# the X spend ledger; new columns on coverage_gaps (sweep recovery) and raw_undecoded (emitting
+# program). Every statement is idempotent so a half-applied migration can simply be re-run. All
+# milestone-1 tables and rows are untouched.
+SCHEMA_V2_SQL = [
+    """CREATE TABLE IF NOT EXISTS social_posts(
+        id             TEXT PRIMARY KEY,
+        platform       TEXT NOT NULL DEFAULT 'x',
+        author         TEXT,
+        author_id      TEXT,
+        text           TEXT,
+        created_at     REAL,
+        received_at    REAL NOT NULL,
+        likes          INTEGER,
+        quotes         INTEGER,
+        replies        INTEGER,
+        impressions    INTEGER,
+        kind           TEXT NOT NULL,
+        followers      INTEGER,
+        query_key      TEXT,
+        fast           INTEGER NOT NULL DEFAULT 0,
+        fast_at        REAL,
+        refreshed_at   REAL,
+        likes_per_min  REAL,
+        quotes_per_min REAL,
+        json           TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS social_posts_received ON social_posts(received_at)",
+    "CREATE INDEX IF NOT EXISTS social_posts_kind_created ON social_posts(kind, created_at)",
+    "CREATE INDEX IF NOT EXISTS social_posts_query_key ON social_posts(query_key)",
+    """CREATE TABLE IF NOT EXISTS social_post_metrics(
+        id          TEXT NOT NULL,
+        ts          REAL NOT NULL,
+        likes       INTEGER,
+        quotes      INTEGER,
+        replies     INTEGER,
+        impressions INTEGER,
+        PRIMARY KEY(id, ts)
+    ) WITHOUT ROWID""",
+    """CREATE TABLE IF NOT EXISTS social_counts(
+        key         TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        ts          REAL NOT NULL,
+        n_last_hour INTEGER,
+        n_24h       INTEGER,
+        query       TEXT,
+        PRIMARY KEY(key, ts)
+    ) WITHOUT ROWID""",
+    "CREATE INDEX IF NOT EXISTS social_counts_ts ON social_counts(ts)",
+    """CREATE TABLE IF NOT EXISTS x_spend(
+        id   INTEGER PRIMARY KEY,
+        day  TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        n    INTEGER NOT NULL,
+        usd  REAL NOT NULL,
+        ts   REAL NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS x_spend_day_kind ON x_spend(day, kind)",
+    """CREATE TABLE IF NOT EXISTS x_dedupe(
+        day  TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        key  TEXT NOT NULL,
+        PRIMARY KEY(day, kind, key)
+    ) WITHOUT ROWID""",
+    """CREATE TABLE IF NOT EXISTS outbox(
+        id          INTEGER PRIMARY KEY,
+        kind        TEXT NOT NULL,
+        dedupe_key  TEXT NOT NULL UNIQUE,
+        chat        TEXT NOT NULL,
+        text        TEXT NOT NULL,
+        created_at  REAL NOT NULL,
+        attempts    INTEGER NOT NULL DEFAULT 0,
+        next_try_at REAL,
+        status      TEXT NOT NULL DEFAULT 'pending',
+        message_id  INTEGER,
+        error       TEXT,
+        sent_at     REAL
+    )""",
+    "CREATE INDEX IF NOT EXISTS outbox_status_next ON outbox(status, next_try_at)",
+    "CREATE INDEX IF NOT EXISTS outbox_kind_created ON outbox(kind, created_at)",
+    """CREATE TABLE IF NOT EXISTS ws_subscriptions(
+        id                   INTEGER PRIMARY KEY,
+        mint                 TEXT NOT NULL,
+        address              TEXT NOT NULL,
+        kind                 TEXT NOT NULL,
+        reason               TEXT,
+        since                REAL NOT NULL,
+        until                REAL,
+        notifications        INTEGER NOT NULL DEFAULT 0,
+        trades               INTEGER NOT NULL DEFAULT 0,
+        last_notification_at REAL
+    )""",
+    "CREATE INDEX IF NOT EXISTS ws_subscriptions_until ON ws_subscriptions(until)",
+    "CREATE INDEX IF NOT EXISTS ws_subscriptions_mint ON ws_subscriptions(mint, since)",
+]
+SCHEMA_V2_COLUMNS = [
+    ("coverage_gaps", "recovered_at", "REAL"),
+    ("coverage_gaps", "recovered_by", "TEXT"),
+    ("raw_undecoded", "program", "TEXT"),
+]
+
+
+def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(r[1] == column for r in conn.execute(f"PRAGMA table_info({table})"))
+
+
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    for stmt in SCHEMA_V2_SQL:
+        conn.execute(stmt)
+    for table, column, ctype in SCHEMA_V2_COLUMNS:
+        if not _column_exists(conn, table, column):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ctype}")
+
+
+MIGRATIONS[2] = _migrate_v2
+
 
 def _apply_pragmas(conn: sqlite3.Connection, readonly: bool) -> None:
     conn.execute("PRAGMA busy_timeout=5000")
@@ -304,10 +423,16 @@ def migrate(conn: sqlite3.Connection) -> int:
     for version in sorted(MIGRATIONS):
         if version <= current:
             continue
-        # executescript commits any open transaction first, so the transaction lives inside the script.
-        script = f"BEGIN IMMEDIATE;\n{MIGRATIONS[version]}\nPRAGMA user_version={int(version)};\nCOMMIT;"
+        m = MIGRATIONS[version]
         try:
-            conn.executescript(script)
+            if isinstance(m, str):
+                # executescript commits any open transaction first, so the transaction lives inside the script.
+                conn.executescript(f"BEGIN IMMEDIATE;\n{m}\nPRAGMA user_version={int(version)};\nCOMMIT;")
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+                m(conn)
+                conn.execute(f"PRAGMA user_version={int(version)}")
+                conn.execute("COMMIT")
         except Exception:
             try:
                 conn.execute("ROLLBACK")

@@ -1,0 +1,30 @@
+{
+  "_comment": "Telegram notifications to the owner chat only. Dutch plain language, Europe/Amsterdam times with UTC in brackets, no advice words. Every message ends with footer.",
+  "loop_interval_s": 20,
+  "timezone": "Europe/Amsterdam",
+  "footer": "Observatie, geen advies. Alles wordt achteraf gemeten.",
+  "send": {
+    "max_per_minute": 20,
+    "retry_schedule_s": [
+      15,
+      60,
+      300,
+      900,
+      3600
+    ],
+    "timeout_s": 10
+  },
+  "observe": {
+    "batch_interval_s": 300,
+    "max_batches_per_hour": 6,
+    "max_items_per_message": 8
+  },
+  "digest": {
+    "time_utc": "06:10"
+  },
+  "health": {
+    "cooldown_s": 3600,
+    "stream_silent_s": 300,
+    "budget_warn_fraction": 0.8
+  }
+}

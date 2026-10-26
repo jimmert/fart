@@ -1,0 +1,63 @@
+{
+ "data": [
+  {
+   "id": "1990000000000000101",
+   "text": "aped $ZORB 7xKX...pump",
+   "author_id": "1001",
+   "created_at": "2026-10-26T12:58:00.000Z",
+   "public_metrics": {
+    "like_count": 3,
+    "quote_count": 0,
+    "reply_count": 1,
+    "impression_count": 900
+   }
+  },
+  {
+   "id": "1990000000000000102",
+   "text": "$ZORB looks good",
+   "author_id": "1002",
+   "created_at": "2026-10-26T12:59:00.000Z",
+   "public_metrics": {
+    "like_count": 1,
+    "quote_count": 0,
+    "reply_count": 0,
+    "impression_count": 300
+   }
+  },
+  {
+   "id": "1990000000000000103",
+   "text": "zorblax coin 7xKX",
+   "author_id": "1001",
+   "created_at": "2026-10-26T13:01:00.000Z",
+   "public_metrics": {
+    "like_count": 0,
+    "quote_count": 0,
+    "reply_count": 0,
+    "impression_count": 100
+   }
+  }
+ ],
+ "includes": {
+  "users": [
+   {
+    "id": "1001",
+    "username": "degen_a",
+    "public_metrics": {
+     "followers_count": 999
+    }
+   },
+   {
+    "id": "1002",
+    "username": "degen_b",
+    "public_metrics": {
+     "followers_count": 9
+    }
+   }
+  ]
+ },
+ "meta": {
+  "newest_id": "1990000000000000103",
+  "oldest_id": "1990000000000000101",
+  "result_count": 3
+ }
+}

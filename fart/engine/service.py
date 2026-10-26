@@ -53,11 +53,13 @@ class Engine:
             watch.expire(self.conn, now, float(wcfg.get("dead_after_idle_s", 7200)))
             mints = watch.active_mints(self.conn)
             summary["coins"] = len(mints)
+            mega = features.mega_post_feature(self.conn, as_of)
             candidates: list[dict[str, Any]] = []
             for mint in mints:
                 f = features.coin_features(self.conn, mint, as_of, self.params, ccfg)
                 if f is None:
                     continue
+                f["mega_post"] = mega
                 if decide.promote_watchlist(self.conn, f, now, wcfg):
                     summary["promoted"] += 1
                 passes, _ = decide.coin_verdict(f, ccfg)

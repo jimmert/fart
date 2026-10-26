@@ -1,4 +1,9 @@
-"""Settings and paths. Loads $FART_ROOT/.env at runtime; values are never logged."""
+"""Settings and paths. Loads $FART_ROOT/.env at runtime; values are never logged.
+
+Secrets (RPC URLs with keys, PumpPortal API key, X bearer token, Telegram bot token) live only in
+`$FART_ROOT/.env` (names in `.env.example`). `Settings.describe()` is the only thing that may be
+logged or printed: it carries hosts and configured/not-configured flags, never values.
+"""
 from __future__ import annotations
 
 import os
@@ -14,7 +19,12 @@ PUBLIC_RPC_HTTP = "https://api.mainnet-beta.solana.com"
 PUBLIC_RPC_WSS = "wss://api.mainnet-beta.solana.com"
 DEFAULT_PUMPPORTAL_WSS = "wss://pumpportal.fun/api/data"
 
-ENV_KEYS = ("RPC_HTTP_URL", "RPC_WSS_URL", "RPC_DAILY_BUDGET_CU", "PUMPPORTAL_WSS_URL", "FART_ROOT")
+ENV_KEYS = (
+    "RPC_HTTP_URL", "RPC_WSS_URL", "RPC_DAILY_BUDGET_CU", "PUMPPORTAL_WSS_URL", "FART_ROOT",
+    # milestone 2
+    "PUMPPORTAL_API_KEY", "X_BEARER_TOKEN", "X_DAILY_BUDGET_USD",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_CHAT_ID", "TELEGRAM_NOTIFY_ENABLED",
+)
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -37,7 +47,7 @@ def parse_env_file(path: Path) -> dict[str, str]:
 
 
 def redact_url(url: str | None) -> str:
-    """Host only; the path of an RPC URL usually carries the API key."""
+    """Host only; the path or query of an RPC/PumpPortal URL usually carries the API key."""
     if not url:
         return "<none>"
     try:
@@ -45,6 +55,10 @@ def redact_url(url: str | None) -> str:
         return f"{p.scheme}://{p.hostname}"
     except ValueError:
         return "<unparseable>"
+
+
+def _flag(value: str | None) -> bool:
+    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass
@@ -55,6 +69,12 @@ class Settings:
     rpc_is_public: bool
     rpc_daily_budget_cu: int
     pumpportal_wss_url: str
+    pumpportal_api_key: str = ""
+    x_bearer_token: str = ""
+    x_daily_budget_usd: float = 3.0
+    telegram_bot_token: str = ""
+    telegram_owner_chat_id: str = ""
+    telegram_notify_enabled: bool = False
     configs: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -85,6 +105,33 @@ class Settings:
     def lock_path(self) -> Path:
         return self.data_dir / "budget.lock"
 
+    # ----- milestone 2 derived settings -----------------------------------------------------------
+    @property
+    def pumpportal_trades_enabled(self) -> bool:
+        """PumpPortal only serves subscribeTokenTrade to funded API keys; without a key we subscribe
+        to creates and migrations only and take trades from the RPC."""
+        return bool(self.pumpportal_api_key)
+
+    @property
+    def pumpportal_connect_url(self) -> str:
+        """The URL actually used for the connection. Never log it: the key rides in the query."""
+        if not self.pumpportal_api_key:
+            return self.pumpportal_wss_url
+        sep = "&" if "?" in self.pumpportal_wss_url else "?"
+        return f"{self.pumpportal_wss_url}{sep}api-key={self.pumpportal_api_key}"
+
+    @property
+    def x_configured(self) -> bool:
+        return bool(self.x_bearer_token)
+
+    @property
+    def telegram_configured(self) -> bool:
+        return bool(self.telegram_bot_token) and bool(self.telegram_owner_chat_id)
+
+    @property
+    def telegram_enabled(self) -> bool:
+        return self.telegram_notify_enabled and self.telegram_configured
+
     def config(self, name: str) -> Any:
         return self.configs[name]
 
@@ -93,7 +140,7 @@ class Settings:
             d.mkdir(parents=True, exist_ok=True)
 
     def describe(self) -> dict[str, Any]:
-        """Safe to log/print: no secret values."""
+        """Safe to log/print: no secret values, only hosts and configured/not-configured flags."""
         return {
             "root": str(self.root),
             "rpc_http": redact_url(self.rpc_http_url),
@@ -101,11 +148,17 @@ class Settings:
             "rpc_is_public": self.rpc_is_public,
             "rpc_daily_budget_cu": self.rpc_daily_budget_cu,
             "pumpportal": redact_url(self.pumpportal_wss_url),
+            "pumpportal_api_key": "configured" if self.pumpportal_api_key else "not configured",
+            "pumpportal_trades": "pumpportal (api key)" if self.pumpportal_trades_enabled else "rpc only (no key)",
+            "x_bearer_token": "configured" if self.x_configured else "not configured",
+            "x_daily_budget_usd": self.x_daily_budget_usd,
+            "telegram": "configured" if self.telegram_configured else "not configured",
+            "telegram_notify_enabled": self.telegram_notify_enabled,
         }
 
 
 CONFIG_DIR = REPO_ROOT / "config"
-CONFIG_FILES = ("pumpfun", "budget", "engine", "measure", "stopwords", "ingest")
+CONFIG_FILES = ("pumpfun", "budget", "engine", "measure", "stopwords", "ingest", "x", "x_kols", "notify")
 
 
 def load_configs(config_dir: Path = CONFIG_DIR) -> dict[str, Any]:
@@ -126,6 +179,10 @@ def load_settings(root: str | os.PathLike | None = None, env: dict[str, str] | N
         cu = int(merged.get("RPC_DAILY_BUDGET_CU", "") or 3_000_000)
     except ValueError:
         cu = 3_000_000
+    try:
+        x_usd = float(merged.get("X_DAILY_BUDGET_USD", "") or 3.0)
+    except ValueError:
+        x_usd = 3.0
     return Settings(
         root=root_p,
         rpc_http_url=http or PUBLIC_RPC_HTTP,
@@ -133,5 +190,11 @@ def load_settings(root: str | os.PathLike | None = None, env: dict[str, str] | N
         rpc_is_public=is_public,
         rpc_daily_budget_cu=cu,
         pumpportal_wss_url=merged.get("PUMPPORTAL_WSS_URL", "").strip() or DEFAULT_PUMPPORTAL_WSS,
+        pumpportal_api_key=merged.get("PUMPPORTAL_API_KEY", "").strip(),
+        x_bearer_token=merged.get("X_BEARER_TOKEN", "").strip(),
+        x_daily_budget_usd=x_usd,
+        telegram_bot_token=merged.get("TELEGRAM_BOT_TOKEN", "").strip(),
+        telegram_owner_chat_id=merged.get("TELEGRAM_OWNER_CHAT_ID", "").strip(),
+        telegram_notify_enabled=_flag(merged.get("TELEGRAM_NOTIFY_ENABLED")),
         configs=load_configs(),
     )

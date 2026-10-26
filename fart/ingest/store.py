@@ -12,7 +12,8 @@ from typing import Any
 from ..chain.events import DecodedEvent, Undecoded
 from ..util import fnum
 
-RPC_SOURCES = ("rpc_logs", "rpc_sigs", "rpc_backfill", "rpc_tx")
+RPC_SOURCES = ("rpc_logs", "rpc_sigs", "rpc_backfill", "rpc_tx", "rpc_trades")
+TRADE_SOURCES = ("pumpportal", "rpc_logs", "rpc_trades", "pump_amm")
 
 
 def _sources_union(existing: str | None, new: str) -> str:
@@ -82,20 +83,29 @@ def upsert_migration(conn: sqlite3.Connection, rec: dict[str, Any], source: str,
 
 
 def insert_trade(conn: sqlite3.Connection, rec: dict[str, Any], source: str, received_at: float) -> bool:
-    """Insert a trade for a watched mint; duplicates (same signature+mint) are ignored."""
+    """Insert a trade for a watched mint. A duplicate (same signature+mint, e.g. seen by PumpPortal and
+    by the RPC stream) is not inserted again, but fills in chain time, reserves and buyer where the
+    first row lacked them (PumpPortal rows carry no slot/block_time). Returns True only for a new row."""
     if not rec.get("mint") or not rec.get("signature"):
         return False
-    cur = conn.execute(
-        "INSERT OR IGNORE INTO trades(mint, slot, block_time, received_at, signature, buyer, is_buy, sol, tokens,"
+    row = conn.execute("SELECT 1 FROM trades WHERE signature=? AND mint=?", (rec["signature"], rec["mint"])).fetchone()
+    if row is not None:
+        conn.execute(
+            "UPDATE trades SET slot=COALESCE(slot,?), block_time=COALESCE(block_time,?), virtual_sol=COALESCE(virtual_sol,?),"
+            " virtual_token=COALESCE(virtual_token,?), buyer=COALESCE(buyer,?) WHERE signature=? AND mint=?",
+            (rec.get("slot"), rec.get("block_time"), rec.get("virtual_sol"), rec.get("virtual_token"), rec.get("buyer"),
+             rec["signature"], rec["mint"]),
+        )
+        return False
+    conn.execute(
+        "INSERT INTO trades(mint, slot, block_time, received_at, signature, buyer, is_buy, sol, tokens,"
         " virtual_sol, virtual_token, source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (rec["mint"], rec.get("slot"), rec.get("block_time"), received_at, rec["signature"], rec.get("buyer"),
          1 if rec.get("is_buy") else 0, float(rec.get("sol") or 0.0), float(rec.get("tokens") or 0.0),
          rec.get("virtual_sol"), rec.get("virtual_token"), source),
     )
-    if cur.rowcount:
-        conn.execute("UPDATE watchlist SET last_trade_at=MAX(COALESCE(last_trade_at,0),?) WHERE mint=?", (received_at, rec["mint"]))
-        return True
-    return False
+    conn.execute("UPDATE watchlist SET last_trade_at=MAX(COALESCE(last_trade_at,0),?) WHERE mint=?", (received_at, rec["mint"]))
+    return True
 
 
 # ----- PumpPortal -----------------------------------------------------------------------------
@@ -210,9 +220,57 @@ def records_from_events(events: list[DecodedEvent], signature: str | None, slot:
     return out
 
 
+def pump_amm_trade_records(events: list[DecodedEvent], signature: str | None, slot: int | None, mint: str,
+                           expected_pool: str | None) -> tuple[list[dict[str, Any]], list[str]]:
+    """pump-amm BuyEvent/SellEvent -> trade records for `mint` (the subscription tells us the mint;
+    the event only carries the pool). Returns (records, rejected_reasons). An event whose `pool` differs
+    from the pool we subscribed to is rejected: that is the layout self-check (docs/PUMPFUN-EVENTS.md).
+
+    Amounts: quote = WSOL lamports, base = token base units (6 decimals) - TO VERIFY. The pool reserves
+    in the event are stored as virtual_sol/virtual_token so the price/mcap math works unchanged.
+    """
+    out: list[dict[str, Any]] = []
+    rejected: list[str] = []
+    swaps = [e for e in events if e.name in ("BuyEvent", "SellEvent")]
+    for i, e in enumerate(swaps):
+        f = e.fields
+        if expected_pool and f.get("pool") and f["pool"] != expected_pool:
+            rejected.append("pool_mismatch")
+            continue
+        if any("implausible" in s for s in e.suspect):
+            rejected.append("suspect_layout")
+            continue
+        is_buy = e.name == "BuyEvent"
+        sol_lamports = f.get("quote_amount_in") if is_buy else f.get("quote_amount_out")
+        tokens_base = f.get("base_amount_out") if is_buy else f.get("base_amount_in")
+        if sol_lamports is None or tokens_base is None:
+            rejected.append("missing_amounts")
+            continue
+        ts = f.get("timestamp")
+        out.append({
+            "mint": mint, "signature": f"{signature}:{i}" if len(swaps) > 1 and signature else signature,
+            "buyer": f.get("user"), "is_buy": is_buy,
+            "sol": sol_lamports / 1e9, "tokens": tokens_base / 1e6,
+            "virtual_sol": f.get("pool_quote_token_reserves"), "virtual_token": f.get("pool_base_token_reserves"),
+            "slot": slot, "block_time": ts if isinstance(ts, int) and not any("timestamp" in s for s in e.suspect) else None,
+            "pool": f.get("pool"),
+        })
+    return out, rejected
+
+
+def pool_from_create_pool_event(events: list[DecodedEvent]) -> dict[str, Any] | None:
+    """pump-amm CreatePoolEvent (in the migration transaction) -> {mint, pool_address} when both decoded."""
+    for e in events:
+        if e.name == "CreatePoolEvent" and e.fields.get("base_mint") and e.fields.get("pool"):
+            return {"mint": e.fields["base_mint"], "pool_address": e.fields["pool"], "dex": "pump-amm"}
+    return None
+
+
 def store_undecoded(conn: sqlite3.Connection, items: list[Undecoded], source: str, signature: str | None,
                     slot: int | None, received_at: float, max_per_hour: int = 500) -> int:
-    """Keep undecodable payloads (not ignored/known events) for later layout work. Bounded per hour."""
+    """Keep undecodable payloads (not ignored/known events) for later layout work. Bounded per hour.
+    The emitting program (from the log nesting) is stored so `fart events classify` can tell pump.fun
+    events from Jupiter/Orca/Raydium events in the same transaction."""
     n = 0
     for u in items:
         if u.reason == "ignored_event":
@@ -221,9 +279,9 @@ def store_undecoded(conn: sqlite3.Connection, items: list[Undecoded], source: st
         if cnt >= max_per_hour:
             break
         conn.execute(
-            "INSERT INTO raw_undecoded(received_at, source, signature, slot, discriminator, payload_b64, reason)"
-            " VALUES(?,?,?,?,?,?,?)",
-            (received_at, source, signature, slot, u.discriminator_hex, u.payload_b64[:4000], u.reason[:200]),
+            "INSERT INTO raw_undecoded(received_at, source, signature, slot, discriminator, payload_b64, reason, program)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            (received_at, source, signature, slot, u.discriminator_hex, u.payload_b64[:4000], u.reason[:200], u.program),
         )
         n += 1
     return n

@@ -1,0 +1,22 @@
+{
+ "jsonrpc": "2.0",
+ "method": "logsNotification",
+ "params": {
+  "result": {
+   "context": {
+    "slot": 370001500
+   },
+   "value": {
+    "err": null,
+    "logs": [
+     "Program pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA invoke [1]",
+     "Program log: Instruction: Buy",
+     "Program data: Z/RSHyz1d3eYD/5oAAAAAACgck4YCQAAAHUrfQAAAAAAAAAAAAAAAADyBSoBAAAAAID0IOa1AAAA6HZIFwAAAACUNXcAAAAAFAAAAAAAAAAACT0AAAAAAAUAAAAAAAAAQEIPAAAAAAAAnXJ3AAAAAEDfgXcAAAAATsb/VdYvUHPv+HOogXalu7biCu7AOUjk8hNdJPfPB+RDeEVcukrI/DhUB2XXIb+ubHCuvXmDXhXNhnWRVAwqozShN/IBZ9nA+3DDRl5oUKNhLEfEDoG1+ZAk0NecR9Hrvb63ND9UCoxesFH1KuE4w5XKz/jFhhh8DmsBSe3j6enl+zQ0Ez+7KKSHvR12SlvKC6k6paCAY4yxZpWKCuD0LXUBvsDmrJ5fMPyzsxNAvRLcziI3X7+eQmV6gv7xDZ9vNm7mIUCSmFCG1RcCi+Rj7n6eQqKYKNK45MJ8Rzjka9kFAAAAAAAAAEBCDwAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAlDV3AAAAAJgP/mgAAAAA",
+     "Program pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA success"
+    ],
+    "signature": "5jN26Anr3MahzpZF5MFacLE46JS6ibmMZEZtVrfsDHFz4eAeGVsM7CFKJuELmFy8cuDU7bn45SUwdHhZfd6ofLFR"
+   }
+  },
+  "subscription": 12
+ }
+}

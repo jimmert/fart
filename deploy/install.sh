@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Idempotent installer for Ubuntu 24.04. Run as root from a checkout:  sudo deploy/install.sh
-# - system user `fart` (no login), /opt/fart/{app,data,out,logs}
+# - system user `fart` (no login), /opt/fart/{app,bin,data,out,logs}
 # - copies the checkout to /opt/fart/app (never touches data/out/logs/.env)
 # - python venv at /opt/fart/venv with websockets
-# - systemd units fart-* installed, enabled and (re)started
+# - /opt/fart/bin/fart: executable wrapper (cd into the app, FART_ROOT set, exec the venv python -m fart)
+# - applies the database schema migration (PRAGMA user_version) before the daemons restart
+# - systemd units fart-* installed, enabled and (re)started (fart-social / fart-notify when present)
 # Never overwrites an existing /opt/fart/.env. Prints the verification commands at the end.
 set -euo pipefail
 
@@ -26,7 +28,7 @@ if ! id -u "$FART_USER" >/dev/null 2>&1; then
   useradd --system --home-dir "$FART_ROOT" --shell /usr/sbin/nologin --user-group "$FART_USER"
   log "created system user $FART_USER"
 fi
-mkdir -p "$FART_ROOT" "$APP" "$FART_ROOT/data" "$FART_ROOT/out" "$FART_ROOT/logs"
+mkdir -p "$FART_ROOT" "$APP" "$FART_ROOT/bin" "$FART_ROOT/data" "$FART_ROOT/out" "$FART_ROOT/logs"
 chown root:"$FART_USER" "$FART_ROOT"
 chmod 0750 "$FART_ROOT"
 chown -R "$FART_USER":"$FART_USER" "$FART_ROOT/data" "$FART_ROOT/out" "$FART_ROOT/logs"
@@ -64,6 +66,18 @@ chown -R root:"$FART_USER" "$VENV"
 chmod -R o-rwx "$VENV"
 log "venv ready: $("$VENV/bin/python" -c 'import websockets,sys; print("python", sys.version.split()[0], "websockets", websockets.__version__)')"
 
+# --- /opt/fart/bin/fart wrapper --------------------------------------------------------------
+# `python -m fart` only works from the app directory; the wrapper makes `sudo -u fart /opt/fart/bin/fart status`
+# work from anywhere and pins FART_ROOT.
+cat > "$FART_ROOT/bin/fart" <<WRAP
+#!/usr/bin/env bash
+export FART_ROOT="\${FART_ROOT:-$FART_ROOT}"
+cd "$APP" && exec "$VENV/bin/python" -m fart "\$@"
+WRAP
+chown root:"$FART_USER" "$FART_ROOT/bin" "$FART_ROOT/bin/fart"
+chmod 0750 "$FART_ROOT/bin" "$FART_ROOT/bin/fart"
+log "wrapper installed: $FART_ROOT/bin/fart"
+
 # --- .env (never overwritten) ------------------------------------------------------------------
 if [ ! -f "$FART_ROOT/.env" ]; then
   cp "$APP/.env.example" "$FART_ROOT/.env"
@@ -71,6 +85,17 @@ if [ ! -f "$FART_ROOT/.env" ]; then
 fi
 chown root:"$FART_USER" "$FART_ROOT/.env"
 chmod 0640 "$FART_ROOT/.env"
+
+# --- database schema (idempotent; a no-op when already current) --------------------------------
+# Opening the database applies pending migrations (PRAGMA user_version). Doing it here, before the
+# daemons restart, means every service starts on the new schema. Safe while the old daemons run (WAL).
+if [ -f "$FART_ROOT/data/fart.db" ]; then
+  if sudo -u "$FART_USER" "$FART_ROOT/bin/fart" --quiet --json status >/dev/null 2>&1; then
+    log "database schema: $(sudo -u "$FART_USER" "$FART_ROOT/bin/fart" --quiet --json status 2>/dev/null | "$VENV/bin/python" -c 'import json,sys; print("user_version", json.load(sys.stdin).get("schema_version"))')"
+  else
+    log "WARNING: schema check failed (fart status); the daemons will retry the migration on start"
+  fi
+fi
 
 # --- systemd units -----------------------------------------------------------------------------
 for unit in "$APP"/deploy/fart.slice "$APP"/deploy/fart-*.service "$APP"/deploy/fart-*.timer; do
@@ -81,11 +106,19 @@ if command -v systemd-analyze >/dev/null 2>&1; then
   systemd-analyze verify /etc/systemd/system/fart-*.service /etc/systemd/system/fart-*.timer 2>&1 | grep -v -e 'is not loaded properly' || true
 fi
 systemctl enable fart-ingest.service fart-engine.service fart-measure-track.timer fart-measure-report.timer fart-backup.timer >/dev/null
+OPTIONAL_SERVICES=""
+for u in fart-social.service fart-notify.service; do
+  if [ -f "/etc/systemd/system/$u" ]; then
+    systemctl enable "$u" >/dev/null
+    OPTIONAL_SERVICES="$OPTIONAL_SERVICES $u"
+  fi
+done
 if [ "$START_SERVICES" = "1" ]; then
   systemctl restart fart-ingest.service
   systemctl restart fart-engine.service
+  for u in $OPTIONAL_SERVICES; do systemctl restart "$u"; done
   systemctl start fart-measure-track.timer fart-measure-report.timer fart-backup.timer
-  log "services (re)started"
+  log "services (re)started:$OPTIONAL_SERVICES fart-ingest fart-engine + timers"
 fi
 
 # --- verification -------------------------------------------------------------------------------
@@ -93,7 +126,9 @@ sleep 2
 systemctl --no-pager --plain list-units 'fart-*' || true
 echo
 log "verify with:"
-echo "  sudo -u $FART_USER env FART_ROOT=$FART_ROOT $VENV/bin/python -m fart status"
+echo "  sudo -u $FART_USER $FART_ROOT/bin/fart status"
 echo "  journalctl -u fart-ingest -n 50 --no-pager"
-echo "  sudo -u $FART_USER env FART_ROOT=$FART_ROOT $VENV/bin/python -m fart coverage --hours 3"
+echo "  sudo -u $FART_USER $FART_ROOT/bin/fart coverage --hours 3"
+echo "  sudo -u $FART_USER $FART_ROOT/bin/fart chain global        # Global account vs config/pumpfun.json"
+echo "  sudo -u $FART_USER $FART_ROOT/bin/fart events classify     # undecoded event discriminators"
 echo "  tail -f $FART_ROOT/logs/ingest.log"
