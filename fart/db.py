@@ -6,6 +6,7 @@ are our clock. `decisions` and `outcomes` are append-only (enforced by triggers)
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -255,7 +256,17 @@ MIGRATIONS: dict[int, str] = {
 def _apply_pragmas(conn: sqlite3.Connection, readonly: bool) -> None:
     conn.execute("PRAGMA busy_timeout=5000")
     if not readonly:
-        conn.execute("PRAGMA journal_mode=WAL")
+        # Changing the journal mode needs an exclusive lock; only do it when not already WAL.
+        for attempt in range(5):
+            try:
+                mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+                if str(mode).lower() != "wal":
+                    conn.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
 
