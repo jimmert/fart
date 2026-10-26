@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fart"
+version = "0.1.0"
+description = "Solana/pump.fun memecoin data machine: redundant ingestion, event-time data model, honest measurement."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "websockets>=12,<18",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.setuptools.packages.find]
+include = ["fart*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
