@@ -1,14 +1,18 @@
 # pump.fun and pump-amm Anchor events: layouts used by `fart/chain/events.py`
 
-**Status (26 Oct 2026).** The pump.fun layouts below come from the published IDL history. On the VPS
-the milestone-1 deploy decoded `CreateEvent`, `TradeEvent` (the dev buy inside the create transaction)
-and `CompletePumpAmmMigrationEvent` from the live log stream (467 creates in one hour via the RPC
-stream), so those three *decode on mainnet*; the byte-level check of step 3 under "Verification" is
-still the formal proof and still open. The pump-amm (PumpSwap) layouts (`BuyEvent`, `SellEvent`,
-`CreatePoolEvent`) were added in milestone 2 from the PumpSwap IDL as remembered and are
-**TO VERIFY**: a `BuyEvent`/`SellEvent` whose `pool` differs from the pool we subscribed to is
-rejected and counted (`decode.pump_amm_pool_mismatch`), which is the built-in self-check.
-The fixtures under `tests/fixtures/` are synthetic (`tests/fixtures/gen_fixtures.py`).
+**Status (26 Oct 2026, milestone 3).** Every layout below follows the official IDLs published at
+github.com/pump-fun/pump-public-docs (`idl/pump.json`, `idl/pump_amm.json`, read on 26 Oct 2026): the
+milestone-1/2 field lists turned out to be the exact prefixes of the IDL structs and the IDL's trailing
+fields were appended. On the VPS the milestone-1 deploy decoded `CreateEvent`, `TradeEvent` (the dev buy
+inside the create transaction) and `CompletePumpAmmMigrationEvent` from the live log stream (467 creates
+in one hour via the RPC stream), so those *decode on mainnet*; the byte-level check of step 3 under
+"Verification" (a real recording decoding `full` with zero extra bytes) is still the formal proof. The
+pump-amm swaps (`BuyEvent`, `SellEvent`) are stored only when the pool maps to a known base mint
+(CreatePoolEvent in the same transaction or `migrations.pool_address`) whose quote mint is WSOL; an
+unmappable swap is counted (`decode.pump_amm_pool_unknown`, `decode.pump_amm_quote_not_wsol`), never
+guessed. Every event name of both IDLs is known to the decoder, so `fart events classify` names what it
+does not decode. The fixtures under `tests/fixtures/` are synthetic (`tests/fixtures/gen_fixtures.py`) and
+deliberately carry the pre-2026 field counts (an older program version's payload decodes as `partial`).
 
 ## Where events live in a transaction
 
@@ -38,7 +42,7 @@ Borsh encodings: `string` = u32 little-endian length + UTF-8 bytes; `pubkey` = 3
 | event | discriminator (hex) | program(s) | status |
 |---|---|---|---|
 | CreateEvent | `1b72a94ddeeb6376` | pump | decoded (layout in `LAYOUTS`) |
-| TradeEvent | `bddb7fd34ee661ee` | pump, raydium | decoded (layout in `LAYOUTS`) |
+| TradeEvent | `bddb7fd34ee661ee` | pump | decoded (layout in `LAYOUTS`) |
 | CompletePumpAmmMigrationEvent | `bde95db95c94ea94` | pump | decoded (layout in `LAYOUTS`) |
 | CompleteEvent | `5f72619cd42e9808` | pump | decoded (layout in `LAYOUTS`) |
 | BuyEvent | `67f4521f2cf57777` | pump_amm | decoded (layout in `LAYOUTS`) |
@@ -47,34 +51,60 @@ Borsh encodings: `string` = u32 little-endian length + UTF-8 bytes; `pubkey` = 3
 
 ### Known events we skip (counted, payload not stored)
 
+Every event of `idl/pump.json` and `idl/pump_amm.json` (26 Oct 2026) plus a few names of older IDL versions.
+
 | event | discriminator (hex) | program(s) | status |
 |---|---|---|---|
-| SetParamsEvent | `dfc39ff63e308f83` | pump | known, counted only |
+| AddQuoteControlMintEvent | `a4af574a582d213e` | pump | known, counted only |
+| AdminCtoEvent | `6e7ce262aaff1178` | pump | known, counted only |
+| AdminSetIdlAuthorityEvent | `f53b46224bb96d5c` | pump | known, counted only |
+| AdminUpdateTokenIncentivesEvent | `93fa6c78f71d43de` | pump, pump_amm | known, counted only |
+| ClaimCashbackEvent | `e2d6f62107f293e5` | pump, pump_amm | known, counted only |
+| ClaimTokenIncentivesEvent | `4facf631cd5bcee8` | pump, pump_amm | known, counted only |
+| CloseUserVolumeAccumulatorEvent | `929fbdac925838f4` | pump, pump_amm | known, counted only |
 | CollectCreatorFeeEvent | `7a027f010ebf0caf` | pump | known, counted only |
+| DistributeCreatorFeesEvent | `a537817004b3ca28` | pump | known, counted only |
+| DistributeFeeToHoldersEvent | `e3bed7ceb0b4a584` | pump | known, counted only |
 | ExtendAccountEvent | `6161d7905d92167c` | pump, pump_amm | known, counted only |
-| UpdateGlobalAuthorityEvent | `b6c3892a23cecff7` | pump | known, counted only |
+| InitUserVolumeAccumulatorEvent | `86240d48e86582d8` | pump, pump_amm | known, counted only |
+| MigrateBondingCurveCreatorEvent | `9ba768dcd56cf303` | pump | known, counted only |
+| MinimumDistributableFeeEvent | `a8d884efebb63134` | pump | known, counted only |
+| PostCompleteBuyEvent | `6fb06d8b316cd5fb` | pump | known, counted only |
+| RemoveQuoteControlMintEvent | `2e21568600d5d130` | pump | known, counted only |
+| ReservedFeeRecipientsEvent | `2bbcfa12dd4bbb5f` | pump, pump_amm | known, counted only |
 | SetCreatorEvent | `ed347b25f5fb48d2` | pump | known, counted only |
 | SetMetaplexCreatorEvent | `8ecb06207f69bfa2` | pump | known, counted only |
-| ClaimTokenIncentivesEvent | `4facf631cd5bcee8` | pump, pump_amm | known, counted only |
-| InitUserVolumeAccumulatorEvent | `86240d48e86582d8` | pump, pump_amm | known, counted only |
+| SetParamsEvent | `dfc39ff63e308f83` | pump | known, counted only |
+| SetQuoteControlAdminEvent | `4af88d45ca511ef7` | pump | known, counted only |
+| SetQuoteControlMintReservesEvent | `a943276d6686b6e8` | pump | known, counted only |
+| SetQuoteControlReservesAdminEvent | `43fbb3b6575ca921` | pump | known, counted only |
+| SweepBondingCurveFeeEvent | `742b4dbd117a482b` | pump | known, counted only |
 | SyncUserVolumeAccumulatorEvent | `c57aa77c74515bff` | pump, pump_amm | known, counted only |
+| UpdateCreatorFeeConfigEvent | `98c67c7c6af67fbf` | pump, pump_amm | known, counted only |
+| UpdateGlobalAuthorityEvent | `b6c3892a23cecff7` | pump | known, counted only |
+| UpdateMayhemVirtualParamsEvent | `757be4b6a1a8dcd6` | pump | known, counted only |
 | AdminSetCreatorEvent | `4045c0681d1e196b` | pump | known, counted only |
-| AdminUpdateTokenIncentivesEvent | `93fa6c78f71d43de` | pump, pump_amm | known, counted only |
-| CloseUserVolumeAccumulatorEvent | `929fbdac925838f4` | pump, pump_amm | known, counted only |
 | ReservesSyncedEvent | `129ac1451fabbea1` | pump | known, counted only |
-| AdminSetIdlAuthorityEvent | `f53b46224bb96d5c` | pump | known, counted only |
 | ReserveEvent | `4e79b291e163055d` | pump | known, counted only |
 | CreateEventV2 | `a262083b9670e371` | pump | known, counted only |
 | TradeEventV2 | `128ed28bb27bcb75` | pump | known, counted only |
+| AdminCtoPoolEvent | `2f23a3f9969d937a` | pump_amm | known, counted only |
+| BoostBuyAndBurnEvent | `3f451c16305cc2b9` | pump_amm | known, counted only |
+| CollectCoinCreatorFeeEvent | `e8f5c2eeeada3a59` | pump_amm | known, counted only |
+| CreateConfigEvent | `6b34598137e25116` | pump_amm | known, counted only |
 | DepositEvent | `78f83d531f8e6b90` | pump_amm | known, counted only |
-| WithdrawEvent | `1609851aa02c47c0` | pump_amm | known, counted only |
 | DisableEvent | `6bfdc14ce4ca1b68` | pump_amm | known, counted only |
+| InitBoostEvent | `ae7c4af90451f611` | pump_amm | known, counted only |
+| MigratePoolCoinCreatorEvent | `aadd52c793a5f72e` | pump_amm | known, counted only |
+| SetBondingCurveCoinCreatorEvent | `f2e7eb664163bdd3` | pump_amm | known, counted only |
+| SetBoostAuthorityEvent | `5980f08d5bca4769` | pump_amm | known, counted only |
+| SetMetaplexCoinCreatorEvent | `966bc77b7ccf66e4` | pump_amm | known, counted only |
+| SweepPoolFeeEvent | `82a42461e48287a5` | pump_amm | known, counted only |
 | UpdateAdminEvent | `e198ab57f63f42ea` | pump_amm | known, counted only |
 | UpdateFeeConfigEvent | `5a1741233ef4bcd0` | pump_amm | known, counted only |
-| CollectCoinCreatorFeeEvent | `e8f5c2eeeada3a59` | pump_amm | known, counted only |
+| WithdrawEvent | `1609851aa02c47c0` | pump_amm | known, counted only |
 | SetCoinCreatorEvent | `e519b9b7eb58c24e` | pump_amm | known, counted only |
 | AdminSetCoinCreatorEvent | `2ddc5d181961ac68` | pump_amm | known, counted only |
-| CreateConfigEvent | `6b34598137e25116` | pump_amm | known, counted only |
 | UpdateConfigEvent | `6070fd663b4e4b86` | pump_amm | known, counted only |
 | BuyExactQuoteInEvent | `7b3d3ef45415f4be` | pump_amm | known, counted only |
 | SellExactQuoteOutEvent | `0a97ae00597b36cf` | pump_amm | known, counted only |
@@ -91,7 +121,7 @@ Raydium, Meteora). They are never decoded.
 | FeeEvent | `494f4e7fb8d50ddc` | jupiter_v6 | guess for classification only, never decoded |
 | LpChangeEvent | `79a3cdc939da753c` | raydium | guess for classification only, never decoded |
 | PoolCreateEvent | `97d7e20976a173ae` | raydium | guess for classification only, never decoded |
-| TradeEvent | `bddb7fd34ee661ee` | pump, raydium | guess for classification only, never decoded |
+| TradeEvent | `bddb7fd34ee661ee` | pump | guess for classification only, never decoded |
 | ClaimVestedEvent | `15c2725778d3e220` | raydium | guess for classification only, never decoded |
 | CreateVestingEvent | `96980bb334d2bf7d` | raydium | guess for classification only, never decoded |
 | SwapBaseInEvent | `462fac95f82564a2` | raydium | guess for classification only, never decoded |
@@ -132,29 +162,51 @@ Raydium, Meteora). They are never decoded.
 | EvtCreateDammV2MigrationMetadata | `676f84a88cfd9672` | meteora | guess for classification only, never decoded |
 | EvtClaimCreatorTradingFee | `9ae4d7ca859bd68a` | meteora | guess for classification only, never decoded |
 
-## The undecoded discriminators seen on the VPS (hour 05 UTC, 26 Oct 2026)
+## The undecoded discriminators seen on the VPS (26 Oct 2026)
 
-74 undecodable `Program data:` payloads in 30 minutes, from the create (mint authority) and
-graduation (migration account) streams:
+Hour 05 UTC (milestone 1, 74 payloads in 30 minutes) and the milestone-2 run: `decode.unknown_discriminator`
+21,744, `decode.too_short` 5,845, `decode.truncated_or_drift` 471 by 08:30 UTC. The bulk came from the two
+system-mint subscriptions (USDC, PUMP: logs of Jupiter, Raydium, Orca, Meteora and token programs that
+mention those mints, see below) and from the hot pump-amm pool; both are gone in milestone 3.
 
-| discriminator | best guess | status after milestone 2 |
+| discriminator | name | status after milestone 3 |
 |---|---|---|
-| `b1310cd2a076a774` | CreatePoolEvent | **CreatePoolEvent** (pump_amm) - decoded from now on; the pump-amm layout is TO VERIFY (`fart events classify` should stop listing it) |
-| `ae7c4af90451f611` | - | no candidate name; the emitting program (now stored per row) decides whether this matters at all |
-| `40c6cde8260871e2` | SwapEvent | name match **SwapEvent** of jupiter_v6, raydium - another Anchor program in the same transaction; confirm the emitting program with `fart events classify --fetch 5` |
-| `e1ca49af932ba096` | Traded | name match **Traded** of orca_whirlpool - another Anchor program in the same transaction; confirm the emitting program with `fart events classify --fetch 5` |
-| `9ba768dcd56cf303` | - | no candidate name; the emitting program (now stored per row) decides whether this matters at all |
-| `8569aac8b874fb58` | - | no candidate name; the emitting program (now stored per row) decides whether this matters at all |
-| `a537817004b3ca28` | - | no candidate name; the emitting program (now stored per row) decides whether this matters at all |
-| `15bac4b85be4e1cb` | - | no candidate name; the emitting program (now stored per row) decides whether this matters at all |
-| `67f4521f2cf57777` | BuyEvent | **BuyEvent** (pump_amm) - decoded from now on; the pump-amm layout is TO VERIFY (`fart events classify` should stop listing it) |
+| `b1310cd2a076a774` | CreatePoolEvent (pump_amm) | decoded since milestone 2 |
+| `67f4521f2cf57777` | BuyEvent (pump_amm) | decoded since milestone 2 |
+| `ae7c4af90451f611` | **InitBoostEvent** (pump_amm, IDL) | known, counted only: the boost feature of pump-amm pools |
+| `9ba768dcd56cf303` | **MigrateBondingCurveCreatorEvent** (pump, IDL) | known, counted only |
+| `a537817004b3ca28` | **DistributeCreatorFeesEvent** (pump, IDL) | known, counted only |
+| `40c6cde8260871e2` | SwapEvent (jupiter_v6 / raydium name match) | another program's event in the same transaction; `fart events classify` shows the emitting program |
+| `e1ca49af932ba096` | Traded (orca_whirlpool name match) | another program's event; see the emitting program |
+| `8569aac8b874fb58` | - | not a pump.fun or pump-amm event (neither IDL has it); the emitting program column decides |
+| `15bac4b85be4e1cb` | - | not a pump.fun or pump-amm event; the emitting program column decides |
 
-Interpretation: a graduation transaction calls pump-amm `create_pool` (`CreatePoolEvent`) and the
-first buy on the pool (`BuyEvent`); both are pump-amm events and are decoded from milestone 2 on.
-`SwapEvent`/`Traded` are swaps of other DEX programs that share a transaction with a pump.fun
-instruction (bundled create-and-swap transactions). The five unknown ones carry no pump.fun or
-pump-amm name; the emitting program per row (`raw_undecoded.program`, written from milestone 2 on,
-or `fart events classify --fetch 5` for older rows) tells whether they are pump.fun's at all.
+Anything `fart events classify` still lists with the emitting program `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`
+or `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA` and status `unknown` is a real gap: the program changed
+after the IDL of 26 Oct 2026; add the name to `fart/chain/events.py`.
+
+## PumpPortal migration messages with USDC / PUMP in `mint` (26 Oct 2026)
+
+On the VPS the `subscribeMigration` stream delivered messages that `store.classify_pumpportal` read as
+`migrate` and whose **`mint` field** carried `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v` (USDC) and
+`pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn` (PUMP). `pumpportal_migration_record()` takes the mint from
+exactly that field (`pool_address` is never in the message, `dex` = `pool` = `pump-amm`), so both mints
+became `graduation` watchlist entries, `rpc_trades` subscribed to them (the mint itself, no pool known)
+and every transaction on Solana that mentions USDC or PUMP arrived as a notification: 72,770 and 8,142 in
+six minutes, 2,729 rows in `trades` with `source='pump_amm'` and those mints, because
+`pump_amm_trade_records` took the mint from the subscription.
+
+Since milestone 3: a migration is refused when its mint is on `config/pumpfun.json` → `system_mints` or,
+for PumpPortal, when the coin is not in `coins` (`store.migration_rejection`); the whole raw message is
+stored in `rejected_messages` (reason `system_mint:USDC`, `system_mint:PUMP`, `unknown_coin`) and counted
+(`ingest.rejected.pumpportal.<reason>`); pump-amm swaps map their mint through the pool only; schema v3
+deleted the rows. To see what PumpPortal actually sends in those messages (the open question is which
+coin they were about: pump.fun now has non-SOL quote mints, see the `quote_mint` fields below, so these may
+be the quote side of USDC- or PUMP-quoted migrations):
+
+```
+sqlite3 /opt/fart/data/fart.db "select received_at, reason, raw_json from rejected_messages where reason like 'system_mint%' order by id desc limit 5"
+```
 
 ### pump.fun CreateEvent (required: first 6 fields)
 
@@ -198,19 +250,33 @@ or `fart events classify --fetch 5` for older rows) tells whether they are pump.
 | 19 | total_claimed_tokens | u64 |
 | 20 | current_sol_volume | u64 |
 | 21 | last_update_timestamp | i64 |
+| 22 | ix_name | string (IDL 26 Oct 2026) |
+| 23 | mayhem_mode | bool |
+| 24 | cashback_fee_basis_points | u64 |
+| 25 | cashback | u64 |
+| 26 | buyback_fee_basis_points | u64 |
+| 27 | buyback_fee | u64 |
+| 28 | shareholders | vec<Shareholder{address pubkey, share_bps u16}> |
+| 29 | quote_mint | pubkey |
+| 30 | quote_amount | u64 |
+| 31 | virtual_quote_reserves | u64 |
+| 32 | real_quote_reserves | u64 |
+| 33 | holder_rewards_bps | u64 |
+| 34 | holder_rewards | u64 |
+| 35 | creator_fee_unclaimed | u64 |
 
 Reserves in a TradeEvent are the state *after* the trade.
 
 ### pump.fun CompletePumpAmmMigrationEvent (required: first 2 fields)
 
 user pubkey, mint pubkey, mint_amount u64, sol_amount u64, pool_migration_fee u64,
-bonding_curve pubkey, timestamp i64, pool pubkey.
+bonding_curve pubkey, timestamp i64, pool pubkey, quote_mint pubkey (IDL 26 Oct 2026).
 
 ### pump.fun CompleteEvent (required: first 2 fields)
 
-user pubkey, mint pubkey, bonding_curve pubkey, timestamp i64.
+user pubkey, mint pubkey, bonding_curve pubkey, timestamp i64, quote_mint pubkey (IDL 26 Oct 2026).
 
-### pump-amm BuyEvent (TO VERIFY; required: first 16 fields)
+### pump-amm BuyEvent (IDL-confirmed order; required: first 16 fields)
 
 | # | field | type |
 |---|---|---|
@@ -242,26 +308,47 @@ user pubkey, mint pubkey, bonding_curve pubkey, timestamp i64.
 | 26 | total_claimed_tokens | u64 |
 | 27 | current_sol_volume | u64 |
 | 28 | last_update_timestamp | i64 |
+| 29 | min_base_amount_out | u64 (IDL 26 Oct 2026) |
+| 30 | ix_name | string |
+| 31 | cashback_fee_basis_points | u64 |
+| 32 | cashback | u64 |
+| 33 | buyback_fee_basis_points | u64 |
+| 34 | buyback_fee | u64 |
+| 35 | virtual_quote_reserves | i128 |
+| 36 | can_boost | bool |
+| 37 | base_supply | u64 |
+| 38 | holder_rewards_bps | u64 |
+| 39 | holder_rewards | u64 |
+| 40 | creator_fee_unclaimed | u64 |
 
-Open questions: whether the pool reserves are the state before or after the swap (stored as
-`trades.virtual_sol/virtual_token` either way; the price error is one trade's worth), and whether
-the quote mint is always WSOL for migrated pump.fun coins (assumed).
+Open question: whether the pool reserves are the state before or after the swap (stored as
+`trades.virtual_sol/virtual_token` either way; the price error is one trade's worth). The quote mint is
+not assumed any more: a pool whose CreatePoolEvent names another quote mint than WSOL is never a trade
+source (`quote_not_wsol`).
 
-### pump-amm SellEvent (TO VERIFY; required: first 16 fields)
+### pump-amm SellEvent (IDL-confirmed order; required: first 16 fields)
 
 Fields 1-14 as BuyEvent with `base_amount_in`, `min_quote_amount_out`, `quote_amount_out`,
 `quote_amount_out_without_lp_fee`, `user_quote_amount_out`; then pool, user, user_base_token_account,
 user_quote_token_account, protocol_fee_recipient, protocol_fee_recipient_token_account,
-coin_creator, coin_creator_fee_basis_points, coin_creator_fee (23 fields).
+coin_creator, coin_creator_fee_basis_points, coin_creator_fee (23 fields), then (IDL 26 Oct 2026)
+cashback_fee_basis_points u64, cashback u64, buyback_fee_basis_points u64, buyback_fee u64,
+virtual_quote_reserves i128, can_boost bool, base_supply u64, holder_rewards_bps u64, holder_rewards u64,
+creator_fee_unclaimed u64 (33 fields).
 
-### pump-amm CreatePoolEvent (TO VERIFY; required: first 5 fields)
+### pump-amm CreatePoolEvent (IDL-confirmed order; required: first 5 fields)
 
 timestamp i64, index u16, creator pubkey, base_mint pubkey, quote_mint pubkey, base_mint_decimals u8,
 quote_mint_decimals u8, base_amount_in u64, quote_amount_in u64, pool_base_amount u64,
 pool_quote_amount u64, minimum_liquidity u64, initial_liquidity u64, lp_token_amount_out u64,
 pool_bump u8, pool pubkey, lp_mint pubkey, user_base_token_account pubkey,
-user_quote_token_account pubkey, coin_creator pubkey. Used to fill `migrations.pool_address`
-when the migration event itself was not decodable.
+user_quote_token_account pubkey, coin_creator pubkey, then (IDL 26 Oct 2026) is_mayhem_mode bool,
+creator_fee_bps u64, can_edit_creator_fee bool, is_holder_reward bool (24 fields). Fills
+`migrations.pool_address` when the migration event itself was not decodable and is the pool → base-mint
+mapping for the swaps of the same transaction (`store.pool_base_mints`). The pool PDA seeds in the IDL are
+`["pool", index u16, creator, base_mint, quote_mint]` under the pump-amm program, as `fart chain pda` guesses;
+whether `creator` is the pump.fun pool-authority PDA for migrated coins is still to compare with
+`migrations.pool_address`.
 
 ## Tolerance rules
 
@@ -271,7 +358,9 @@ emitting program) and counted in `kv decode.*`. A `timestamp` outside 2020-2100 
 `*_basis_points` field above 10,000 marks the event `suspect` (decoded, but a suspect timestamp is
 not used as chain time and a suspect pump-amm swap is not stored as a trade). Unknown
 discriminators are stored and counted; known but irrelevant events are counted only.
-`DecodedEvent.layout` reads like `CreateEvent/full/12of12` or `BuyEvent/partial/16of28`.
+`DecodedEvent.layout` reads like `CreateEvent/full/20of20` (a current payload), `CreateEvent/partial/12of20`
+(an older program version: the milestone-2 fields only) or `BuyEvent/partial/16of40`. Borsh `vec` and
+`i128` fields are read by the decoder since milestone 3 (`shareholders`, `virtual_quote_reserves`).
 
 ## Verification (do this at deploy)
 
@@ -298,9 +387,11 @@ discriminators are stored and counted; known but irrelevant events are counted o
    Expect `CreateEvent/full/...` with zero `extra_bytes` and no suspect flags, and a `TradeEvent`
    when the creator bought in the same transaction.
 5. Repeat for a migration signature (`migrations.signature`) - expect `CompletePumpAmmMigrationEvent`
-   and a pump-amm `CreatePoolEvent` whose `pool` equals the migration event's `pool`.
+   and a pump-amm `CreatePoolEvent` whose `pool` equals the migration event's `pool` and whose
+   `quote_mint` is WSOL (`So111...112`).
 6. Repeat for a pump-amm trade: `select signature from trades where source='pump_amm' limit 1`;
-   expect `BuyEvent`/`SellEvent` with `extra_bytes == 0`, plausible fees and the right pool.
+   expect `BuyEvent`/`SellEvent` with `extra_bytes == 0`, plausible fees and a `pool` that maps to the
+   trade's mint in `migrations`.
 7. Copy the responses to `tests/fixtures/tx_create_real.json`, `tests/fixtures/tx_migration_real.json`
    (public data, no secrets): `tests/test_events.py` picks them up automatically.
 8. Update the status line at the top of this file and `docs/UNVERIFIED.md`.

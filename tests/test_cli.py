@@ -48,7 +48,9 @@ def test_events_classify_and_chain_pda(settings, capsys):
     assert "CreatePoolEvent" in out and "pump-amm" in out and "ae7c4af90451f611" in out
     assert main(["--root", root, "--quiet", "--json", "events", "classify"]) == 0
     items = json.loads(capsys.readouterr().out)
-    assert items[0]["discriminator"] == "ae7c4af90451f611" and items[0]["n"] == 2 and items[0]["status"] == "unknown"
+    # ae7c4af90451f611 was "unknown" until the IDL named it: pump-amm InitBoostEvent (milestone 3)
+    assert items[0]["discriminator"] == "ae7c4af90451f611" and items[0]["n"] == 2 and items[0]["status"] == "ignored"
+    assert items[0]["name"] == "InitBoostEvent" and items[0]["programs"] == ["pump_amm"]
     assert items[1]["name"] == "CreatePoolEvent" and items[1]["program_label"] == "pump-amm"
     mint = "CcnpRLK4pnA35KjAd2aGZr4GAat16h8oTTKQq9pSZgfe"
     assert main(["--root", root, "--quiet", "--json", "chain", "pda", mint]) == 0
@@ -77,7 +79,9 @@ def test_status_json_has_milestone2_fields(settings, capsys):
     s = data["settings"]
     assert s["pumpportal_api_key"] == "not configured" and s["x_bearer_token"] == "not configured" and s["telegram"] == "not configured"
     assert data["cu_by_method_today"] == [] and data["top_subscriptions"] == [] and data["outbox"] == {} and data["x_spend_today"] == []
-    assert data["global_check"]["status"] is None and data["schema_version"] == 2
+    assert data["global_check"]["status"] is None and data["schema_version"] == db.SCHEMA_VERSION
+    assert data["failures"] == {} and data["enrich"]["used_today"] == 0 and data["enrich"]["limit"] == 1500  # public RPC: fixed fallback
+    assert data["counts"]["rejected_messages"] == 0 and data["schema_v3_cleanup"]["deleted"]["trades"] == 0
     assert main(["--root", str(settings.root), "--quiet", "status"]) == 0
     out = capsys.readouterr().out
     assert "trades: rpc only (no key)" in out and "not configured" in out

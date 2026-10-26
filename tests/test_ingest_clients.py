@@ -73,7 +73,9 @@ def test_pumpportal_handle_text_end_to_end(settings, conn, pp_msgs):
     assert pp.counts["trade_unwatched"] == 1
     assert conn.execute("SELECT COUNT(*) FROM coins").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 1
-    assert conn.execute("SELECT reason FROM watchlist WHERE mint=?", (pp_msgs["new_token"]["mint"],)).fetchone()[0] == "graduation"
+    assert conn.execute("SELECT COUNT(*) FROM migrations").fetchone()[0] == 1  # the coin is known: migration accepted
+    # milestone 3: a graduation no longer puts the coin on the watchlist (subscribe_graduations=false); probation stays
+    assert conn.execute("SELECT reason FROM watchlist WHERE mint=?", (pp_msgs["new_token"]["mint"],)).fetchone()[0] == "probation"
     raw.flush()
     rows = list(iter_raw(settings.raw_dir / "pumpportal" / "19700101" / "00.jsonl.gz"))
     assert len(rows) == 6 and rows[4]["msg"] == "not json"

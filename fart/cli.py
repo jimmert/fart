@@ -1,6 +1,9 @@
 """python -m fart <command>
 
   ingest                 daemon: PumpPortal + RPC streams (creates, migrations, per-mint trades), sweep, coverage
+  ingest replay --source S --since T [--until T]
+                         re-feed the raw hour files of one source (pumpportal | rpc_logs | rpc_trades) to its handler,
+                         data writes only, idempotent; T = ISO-8601 (2026-10-26T08:00Z) or unix seconds
   engine                 daemon: candidate engine v0 (15 s loop), observations only
   social [--once]        daemon: X mega-account / KOL watch + CA confirmation (15 s loop); --once runs one tick
   notify [--once]        daemon: Telegram outbox builder + sender to the owner chat (20 s loop)
@@ -18,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from typing import Any
 
@@ -34,7 +38,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="machine-readable output where applicable")
     p.add_argument("--quiet", action="store_true", help="no stderr log lines")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("ingest")
+    ing = sub.add_parser("ingest")
+    ing.add_argument("icmd", nargs="?", choices=["replay"], help="replay (default: run the daemon)")
+    ing.add_argument("--source", choices=["pumpportal", "rpc_logs", "rpc_trades"], help="replay: which raw store")
+    ing.add_argument("--since", help="replay: start (ISO-8601 or unix seconds)")
+    ing.add_argument("--until", help="replay: end (ISO-8601 or unix seconds; default now)")
     sub.add_parser("engine")
     so = sub.add_parser("social")
     so.add_argument("--once", action="store_true", help="run one tick and print the summary")
@@ -66,6 +74,20 @@ def _kv_prefixed(conn, prefixes: tuple[str, ...]) -> dict[str, str]:
     return {r["key"]: r["value"] for r in conn.execute(f"SELECT key, value FROM kv WHERE {where}", tuple(f"{p}%" for p in prefixes))}
 
 
+_DAY_SUFFIX = re.compile(r"\.\d{4}-\d{2}-\d{2}$")
+FAILURE_PREFIXES = ("engine.tick_failed", "ingest.handle_failed.", "ingest.rejected.", "rpc_trades.subscription_capped", "rpc_trades.envelope_paused")
+
+
+def _failure_counters(kv: dict[str, str]) -> dict[str, str]:
+    """All-time failure counters (milestone 3), without the per-day keys and the .last* details."""
+    out = {}
+    for k, v in kv.items():
+        if not k.startswith(FAILURE_PREFIXES) or _DAY_SUFFIX.search(k) or k.endswith(".last") or k.endswith(".last_at") or k.endswith("_at"):
+            continue
+        out[k] = v
+    return dict(sorted(out.items()))
+
+
 def cmd_status(settings, as_json: bool) -> int:
     from .net.budget import Budget
 
@@ -79,11 +101,12 @@ def cmd_status(settings, as_json: bool) -> int:
             t = now()
             out["schema_version"] = db.schema_version(conn)
             out["counts"] = db.table_counts(conn, ("coins", "migrations", "trades", "watchlist", "decisions", "outcomes", "paper",
-                                                   "coverage_gaps", "raw_undecoded", "social_posts", "outbox"))
+                                                   "coverage_gaps", "raw_undecoded", "social_posts", "outbox", "rejected_messages"))
             out["watchlist_active"] = conn.execute("SELECT COUNT(*) FROM watchlist WHERE active=1").fetchone()[0]
             out["trades_by_source_today"] = {r[0]: r[1] for r in conn.execute(
                 "SELECT source, COUNT(*) FROM trades WHERE received_at >= ? GROUP BY source", (day_start(t),))}
-            kv = _kv_prefixed(conn, ("ingest.", "engine.", "measure.", "retention.", "decode.", "pp.", "chain.", "social.", "notify.", "x."))
+            kv = _kv_prefixed(conn, ("ingest.", "engine.", "measure.", "retention.", "decode.", "pp.", "chain.", "social.", "notify.", "x.",
+                                     "rpc_trades.", "enrich.", "schema."))
             ages = {}
             for k in ("ingest.heartbeat", "ingest.pumpportal.last_msg_at", "ingest.rpc_logs.last_msg_at", "ingest.rpc_trades.last_msg_at",
                       "engine.heartbeat", "measure.track.last_run", "measure.report.last_run", "social.heartbeat", "notify.heartbeat"):
@@ -91,6 +114,21 @@ def cmd_status(settings, as_json: bool) -> int:
                 ages[k] = None if v is None else round(t - float(v))
             out["age_seconds"] = ages
             out["counters"] = {k: v for k, v in kv.items() if k.startswith("decode.") or k.startswith("pp.")}
+            out["failures"] = _failure_counters(kv)
+            out["rejected_messages"] = {r[0]: r[1] for r in conn.execute(
+                "SELECT reason, COUNT(*) FROM rejected_messages WHERE received_at >= ? GROUP BY reason", (day_start(t),))}
+            out["schema_v3_cleanup"] = json.loads(kv["schema.v3.cleanup"]) if kv.get("schema.v3.cleanup") else None
+            from .ingest.sweep import enrich_backlog, enrich_daily_limit
+
+            icfg = settings.config("ingest")
+            bcfg = dict(icfg.get("backfill", {}))
+            bcfg.update(icfg.get("enrich", {}))
+            rpc_src_cfg = settings.config("budget")["sources"].get("rpc_public" if settings.rpc_is_public else "rpc", {})
+            tx_cost = float((rpc_src_cfg.get("cost_table") or {}).get("getTransaction", rpc_src_cfg.get("cost_default", 59)))
+            out["enrich"] = {"used_today": int(kv.get(f"enrich.tx.{day_key(t)}", "0") or 0),
+                             "limit": enrich_daily_limit(bcfg, None if settings.rpc_is_public else float(settings.rpc_daily_budget_cu), tx_cost),
+                             "skipped_today": int(kv.get(f"enrich.skipped_budget.{day_key(t)}", "0") or 0),
+                             "backlog": enrich_backlog(conn, int(bcfg.get("max_attempts", 3)))}
             out["pumpportal_last_http_status"] = kv.get("ingest.pumpportal.last_http_status")
             out["open_gaps"] = [dict(r) for r in conn.execute("SELECT source, start, reason FROM coverage_gaps WHERE end IS NULL")]
             budget = Budget.from_settings(conn, settings)
@@ -151,6 +189,13 @@ def cmd_status(settings, as_json: bool) -> int:
         print(f"  global account check: {g['status']} at {g['checked_at']}" + (f" mismatches={json.dumps(g['mismatches'])}" if g["mismatches"] else ""))
     if out["counters"]:
         print("  counters: " + ", ".join(f"{k}={v}" for k, v in sorted(out["counters"].items())))
+    print("  failures: " + (", ".join(f"{k}={v}" for k, v in out["failures"].items()) or "none"))
+    if out["rejected_messages"]:
+        print("  rejected messages today: " + ", ".join(f"{k}={v}" for k, v in sorted(out["rejected_messages"].items())))
+    e = out["enrich"]
+    print(f"  enrich (getTransaction): {e['used_today']}/{e['limit']} today, skipped {e['skipped_today']}, backlog migrations={e['backlog'].get('migrate_tx', 0)} creates={e['backlog'].get('create_tx', 0)}")
+    if out["schema_v3_cleanup"]:
+        print(f"  schema v3 cleanup (system-mint rows removed at {utc_iso(out['schema_v3_cleanup'].get('at'))}): {json.dumps(out['schema_v3_cleanup'].get('deleted'))}")
     if out["pumpportal_last_http_status"]:
         print(f"  pumpportal last HTTP refusal: {out['pumpportal_last_http_status']}")
     print(f"  last decision: {out['last_decision_at']}")
@@ -171,12 +216,12 @@ def cmd_coverage(settings, hours: int, as_json: bool) -> int:
     if as_json:
         print(json.dumps(rows, indent=2))
         return 0
-    print(f"{'hour (UTC)':<14}{'pp':>6}{'rpc':>6}{'union':>7}{'grads':>7}{'no-create':>11}{'gaps(s)':>9}{'recov(s)':>10}  complete")
+    print(f"{'hour (UTC)':<14}{'pp':>6}{'rpc':>6}{'union':>7}{'grads':>7}{'no-create':>11}{'gaps(s)':>9}{'recov(s)':>10}  covered  complete")
     for r in rows:
         gap_s = sum(g["seconds"] for g in r["gaps"] if not g.get("recovered"))
         rec_s = sum(g["seconds"] for g in r["gaps"] if g.get("recovered"))
         print(f"{r['hour']:<14}{r['creates_pp']:>6}{r['creates_rpc']:>6}{r['creates_union']:>7}{r['grads']:>7}{r['grads_without_create']:>11}"
-              f"{gap_s:>9.0f}{rec_s:>10.0f}  {'yes' if r['complete'] else 'no'}")
+              f"{gap_s:>9.0f}{rec_s:>10.0f}  {'yes' if r.get('covered') else 'no':<7}  {'yes' if r['complete'] else 'no'}")
     return 0
 
 
@@ -275,19 +320,21 @@ def cmd_chain_global(settings, as_json: bool) -> int:
             print(f"  owner={res.get('owner')}  discriminator_ok={dec['discriminator_ok']}  bytes={dec['raw_len']} consumed={dec['consumed']} extra={dec['extra_bytes']}")
             print(f"  {'field':<34}{'chain':<48}{'config':<22}layout")
             for name, _ in VERIFIED_LAYOUT:
+                if name not in dec["verified"]:
+                    continue
                 cfg_key = inv.get(name)
                 cfg_val = cfg.get(cfg_key) if cfg_key else ""
-                print(f"  {name:<34}{str(dec['verified'].get(name)):<48}{str(cfg_val if cfg_key else '-'):<22}verified")
+                print(f"  {name:<34}{str(dec['verified'].get(name))[:47]:<48}{str(cfg_val if cfg_key else '-'):<22}verified (VPS + IDL)")
             for name, _ in TO_VERIFY_LAYOUT:
                 if name not in dec["to_verify"]:
                     continue
                 cfg_key = inv.get(name)
                 cfg_val = cfg.get(cfg_key) if cfg_key else ""
-                print(f"  {name:<34}{str(dec['to_verify'].get(name))[:47]:<48}{str(cfg_val if cfg_key else '-'):<22}TO VERIFY")
+                print(f"  {name:<34}{str(dec['to_verify'].get(name))[:47]:<48}{str(cfg_val if cfg_key else '-'):<22}IDL (newer field)")
             if dec["suspect"]:
                 print("  suspect: " + "; ".join(dec["suspect"]))
         for m in res.get("mismatches", []):
-            print(f"  MISMATCH {m['field']}: chain={m['chain']} config[{m['config_key']}]={m['config']}" + ("" if m.get("verified_layout") else " (to-verify layout)"))
+            print(f"  MISMATCH {m['field']}: chain={m['chain']} config[{m['config_key']}]={m['config']}" + ("" if m.get("verified_layout") else " (IDL-only field)"))
     return {"ok": 0, "mismatch": 1}.get(res["status"], 2)
 
 
@@ -324,11 +371,54 @@ def cmd_chain_pda(settings, mint: str, as_json: bool) -> int:
     return rc
 
 
+def parse_time(value: str | None) -> float | None:
+    """ISO-8601 (2026-10-26T08:00Z, 2026-10-26T08:00:00+00:00, 2026-10-26) or unix seconds -> unix seconds."""
+    if value is None or not str(value).strip():
+        return None
+    v = str(value).strip()
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    import datetime as _dt
+
+    if v.endswith("Z"):
+        v = v[:-1] + "+00:00"
+    d = _dt.datetime.fromisoformat(v)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=_dt.timezone.utc)
+    return d.timestamp()
+
+
+def cmd_ingest_replay(settings, source: str | None, since: str | None, until: str | None, as_json: bool) -> int:
+    from .ingest.service import replay_raw
+
+    if not source or not since:
+        print("ingest replay needs --source {pumpportal,rpc_logs,rpc_trades} and --since <ISO-8601 or unix seconds>")
+        return 2
+    if not settings.db_path.exists():
+        print("no database yet")
+        return 2
+    try:
+        t0 = parse_time(since)
+        t1 = parse_time(until)
+    except ValueError as e:
+        print(f"bad time: {e}")
+        return 2
+    stats = replay_raw(settings, source, float(t0), t1)
+    if as_json:
+        print(json.dumps(stats, indent=2))
+    else:
+        print(f"replay {source}: files={stats['files']} records={stats['records']} replayed={stats['replayed']} skipped={stats['skipped']}"
+              f" errors={stats['errors']} kinds={json.dumps(stats['kinds'])}")
+    return 0 if stats["errors"] == 0 else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     settings = load_settings(root=args.root)
     settings.ensure_dirs()
-    daemon = args.cmd in ("ingest", "engine", "social") or (args.cmd == "measure") or (args.cmd == "notify" and not args.ncmd)
+    daemon = (args.cmd == "ingest" and not args.icmd) or args.cmd in ("engine", "social") or (args.cmd == "measure") or (args.cmd == "notify" and not args.ncmd)
     setup_logging(settings.logs_dir if daemon else None, args.cmd if args.cmd != "measure" else f"measure-{args.mcmd}", stderr=not args.quiet)
     if args.cmd == "status":
         return cmd_status(settings, args.json)
@@ -341,6 +431,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_chain_global(settings, args.json)
         return cmd_chain_pda(settings, args.mint, args.json)
     if args.cmd == "ingest":
+        if args.icmd == "replay":
+            return cmd_ingest_replay(settings, args.source, args.since, args.until, args.json)
         from .ingest.service import run_ingest
 
         return run_ingest(settings)

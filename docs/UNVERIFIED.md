@@ -7,20 +7,27 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
 ## Chain / pump.fun
 
 - [~] **Event byte layouts** of CreateEvent, TradeEvent, CompletePumpAmmMigrationEvent,
-  CompleteEvent (`fart/chain/events.py` LAYOUTS; `docs/PUMPFUN-EVENTS.md`). They decode on mainnet
+  CompleteEvent (`fart/chain/events.py` LAYOUTS; `docs/PUMPFUN-EVENTS.md`). Field lists taken from the
+  official IDL on 26 Oct 2026 (`idl/pump.json`, with the newer trailing fields); they decode on mainnet
   (VPS, 26 Oct 2026: creates and migrations flow in through the RPC stream); the byte-level proof of
-  step 3 in `docs/PUMPFUN-EVENTS.md` is still open. Watch `decode.truncated_or_drift`.
-- [ ] **pump-amm event layouts** BuyEvent / SellEvent / CreatePoolEvent (milestone 2, from the PumpSwap
-  IDL as remembered). Self-check: `fart status` counter `decode.pump_amm_pool_mismatch` must stay 0
-  and `trades` rows with `source='pump_amm'` must show plausible SOL amounts. Whether the pool
-  reserves in the event are pre- or post-swap, and whether the quote mint is always WSOL.
-- [ ] **Which address carries per-mint trade notifications**: `logsSubscribe {mentions:[bonding curve]}`
-  before graduation, `{mentions:[pool]}` after. If `trades` with `source='rpc_trades'` stay empty while
+  step 3 in `docs/PUMPFUN-EVENTS.md` (a real recording decoding `full` with zero extra bytes) is still
+  open. Watch `decode.truncated_or_drift`.
+- [~] **pump-amm event layouts** BuyEvent / SellEvent / CreatePoolEvent: field order confirmed against
+  the official `idl/pump_amm.json` (26 Oct 2026; the milestone-2 lists were the exact prefix). Still
+  open: a real recording decoding `full`, whether the pool reserves in the event are pre- or post-swap.
+  A pool quoted in something other than WSOL is rejected (`decode.pump_amm_quote_not_wsol`), a swap on
+  a pool we cannot map to a mint too (`decode.pump_amm_pool_unknown`); both should stay small.
+- [ ] **Which address carries per-mint trade notifications** before graduation:
+  `logsSubscribe {mentions:[bonding curve]}`. If `trades` with `source='rpc_trades'` stay empty while
   `ws_subscriptions.notifications` grows, switch `config/ingest.json` → `rpc_trades.mention` to `"mint"`.
-- [ ] **Global account fields past offset 113** (`fart chain global`): withdraw_authority, enable_migrate,
-  pool_migration_fee, creator_fee_basis_points, fee_recipients, set/admin_set_creator_authority are a
-  guess at the newer layout; compare `creator_fee_basis_points` with `config/pumpfun.json` →
-  `creator_fee_bps` (30) and `total_curve_fee_bps` (125).
+  (Pool subscriptions after graduation were removed in milestone 3: too expensive.)
+- [x] **Global account layout** (`fart chain global`): verified against the official IDL on 26 Oct 2026
+  for the whole account (1,088 bytes): the fields past offset 113 (withdraw_authority, enable_migrate,
+  pool_migration_fee, `creator_fee_basis_points` at 154, fee_recipients, set/admin_set_creator_authority)
+  are exactly where the VPS read them, so the 5 at offset 154 is the real creator fee: 95 + 5 = 100 bps
+  = the public 1% curve fee (`config/pumpfun.json`: `creator_fee_bps` 5, `total_curve_fee_bps` 100).
+  The newer fields from offset 450 on (create_v2_enabled ... max_curve_depth) decode tolerantly and are
+  labelled "IDL (newer field)" until the VPS shows them.
 - [ ] **pump-amm pool PDA** (`fart chain pda <mint>`): `["pool", index 0, pool-authority PDA, mint, WSOL]`
   under the pump-amm program is a guess; compare with `migrations.pool_address`. Never used blindly.
 - [ ] **Events appear as `Program data:` log lines** (not only as self-CPI inner instructions). If
@@ -31,8 +38,10 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
   (`config/pumpfun.json`: `mint_authority`, `migration_account`).
 - [x] **Bonding curve parameters** (`config/pumpfun.json`): 30 SOL / 1.073e9 virtual tokens,
   793.1M real tokens, 1e9 supply, ~85 SOL to graduate: match the Global account (VPS, 26 Oct 2026);
-  the protocol fee is 0.95%, not 1% (fixed). Still open: pump.fun's 2025 dynamic fee schedule
-  (creator fee 0.30%?) - the paper trade uses the flat `total_curve_fee_bps` (125).
+  the protocol fee is 0.95% and the creator fee 0.05% (Global account + IDL layout, milestone 3), so
+  the paper trade uses the flat `total_curve_fee_bps` 100. Still open: whether a per-coin
+  `creator_fee_bps` (CreateEvent field 18, BondingCurve account) ever differs from the global 5 for the
+  coins we measure (`creator_fee_configurable` in Global); the TradeEvent carries the fee actually charged.
 - [ ] **Bundled heuristics** (graduation within 60 s, dev buy ≥ 50% of the curve) are definitions,
   not measured facts (`config/pumpfun.json`: `bundled_*`). Re-measure the "half of graduations are
   bundled" claim from the audit with the report's organic/bundled split.
@@ -46,6 +55,14 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
   `vTokensInBondingCurve`, `marketCapSol`, `bondingCurveKey`, `traderPublicKey`, `signature`,
   `pool`, `name`, `symbol`, `uri`) and the migration message shape (`fart/ingest/store.py`).
   The live smoke test prints the key set of a real create message.
+- [ ] **Migration messages with USDC / PUMP in `mint`** (VPS, 26 Oct 2026): `subscribeMigration` delivered
+  messages whose `mint` field was the USDC or the PUMP mint (72,770 and 8,142 pool notifications in six
+  minutes once they were on the watchlist). Since milestone 3 they are refused and kept:
+  `sqlite3 /opt/fart/data/fart.db "select received_at, reason, raw_json from rejected_messages where reason like 'system_mint%' order by id desc limit 5"`.
+  Open: which coin those messages were about (pump.fun now supports non-SOL quote mints: `quote_mint`
+  in CreateEvent/CompletePumpAmmMigrationEvent/CreatePoolEvent, `whitelisted_quote_mints` in Global;
+  PumpPortal may report the quote side of such migrations), and whether another field of the message
+  carries the real mint (docs/PUMPFUN-EVENTS.md, "PumpPortal migration messages").
 - [x] **`subscribeTokenTrade`** is only served to a funded API key (VPS, 26 Oct 2026). Without
   `PUMPPORTAL_API_KEY` fart no longer sends it; trades come from the RPC. With a key, whether
   pump-amm trades arrive after graduation is still open (the RPC pool subscription covers it anyway).
@@ -59,10 +76,19 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
 - [ ] **Compute-unit cost table** (`config/budget.json` → `rpc.cost_table`): getTransaction 59,
   getSignaturesForAddress 50, getTokenLargestAccounts 50, ws_notification 10, … are estimates.
   Reconcile `fart status` → `budget rpc cost` with the Alchemy dashboard after 24 h.
-- [ ] **Whether websocket notifications are billed** and at what rate (`ws_notification`,
-  `ws_subscribe`, `ws_unsubscribe` at 10 CU each are estimates). With ~150 per-mint subscriptions the
-  trade stream dominates the CU spend: compare `fart status` → `rpc CU today by method` with the
-  Alchemy dashboard after one day and adjust `config/budget.json`.
+- [ ] **Whether Alchemy bills websocket notifications at all, and how much** (`ws_notification`,
+  `ws_trade_notification`, `ws_subscribe`, `ws_unsubscribe` at 10 CU each are estimates; Alchemy's
+  public price list names subscription *methods*, not the notifications they deliver). This is the
+  single most important number for the trade stream: on 26 Oct 2026 `fart status` →
+  `rpc CU today by method` showed `ws_notification 2,399,130` estimated CU in 217 batches (one batch =
+  one minute of notifications) against a 3,000,000 cap. To settle it, Jim compares the Alchemy dashboard
+  ("Usage", 26 Oct 2026, compute units per method/app) with that line: if the dashboard shows nothing
+  near 2.4M CU for the websocket, notifications are not billed (or billed far lower) and
+  `config/budget.json` → `rpc.cost_table.ws_notification` / `ws_trade_notification` should become the
+  real figure (0 is allowed); the hourly envelope and the 80% rule scale with it automatically. If the
+  dashboard matches, 10 CU per notification stands and the stream stays envelope-bound (about 12,500
+  notifications per hour at the 3M cap). Milestone 3 books the trade stream under its own methods so the
+  two streams can be told apart in the next comparison.
 - [ ] **Milestone-1 estimate**: ~13,400 CU per 10 minutes (~2M CU/day) against the 3M cap before the
   trade stream; the 80% rule drops probation subscriptions first when the cap comes near.
 - [ ] **EUR 50/month ≈ 3,000,000 CU/day** (`RPC_DAILY_BUDGET_CU` default). Depends on Alchemy's
@@ -112,6 +138,9 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
 
 - [ ] **Python 3.12 on the VPS**: the code targets 3.12 and avoids 3.13-only features, but the
   sandbox ran the tests on 3.13.17 only. Run `make check` on the server once (`WITH_DEV=1`).
-- [ ] **systemd hardening set** (`SystemCallFilter=@system-service`, `ProtectProc=invisible`, …):
-  check `journalctl -u fart-ingest` for a clean start; relax the offending directive if not.
+- [~] **systemd hardening set** (`SystemCallFilter=@system-service`, `ProtectProc=invisible`, …): the
+  daemons start clean on the VPS (26 Oct 2026). `~@privileged` includes `@chown`, which killed `gzip -f`
+  in the backup unit (SIGSYS, exit 159); fixed in the script (`gzip -n -c`), the filter is unchanged.
+  Anything else that calls `chown`/`fchown` (tar with `--same-owner`, `cp -p` as root, `install`) would
+  die the same way: keep the service scripts to plain file writes.
 - [ ] **PumpPortal and Alchemy websockets behind the shared VPS egress**: no proxy in the way.

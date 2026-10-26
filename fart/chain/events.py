@@ -4,12 +4,12 @@ Events arrive as `Program data: <base64>` log lines (logsSubscribe / getTransact
 or as self-CPI inner-instruction payloads prefixed with the 8-byte anchor event-CPI
 discriminator. Payload = 8-byte event discriminator (sha256('event:<Name>')[:8]) + Borsh fields.
 
-The pump.fun layouts come from the published IDL history; CreateEvent / TradeEvent /
-CompletePumpAmmMigrationEvent decode on mainnet (VPS, 26 Oct 2026). The pump-amm layouts
-(BuyEvent, SellEvent, CreatePoolEvent) are from the PumpSwap IDL as remembered and are TO VERIFY
-(docs/PUMPFUN-EVENTS.md): decoding never raises on drift, fields are parsed in order until bytes run
-out, a payload with fewer than the required fields is returned as Undecoded with a reason, and
-plausibility checks (timestamps, basis points) mark suspect layouts.
+Field lists follow the official IDLs of 26 Oct 2026 (github.com/pump-fun/pump-public-docs,
+idl/pump.json and idl/pump_amm.json): the first fields are the milestone-1/2 layouts that decode on
+mainnet (VPS, 26 Oct 2026), the trailing fields are the newer program versions' additions. Decoding
+never raises on drift: fields are parsed in order until bytes run out, a payload with fewer than the
+required fields is returned as Undecoded with a reason, and plausibility checks (timestamps, basis
+points) mark suspect layouts (docs/PUMPFUN-EVENTS.md).
 
 `attribute_program_data()` walks the `Program X invoke [n]` / `Program X success` nesting so every
 payload is attributed to the program that emitted it: unknown discriminators from Jupiter, Orca or
@@ -40,7 +40,7 @@ MAX_STRING_LEN = 2048
 TS_MIN = 1_577_836_800  # 2020-01-01
 TS_MAX = 4_102_444_800  # 2100-01-01
 
-# (field name, type). Types: string | pubkey | u64 | i64 | bool | u8 | u16
+# (field name, type). Types: string | pubkey | u64 | i64 | i128 | bool | u8 | u16 | vec_shareholder
 LAYOUTS: dict[str, tuple[list[tuple[str, str]], int]] = {
     "CreateEvent": (
         [
@@ -50,6 +50,10 @@ LAYOUTS: dict[str, tuple[list[tuple[str, str]], int]] = {
             ("creator", "pubkey"), ("timestamp", "i64"),
             ("virtual_token_reserves", "u64"), ("virtual_sol_reserves", "u64"),
             ("real_token_reserves", "u64"), ("token_total_supply", "u64"),
+            # IDL 26 Oct 2026
+            ("token_program", "pubkey"), ("is_mayhem_mode", "bool"), ("is_cashback_enabled", "bool"),
+            ("quote_mint", "pubkey"), ("virtual_quote_reserves", "u64"), ("creator_fee_bps", "u64"),
+            ("is_holder_reward", "bool"), ("depth", "u8"),
         ],
         6,
     ),
@@ -64,6 +68,12 @@ LAYOUTS: dict[str, tuple[list[tuple[str, str]], int]] = {
             ("creator", "pubkey"), ("creator_fee_basis_points", "u64"), ("creator_fee", "u64"),
             ("track_volume", "bool"), ("total_unclaimed_tokens", "u64"), ("total_claimed_tokens", "u64"),
             ("current_sol_volume", "u64"), ("last_update_timestamp", "i64"),
+            # IDL 26 Oct 2026
+            ("ix_name", "string"), ("mayhem_mode", "bool"), ("cashback_fee_basis_points", "u64"), ("cashback", "u64"),
+            ("buyback_fee_basis_points", "u64"), ("buyback_fee", "u64"), ("shareholders", "vec_shareholder"),
+            ("quote_mint", "pubkey"), ("quote_amount", "u64"), ("virtual_quote_reserves", "u64"),
+            ("real_quote_reserves", "u64"), ("holder_rewards_bps", "u64"), ("holder_rewards", "u64"),
+            ("creator_fee_unclaimed", "u64"),
         ],
         10,
     ),
@@ -71,14 +81,16 @@ LAYOUTS: dict[str, tuple[list[tuple[str, str]], int]] = {
         [
             ("user", "pubkey"), ("mint", "pubkey"), ("mint_amount", "u64"), ("sol_amount", "u64"),
             ("pool_migration_fee", "u64"), ("bonding_curve", "pubkey"), ("timestamp", "i64"), ("pool", "pubkey"),
+            ("quote_mint", "pubkey"),  # IDL 26 Oct 2026
         ],
         2,
     ),
     "CompleteEvent": (
-        [("user", "pubkey"), ("mint", "pubkey"), ("bonding_curve", "pubkey"), ("timestamp", "i64")],
+        [("user", "pubkey"), ("mint", "pubkey"), ("bonding_curve", "pubkey"), ("timestamp", "i64"),
+         ("quote_mint", "pubkey")],  # IDL 26 Oct 2026
         2,
     ),
-    # ----- pump-amm (PumpSwap) events: TO VERIFY -------------------------------------------------
+    # ----- pump-amm (PumpSwap) events: field order confirmed against idl/pump_amm.json (26 Oct 2026) ----
     "BuyEvent": (
         [
             ("timestamp", "i64"), ("base_amount_out", "u64"), ("max_quote_amount_in", "u64"),
@@ -93,6 +105,11 @@ LAYOUTS: dict[str, tuple[list[tuple[str, str]], int]] = {
             ("coin_creator", "pubkey"), ("coin_creator_fee_basis_points", "u64"), ("coin_creator_fee", "u64"),
             ("track_volume", "bool"), ("total_unclaimed_tokens", "u64"), ("total_claimed_tokens", "u64"),
             ("current_sol_volume", "u64"), ("last_update_timestamp", "i64"),
+            # IDL 26 Oct 2026
+            ("min_base_amount_out", "u64"), ("ix_name", "string"), ("cashback_fee_basis_points", "u64"), ("cashback", "u64"),
+            ("buyback_fee_basis_points", "u64"), ("buyback_fee", "u64"), ("virtual_quote_reserves", "i128"),
+            ("can_boost", "bool"), ("base_supply", "u64"), ("holder_rewards_bps", "u64"), ("holder_rewards", "u64"),
+            ("creator_fee_unclaimed", "u64"),
         ],
         16,
     ),
@@ -108,6 +125,10 @@ LAYOUTS: dict[str, tuple[list[tuple[str, str]], int]] = {
             ("user_quote_token_account", "pubkey"), ("protocol_fee_recipient", "pubkey"),
             ("protocol_fee_recipient_token_account", "pubkey"),
             ("coin_creator", "pubkey"), ("coin_creator_fee_basis_points", "u64"), ("coin_creator_fee", "u64"),
+            # IDL 26 Oct 2026
+            ("cashback_fee_basis_points", "u64"), ("cashback", "u64"), ("buyback_fee_basis_points", "u64"), ("buyback_fee", "u64"),
+            ("virtual_quote_reserves", "i128"), ("can_boost", "bool"), ("base_supply", "u64"),
+            ("holder_rewards_bps", "u64"), ("holder_rewards", "u64"), ("creator_fee_unclaimed", "u64"),
         ],
         16,
     ),
@@ -118,41 +139,61 @@ LAYOUTS: dict[str, tuple[list[tuple[str, str]], int]] = {
             ("pool_base_amount", "u64"), ("pool_quote_amount", "u64"), ("minimum_liquidity", "u64"), ("initial_liquidity", "u64"),
             ("lp_token_amount_out", "u64"), ("pool_bump", "u8"), ("pool", "pubkey"), ("lp_mint", "pubkey"),
             ("user_base_token_account", "pubkey"), ("user_quote_token_account", "pubkey"), ("coin_creator", "pubkey"),
+            # IDL 26 Oct 2026
+            ("is_mayhem_mode", "bool"), ("creator_fee_bps", "u64"), ("can_edit_creator_fee", "bool"), ("is_holder_reward", "bool"),
         ],
         5,
     ),
 }
 
-# Known events we recognise by name but do not need; counted, payload not stored.
+# Known events we recognise by name but do not need; counted, payload not stored. Every event of the
+# official IDLs of 26 Oct 2026 is listed (so `fart events classify` names them with their program);
+# a few older names that earlier IDL versions carried are kept.
 IGNORED_EVENT_NAMES = (
-    # pump.fun
-    "SetParamsEvent", "CollectCreatorFeeEvent", "ExtendAccountEvent", "UpdateGlobalAuthorityEvent",
-    "SetCreatorEvent", "SetMetaplexCreatorEvent", "ClaimTokenIncentivesEvent", "InitUserVolumeAccumulatorEvent",
-    "SyncUserVolumeAccumulatorEvent", "AdminSetCreatorEvent", "AdminUpdateTokenIncentivesEvent",
-    "CloseUserVolumeAccumulatorEvent", "ReservesSyncedEvent", "AdminSetIdlAuthorityEvent", "ReserveEvent",
-    "CreateEventV2", "TradeEventV2",
-    # pump-amm
-    "DepositEvent", "WithdrawEvent", "DisableEvent", "UpdateAdminEvent", "UpdateFeeConfigEvent",
-    "CollectCoinCreatorFeeEvent", "SetCoinCreatorEvent", "AdminSetCoinCreatorEvent", "CreateConfigEvent",
-    "UpdateConfigEvent", "BuyExactQuoteInEvent", "SellExactQuoteOutEvent",
+    # pump.fun (idl/pump.json)
+    "AddQuoteControlMintEvent", "AdminCtoEvent", "AdminSetIdlAuthorityEvent", "AdminUpdateTokenIncentivesEvent",
+    "ClaimCashbackEvent", "ClaimTokenIncentivesEvent", "CloseUserVolumeAccumulatorEvent", "CollectCreatorFeeEvent",
+    "DistributeCreatorFeesEvent", "DistributeFeeToHoldersEvent", "ExtendAccountEvent", "InitUserVolumeAccumulatorEvent",
+    "MigrateBondingCurveCreatorEvent", "MinimumDistributableFeeEvent", "PostCompleteBuyEvent", "RemoveQuoteControlMintEvent",
+    "ReservedFeeRecipientsEvent", "SetCreatorEvent", "SetMetaplexCreatorEvent", "SetParamsEvent", "SetQuoteControlAdminEvent",
+    "SetQuoteControlMintReservesEvent", "SetQuoteControlReservesAdminEvent", "SweepBondingCurveFeeEvent",
+    "SyncUserVolumeAccumulatorEvent", "UpdateCreatorFeeConfigEvent", "UpdateGlobalAuthorityEvent", "UpdateMayhemVirtualParamsEvent",
+    # pump.fun, older IDL versions
+    "AdminSetCreatorEvent", "ReservesSyncedEvent", "ReserveEvent", "CreateEventV2", "TradeEventV2",
+    # pump-amm (idl/pump_amm.json)
+    "AdminCtoPoolEvent", "BoostBuyAndBurnEvent", "CollectCoinCreatorFeeEvent", "CreateConfigEvent", "DepositEvent",
+    "DisableEvent", "InitBoostEvent", "MigratePoolCoinCreatorEvent", "SetBondingCurveCoinCreatorEvent", "SetBoostAuthorityEvent",
+    "SetMetaplexCoinCreatorEvent", "SweepPoolFeeEvent", "UpdateAdminEvent", "UpdateFeeConfigEvent", "WithdrawEvent",
+    # pump-amm, older IDL versions
+    "SetCoinCreatorEvent", "AdminSetCoinCreatorEvent", "UpdateConfigEvent", "BuyExactQuoteInEvent", "SellExactQuoteOutEvent",
 )
 
 # name -> programs whose IDL carries an event of that name. Names shared by pump.fun and
 # pump-amm have the same discriminator (sha256 of the name only), so the program is ambiguous.
+_PUMP_ONLY = (
+    "CreateEvent", "TradeEvent", "CompleteEvent", "CompletePumpAmmMigrationEvent", "AddQuoteControlMintEvent", "AdminCtoEvent",
+    "AdminSetIdlAuthorityEvent", "CollectCreatorFeeEvent", "DistributeCreatorFeesEvent", "DistributeFeeToHoldersEvent",
+    "MigrateBondingCurveCreatorEvent", "MinimumDistributableFeeEvent", "PostCompleteBuyEvent", "RemoveQuoteControlMintEvent",
+    "SetCreatorEvent", "SetMetaplexCreatorEvent", "SetParamsEvent", "SetQuoteControlAdminEvent", "SetQuoteControlMintReservesEvent",
+    "SetQuoteControlReservesAdminEvent", "SweepBondingCurveFeeEvent", "UpdateGlobalAuthorityEvent", "UpdateMayhemVirtualParamsEvent",
+    "AdminSetCreatorEvent", "ReservesSyncedEvent", "ReserveEvent", "CreateEventV2", "TradeEventV2",
+)
+_BOTH = (
+    "AdminUpdateTokenIncentivesEvent", "ClaimCashbackEvent", "ClaimTokenIncentivesEvent", "CloseUserVolumeAccumulatorEvent",
+    "ExtendAccountEvent", "InitUserVolumeAccumulatorEvent", "ReservedFeeRecipientsEvent", "SyncUserVolumeAccumulatorEvent",
+    "UpdateCreatorFeeConfigEvent",
+)
+_AMM_ONLY = (
+    "BuyEvent", "SellEvent", "CreatePoolEvent", "AdminCtoPoolEvent", "BoostBuyAndBurnEvent", "CollectCoinCreatorFeeEvent",
+    "CreateConfigEvent", "DepositEvent", "DisableEvent", "InitBoostEvent", "MigratePoolCoinCreatorEvent",
+    "SetBondingCurveCoinCreatorEvent", "SetBoostAuthorityEvent", "SetMetaplexCoinCreatorEvent", "SweepPoolFeeEvent",
+    "UpdateAdminEvent", "UpdateFeeConfigEvent", "WithdrawEvent",
+    "SetCoinCreatorEvent", "AdminSetCoinCreatorEvent", "UpdateConfigEvent", "BuyExactQuoteInEvent", "SellExactQuoteOutEvent",
+)
 EVENT_PROGRAMS: dict[str, tuple[str, ...]] = {
-    "CreateEvent": ("pump",), "TradeEvent": ("pump",), "CompleteEvent": ("pump",),
-    "CompletePumpAmmMigrationEvent": ("pump",), "SetParamsEvent": ("pump",), "CollectCreatorFeeEvent": ("pump",),
-    "UpdateGlobalAuthorityEvent": ("pump",), "SetCreatorEvent": ("pump",), "SetMetaplexCreatorEvent": ("pump",),
-    "AdminSetCreatorEvent": ("pump",), "ReservesSyncedEvent": ("pump",), "AdminSetIdlAuthorityEvent": ("pump",),
-    "ReserveEvent": ("pump",), "CreateEventV2": ("pump",), "TradeEventV2": ("pump",),
-    "ExtendAccountEvent": ("pump", "pump_amm"), "ClaimTokenIncentivesEvent": ("pump", "pump_amm"),
-    "InitUserVolumeAccumulatorEvent": ("pump", "pump_amm"), "SyncUserVolumeAccumulatorEvent": ("pump", "pump_amm"),
-    "CloseUserVolumeAccumulatorEvent": ("pump", "pump_amm"), "AdminUpdateTokenIncentivesEvent": ("pump", "pump_amm"),
-    "BuyEvent": ("pump_amm",), "SellEvent": ("pump_amm",), "CreatePoolEvent": ("pump_amm",), "DepositEvent": ("pump_amm",),
-    "WithdrawEvent": ("pump_amm",), "DisableEvent": ("pump_amm",), "UpdateAdminEvent": ("pump_amm",),
-    "UpdateFeeConfigEvent": ("pump_amm",), "CollectCoinCreatorFeeEvent": ("pump_amm",), "SetCoinCreatorEvent": ("pump_amm",),
-    "AdminSetCoinCreatorEvent": ("pump_amm",), "CreateConfigEvent": ("pump_amm",), "UpdateConfigEvent": ("pump_amm",),
-    "BuyExactQuoteInEvent": ("pump_amm",), "SellExactQuoteOutEvent": ("pump_amm",),
+    **{n: ("pump",) for n in _PUMP_ONLY},
+    **{n: ("pump", "pump_amm") for n in _BOTH},
+    **{n: ("pump_amm",) for n in _AMM_ONLY},
 }
 
 # Event names of other Anchor programs commonly found in the same transactions (best guesses for
@@ -277,6 +318,16 @@ class _Reader:
 
     def i64(self) -> int:
         return struct.unpack("<q", self.take(8))[0]
+
+    def i128(self) -> int:
+        return int.from_bytes(self.take(16), "little", signed=True)
+
+    def vec_shareholder(self) -> list[dict[str, Any]]:
+        """Borsh Vec<Shareholder{address: pubkey, share_bps: u16}> (pump IDL 26 Oct 2026)."""
+        n = struct.unpack("<I", self.take(4))[0]
+        if n > 64 or n * 34 > self.remaining():
+            raise ValueError(f"vec length {n}")
+        return [{"address": self.pubkey(), "share_bps": self.u16()} for _ in range(n)]
 
     def bool(self) -> bool:
         v = self.take(1)[0]

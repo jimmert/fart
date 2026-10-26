@@ -93,12 +93,17 @@ def observe_meta(conn: sqlite3.Connection, m: dict[str, Any], as_of: float, now:
     return write_decision(conn, as_of, now, "observe_meta", None, m["term"], m, rules_version, "observe", reasons)
 
 
+def wants_promotion(f: dict[str, Any], wcfg: dict[str, Any]) -> bool:
+    """Pure threshold check (no database): enough early buyers for 'early_buyers'."""
+    return f["unique_buyers_5m"] >= int(wcfg.get("early_buyers_threshold", 10))
+
+
 def promote_watchlist(conn: sqlite3.Connection, f: dict[str, Any], now: float, wcfg: dict[str, Any]) -> str | None:
-    """Probation coin with enough early buyers -> 'early_buyers' (24 h)."""
+    """Probation coin with enough early buyers -> 'early_buyers' (24 h). Call inside a write transaction."""
     row = conn.execute("SELECT reason FROM watchlist WHERE mint=? AND active=1", (f["mint"],)).fetchone()
     if row is None or row["reason"] != "probation":
         return None
-    if f["unique_buyers_5m"] >= int(wcfg.get("early_buyers_threshold", 10)):
+    if wants_promotion(f, wcfg):
         watch.add(conn, f["mint"], "early_buyers", now, float(wcfg.get("ttl_s", 86400)), int(wcfg.get("cap", 200)))
         return "early_buyers"
     return None

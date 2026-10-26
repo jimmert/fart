@@ -151,14 +151,16 @@ def digest(day: str, rep: dict[str, Any], x_spend_usd: float | None, x_cap_usd: 
         return "onbekend" if x is None else f"{100 * float(x):.0f}%"
 
     gaps = cov.get("gap_seconds_by_source") or {}
+    status = "compleet" if rep.get("complete") else ("niet gedekt (fart draaide niet)" if rep.get("coverage_status") == "not_covered" else "niet compleet")
     lines = [
-        f"<b>Dagrapport {fmt_day(day)}</b> · {'compleet' if rep.get('complete') else 'niet compleet'}",
+        f"<b>Dagrapport {fmt_day(day)}</b> · {status}",
         "",
         f"graduaties: {n(u.get('graduations'))} (gemeten {n(u.get('measured'))}, bezig {n(u.get('pending'))}, ontbrekend {n(u.get('missing'))})",
         f"winnaars: {n(u.get('winners'))} · organisch {n(u.get('winners_organic'))} · gebundeld {n(u.get('winners_bundled'))} · onbekend {n(u.get('winners_bundled_unknown'))}",
         f"geobserveerd vóór eerste trade: {n(rc.get('decision_before_first_trade'))}/{n(rc.get('winners'))} · vóór graduatie: {n(rc.get('decision_before_graduation'))}/{n(rc.get('winners'))}",
         f"precisie observaties: {pct(p.get('precision'))} ({n(p.get('hits'))} raak van {n(p.get('known'))} bekend, {n(p.get('unknown'))} onbekend, {n(p.get('pending'))} bezig) · organisch {pct(p.get('precision_organic'))}",
-        f"dekking: {n(cov.get('hours_complete'))}/24 complete uren · creates {n(cov.get('creates_union'))} (PumpPortal {n(cov.get('creates_pp'))}, RPC {n(cov.get('creates_rpc'))}) · gaten: "
+        f"dekking: {n(cov.get('hours_complete'))}/24 complete uren" + (f", {n(cov.get('hours_covered'))}/24 gedekt" if cov.get("hours_covered") is not None else "")
+        + f" · creates {n(cov.get('creates_union'))} (PumpPortal {n(cov.get('creates_pp'))}, RPC {n(cov.get('creates_rpc'))}) · gaten: "
         + (", ".join(f"{esc(k)} {n(v)} s" for k, v in gaps.items()) if gaps else "geen"),
         ("X: niet geconfigureerd" if x_spend_usd is None else f"X: ${n(x_spend_usd, 2)}" + (f" van ${n(x_cap_usd, 2)}" if x_cap_usd else ""))
         + f" · RPC: {n(cu_spent)} CU" + (f" van {n(cu_cap)}" if cu_cap else ""),

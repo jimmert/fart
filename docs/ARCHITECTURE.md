@@ -1,11 +1,15 @@
-# Architecture (milestone 2)
+# Architecture (milestone 3)
 
 `fart` is a read-only consumer of public Solana / pump.fun data. It never signs, never trades.
 Milestone 1 delivered complete and redundant ingestion, an event-time data model in which hindsight
-is impossible, and honest outcome measurement. Milestone 2 adds per-mint trades over the RPC (PumpPortal
+is impossible, and honest outcome measurement. Milestone 2 added per-mint trades over the RPC (PumpPortal
 serves trades only to funded keys), pump-amm events, the Global-account check, an X confirmation layer
-and Telegram notifications to the owner through a durable outbox. Still no ML, no web UI, no trading,
-and the only outbound write anywhere is `sendMessage` to the owner chat.
+and Telegram notifications to the owner through a durable outbox. Milestone 3 repairs what the VPS
+showed: one way to write to SQLite (short `BEGIN IMMEDIATE` transactions with retries), a trade stream
+that only follows coins before graduation under an hourly CU envelope, system mints that can never
+become coins, a backup script the syscall filter tolerates, and a daily report that says "not covered"
+for hours fart was not running. Still no ML, no web UI, no trading, and the only outbound write anywhere
+is `sendMessage` to the owner chat.
 
 ## Processes
 
@@ -20,14 +24,18 @@ and the only outbound write anywhere is `sendMessage` to the owner chat.
 ```
 
 * **fart-ingest** (`fart/ingest/service.py`): one PumpPortal connection (`pumpportal.py`; trade
-  subscriptions only with `PUMPPORTAL_API_KEY`), one RPC `logsSubscribe` connection on the pump.fun mint
-  authority and migration account (`rpc_logs.py`), one RPC connection with a `logsSubscribe` per watched
-  mint (`rpc_trades.py`: bonding curve before graduation, pump-amm pool after it; cap 150; probation
-  dropped above 80% of the CU cap), a periodic signature sweep + bounded transaction backfill +
-  `getBlockTime` fill over HTTP RPC (`sweep.py`, `rpc_trades.fill_block_times`), hourly coverage rows
-  (`coverage.py`), weekly retention (`retention.py`), and a Global-account check at startup
+  subscriptions only with `PUMPPORTAL_API_KEY`; a migration is accepted only for a known coin and never
+  for a system mint), one RPC `logsSubscribe` connection on the pump.fun mint authority and migration
+  account (`rpc_logs.py`), one RPC connection with a `logsSubscribe` per watched mint **before
+  graduation** (`rpc_trades.py`: bonding curve; reasons probation / early_buyers / meta_burst; cap 150;
+  2,000 notifications per subscription per hour; the stream's own CU capped at 1/24 of the daily cap per
+  hour; probation dropped above 80% of the daily cap; graduated coins are measured by the tracker's
+  samples), a periodic signature sweep + bounded transaction backfill (migrations first, CU-based daily
+  limit) + `getBlockTime` fill over HTTP RPC (`sweep.py`, `rpc_trades.fill_block_times`), hourly coverage
+  rows (`coverage.py`), weekly retention (`retention.py`), and a Global-account check at startup
   (`chain/global_account.py`, logged only). Every raw message is written to
-  `data/raw/<source>/YYYYMMDD/HH.jsonl.gz` before normalization (`raw.py`).
+  `data/raw/<source>/YYYYMMDD/HH.jsonl.gz` before normalization (`raw.py`); `fart ingest replay` feeds
+  those files back to the handlers after a failure.
 * **fart-engine** (`fart/engine/service.py`): computes as-of features for watched mints and meta
   clusters (now including the X features and the latest fast mega post), promotes watchlist entries,
   writes `features_asof` and `decisions` (kind `observe` / `observe_meta`). Observations only.
@@ -41,10 +49,22 @@ and the only outbound write anywhere is `sendMessage` to the owner chat.
   measurement, writes due `outcomes` rows (+1 h / +6 h / +24 h) and the paper trade per decision.
 * **fart-measure-report** (`fart/measure/report.py`): the daily recall report to `out/recall/`.
 
-All processes share `data/fart.db` (SQLite, WAL, 5 s busy timeout, schema `PRAGMA user_version` 2) and
+All processes share `data/fart.db` (SQLite, WAL, 15 s busy timeout, schema `PRAGMA user_version` 3) and
 the budget lock file. Cross-process coordination happens through tables only: the engine writes the
 `watchlist`, the ingest daemon diffs it against its subscriptions every 5 s; the social daemon writes
 `decisions`, the notify daemon reads them.
+
+## Writing to SQLite (milestone 3)
+
+There is one way to write: `db.write_tx(conn, fn)` runs `fn` inside `BEGIN IMMEDIATE ... COMMIT` and
+retries a busy/locked error up to three times with a short jitter; `db.read_tx()` is a closed read-only
+snapshot for the heavy reads. No code outside `fart/db.py` issues a plain `BEGIN` any more: in WAL mode a
+deferred transaction that reads first and writes later fails at once with SQLITE_BUSY_SNAPSHOT when any
+other connection committed in between, and the busy handler is not consulted for that error. That is what
+stopped the engine on the VPS (the tick read features of 200 coins inside its transaction, then wrote).
+Rules: compute (features, clustering, decoding) and talk to the network outside every transaction, write
+in milliseconds, count what still fails (`engine.tick_failed`, `ingest.handle_failed.<source>`, with a
+per-day twin for the report) and keep the raw line replayable.
 
 ## The budget gate (`fart/net/budget.py`)
 
@@ -61,10 +81,13 @@ throttled to once per hour. `Budget.record()` writes the ledger row and updates 
 (last_ok/last_err/counts/latency EWMA/consecutive errors). `fart status` prints all of it.
 
 Websocket connects go through the same gate (`pumpportal.connect` is limited to 12 per hour;
-RPC `ws_connect`/`ws_subscribe`/`ws_unsubscribe`/`ws_notification` are accounted as estimated CU,
-aggregated per minute). At 80% of the RPC daily cap the trade stream keeps only the observe /
-early_buyers / meta_burst subscriptions; at the cap the log streams disconnect and the sweep pauses
-until the next UTC day; PumpPortal keeps running (graceful degradation).
+RPC `ws_connect`/`ws_subscribe`/`ws_unsubscribe`/`ws_notification` for the log stream and
+`ws_trade_notification`/`ws_trade_subscribe`/`ws_trade_unsubscribe` for the trade stream are accounted as
+estimated CU, aggregated per minute, so `fart status` shows the two streams apart). The trade stream has
+its own hourly envelope (1/24 of the daily cap on its own methods, unflushed counts included) and a
+per-subscription cap; at 80% of the RPC daily cap it keeps only the early_buyers / meta_burst
+subscriptions; at the cap the log streams disconnect and the sweep pauses until the next UTC day;
+PumpPortal keeps running (graceful degradation).
 
 The X source costs estimated USD per call (`X_DAILY_BUDGET_USD` hard cap, actual cost booked from the
 response: posts and author expansions billed once per UTC day) and adds a pacing policy on top
@@ -107,17 +130,23 @@ is a new row with a new version; nothing is ever updated in place.
 
 `coins.sources` is the JSON list of sources that saw a mint; `coverage` counts `creates_pp`,
 `creates_rpc`, `creates_union`, `grads`, `grads_without_create` per UTC hour, and `coverage_gaps`
-records every interval a stream was down (startup, disconnect, watchdog, budget cap, shutdown).
+records every interval a stream was down (startup, disconnect, watchdog, budget cap, shutdown, and `down`
+for a crash or host reboot, written at the next start from the previous heartbeat). A source counts from
+its first run; an hour is *covered* when a create source was active during part of it and *complete* only
+when a source ran through the whole hour without an unrecovered gap. A migration message naming a system
+mint (USDC, USDT, WSOL, PUMP) or, from PumpPortal, an unknown coin is refused into `rejected_messages`.
 
 ## Watchlist and trades
 
 Trades are stored only for watched mints (watchlist cap 200). Reasons in eviction order:
 `probation` (every new pump coin for its first 5 minutes, so early-buyer counts exist for every coin),
-`early_buyers` (promoted by the engine), `meta_burst`, `graduation` (24 h), `observe`. Entries expire
-by TTL or by idleness. Sources of trades: `rpc_trades` (TradeEvent on the bonding curve, decoded from
-the per-mint RPC subscription), `pump_amm` (BuyEvent/SellEvent on the pump-amm pool after graduation),
-`rpc_logs` (the dev buy inside the create transaction) and `pumpportal` (only with a funded key). A
-trade seen twice keeps one row and fills chain time where the first arrival lacked it.
+`early_buyers` (promoted by the engine), `meta_burst`, `graduation` (only with `subscribe_graduations`,
+off by default since milestone 3), `observe`. Entries expire by TTL or by idleness. Sources of trades:
+`rpc_trades` (TradeEvent on the bonding curve, decoded from the per-mint RPC subscription), `pump_amm`
+(BuyEvent/SellEvent whose pool maps to a known base mint, e.g. the first pool buy inside the migration
+transaction), `rpc_logs` (the dev buy inside the create transaction) and `pumpportal` (only with a funded
+key). A trade seen twice keeps one row and fills chain time where the first arrival lacked it. After
+graduation the tracker's 5-minute DexScreener samples carry the measurement.
 
 ## Social confirmation
 
@@ -146,9 +175,10 @@ per horizon from own trades (curve math times SOL/USD) and/or samples. Unknown s
 `rules_version`. Secrets live only in `$FART_ROOT/.env` (names in `.env.example`); URLs are
 logged as host only.
 
-## What comes after milestone 2
+## What comes after milestone 3
 
 * A measured week with frozen rules (one `rules_version`) before anything reaches a community chat;
   the daily digest and `out/recall/` are the yardstick.
-* Reconcile every estimate in `docs/UNVERIFIED.md` on the VPS: CU per method, X prices, the pump-amm
-  layouts, the Global account's newer fields.
+* Reconcile every estimate in `docs/UNVERIFIED.md` on the VPS, first of all whether Alchemy bills
+  websocket notifications (that decides how much of the trade stream the envelope lets through), then
+  CU per method, X prices and the real recordings that prove the event layouts byte for byte.

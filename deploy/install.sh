@@ -89,9 +89,14 @@ chmod 0640 "$FART_ROOT/.env"
 # --- database schema (idempotent; a no-op when already current) --------------------------------
 # Opening the database applies pending migrations (PRAGMA user_version). Doing it here, before the
 # daemons restart, means every service starts on the new schema. Safe while the old daemons run (WAL).
+# Milestone 3 (user_version 3) also removes the rows the USDC/PUMP "migrations" caused and prints
+# the counts (kv schema.v3.cleanup); a second run removes nothing.
 if [ -f "$FART_ROOT/data/fart.db" ]; then
-  if sudo -u "$FART_USER" "$FART_ROOT/bin/fart" --quiet --json status >/dev/null 2>&1; then
-    log "database schema: $(sudo -u "$FART_USER" "$FART_ROOT/bin/fart" --quiet --json status 2>/dev/null | "$VENV/bin/python" -c 'import json,sys; print("user_version", json.load(sys.stdin).get("schema_version"))')"
+  if STATUS_JSON="$(sudo -u "$FART_USER" "$FART_ROOT/bin/fart" --quiet --json status 2>/dev/null)"; then
+    log "database schema: $(printf '%s' "$STATUS_JSON" | "$VENV/bin/python" -c 'import json,sys
+d = json.load(sys.stdin)
+c = d.get("schema_v3_cleanup") or {}
+print("user_version", d.get("schema_version"), "| v3 cleanup of system-mint rows:", json.dumps(c.get("deleted")) if c else "not run")')"
   else
     log "WARNING: schema check failed (fart status); the daemons will retry the migration on start"
   fi
@@ -131,4 +136,5 @@ echo "  journalctl -u fart-ingest -n 50 --no-pager"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart coverage --hours 3"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart chain global        # Global account vs config/pumpfun.json"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart events classify     # undecoded event discriminators"
+echo "  systemctl start fart-backup.service && systemctl show -p Result,ExecMainStatus fart-backup.service   # backup fix (M3)"
 echo "  tail -f $FART_ROOT/logs/ingest.log"

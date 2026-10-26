@@ -5,6 +5,12 @@ Universe = all graduations of the day from our own stream, with coverage. For ev
 first trade / before graduation (lead time, negative allowed). Precision of the day's observe
 decisions, paper results with and without bundled coins, coverage gaps, a `complete` flag,
 rules_version and method_version. Output: out/recall/<day>.json and .md (Dutch), atomic.
+
+Honesty rules (milestone 3): the coverage hours are recomputed live (never from stale rows); an
+hour fart was not running is "not covered"; a day without a covered hour is NIET GEDEKT and every
+percentage stays empty; the enrich limit (getTransaction budget), the queue backlog and the
+failure counters of the day (engine ticks, ingest handlers, refused messages, trade-stream caps)
+are part of the report so a quiet day is never mistaken for a complete one.
 """
 from __future__ import annotations
 
@@ -17,6 +23,7 @@ from .. import db
 from ..config import Settings
 from ..engine.meta import load_stopwords, tokenize
 from ..ingest import coverage as cov
+from ..ingest.sweep import enrich_backlog, enrich_daily_limit
 from ..log import get_logger
 from ..util import atomic_write_json, atomic_write_text, day_bounds, hour_key, now as wall_now, utc_iso
 from ..version import rules_version
@@ -78,24 +85,17 @@ def build_report(conn: sqlite3.Connection, settings: Settings, day: str, now: fl
     h24 = max(int(h) for h in cfg["horizons_s"])
     stopwords = load_stopwords(settings.config("stopwords"))
 
-    # ----- coverage -------------------------------------------------------------------------------
-    hours = []
-    for i in range(24):
-        hk = hour_key(start + i * 3600)
-        row = conn.execute("SELECT * FROM coverage WHERE hour=?", (hk,)).fetchone()
-        if row is None:
-            c = cov.compute_hour(conn, hk, now)
-        else:
-            c = dict(row)
-            c["gaps"] = json.loads(c.pop("gaps_json") or "[]")
-            c["complete"] = bool(c["complete"])
-        hours.append(c)
+    # ----- coverage (always recomputed: stored rows may predate a downtime gap) ----------------------
+    hours = [cov.compute_hour(conn, hour_key(start + i * 3600), now) for i in range(24)]
     gap_seconds: dict[str, float] = {}
     for h in hours:
         for g in h["gaps"]:
             gap_seconds[g["source"]] = gap_seconds.get(g["source"], 0.0) + float(g["seconds"])
+    first_start = min((v for v in (cov.source_active_since(conn, s) for s in cov.CREATE_SOURCES) if v is not None), default=None)
     coverage_summary = {
         "hours_complete": sum(1 for h in hours if h["complete"]),
+        "hours_covered": sum(1 for h in hours if h["covered"]),
+        "first_source_start": utc_iso(first_start) if first_start is not None else None,
         "creates_pp": sum(h["creates_pp"] or 0 for h in hours),
         "creates_rpc": sum(h["creates_rpc"] or 0 for h in hours),
         "creates_union": sum(h["creates_union"] or 0 for h in hours),
@@ -103,7 +103,28 @@ def build_report(conn: sqlite3.Connection, settings: Settings, day: str, now: fl
         "grads_without_create": sum(h["grads_without_create"] or 0 for h in hours),
         "gap_seconds_by_source": {k: round(v) for k, v in gap_seconds.items()},
         "hours": [{"hour": h["hour"], "creates_union": h["creates_union"], "grads": h["grads"], "complete": h["complete"],
-                   "gap_s": round(sum(float(g["seconds"]) for g in h["gaps"]))} for h in hours],
+                   "covered": h["covered"], "gap_s": round(sum(float(g["seconds"]) for g in h["gaps"]))} for h in hours],
+    }
+    covered = coverage_summary["hours_covered"] > 0
+
+    # ----- enrichment limit and the day's failures ---------------------------------------------------
+    icfg = settings.config("ingest")
+    bcfg = dict(icfg.get("backfill", {}))
+    bcfg.update(icfg.get("enrich", {}))
+    rpc_src = settings.config("budget")["sources"].get("rpc_public" if settings.rpc_is_public else "rpc", {})
+    tx_cost = float((rpc_src.get("cost_table") or {}).get("getTransaction", rpc_src.get("cost_default", 59)))
+    cap = None if settings.rpc_is_public else float(settings.rpc_daily_budget_cu)
+    limit_kv = db.kv_get(conn, f"enrich.limit.{day}")
+    kvi = lambda key: int(db.kv_get(conn, key, "0") or 0)  # noqa: E731
+    rejected = {r[0]: int(r[1]) for r in conn.execute(
+        "SELECT reason, COUNT(*) FROM rejected_messages WHERE received_at >= ? AND received_at < ? GROUP BY reason ORDER BY 2 DESC", (start, end))}
+    ops = {
+        "enrich": {"used": kvi(f"enrich.tx.{day}"), "limit": int(limit_kv) if limit_kv else enrich_daily_limit(bcfg, cap, tx_cost),
+                   "skipped_budget": kvi(f"enrich.skipped_budget.{day}"), "backlog": enrich_backlog(conn, int(bcfg.get("max_attempts", 3)))},
+        "engine_tick_failed": kvi(f"engine.tick_failed.{day}"),
+        "handle_failed": {s: kvi(f"ingest.handle_failed.{s}.{day}") for s in ("pumpportal", "rpc_logs", "rpc_trades")},
+        "rejected_messages": rejected,
+        "rpc_trades": {"subscription_capped": kvi(f"rpc_trades.subscription_capped.{day}"), "envelope_paused": kvi(f"rpc_trades.envelope_paused.{day}")},
     }
 
     # ----- universe: graduations of the day --------------------------------------------------------
@@ -244,7 +265,7 @@ def build_report(conn: sqlite3.Connection, settings: Settings, day: str, now: fl
     paper = {"all": paper_summary(paper_rows), "without_bundled": paper_summary([r for r in paper_rows if r["bundled"] is not True]),
              "bundled_only": paper_summary([r for r in paper_rows if r["bundled"] is True])}
 
-    complete = coverage_summary["hours_complete"] == 24 and counts["pending"] == 0 and counts["missing"] == 0
+    complete = covered and coverage_summary["hours_complete"] == 24 and counts["pending"] == 0 and counts["missing"] == 0
     return {
         "day": day,
         "generated_at": utc_iso(now),
@@ -252,6 +273,9 @@ def build_report(conn: sqlite3.Connection, settings: Settings, day: str, now: fl
         "rules_versions_in_decisions": rules_versions,
         "method_version": mv,
         "complete": complete,
+        "covered": covered,
+        "coverage_status": "complete" if complete else ("incomplete" if covered else "not_covered"),
+        "ops": ops,
         "winner_definition": cfg["winner"],
         "paper_cfg": cfg["paper"],
         "coverage": coverage_summary,
@@ -268,6 +292,7 @@ def build_report(conn: sqlite3.Connection, settings: Settings, day: str, now: fl
             "decisions_outcome_unknown": prec["unknown"],
             "decisions_pending": prec["pending"],
             "graduations_without_create": counts["without_create"],
+            "hours_not_covered": 24 - coverage_summary["hours_covered"],
         },
         "graduations": universe,
     }
@@ -281,37 +306,73 @@ def _n(x: Any) -> str:
     return "onbekend" if x is None else (f"{x:,.0f}" if isinstance(x, float) else str(x))
 
 
+STATUS_NL = {"complete": "COMPLEET", "incomplete": "NIET COMPLEET", "not_covered": "NIET GEDEKT"}
+
+
 def render_markdown(r: dict[str, Any]) -> str:
     c, u, rc, p, pa, cvg = r["coverage"], r["universe"], r["recall"], r["precision"], r["paper"], r["coverage"]
+    status = r.get("coverage_status") or ("complete" if r["complete"] else "incomplete")
+    blank = status == "not_covered"
+    pct = (lambda x: "–") if blank else _pct  # a day without coverage has no percentages, only unknowns
+    ops = r.get("ops") or {}
     lines = [
         f"# Dagrapport recall {r['day']}",
         "",
         f"Gegenereerd {r['generated_at']} · rules_version {r['rules_version_now']} · method_version {r['method_version']} · "
-        f"**{'COMPLEET' if r['complete'] else 'NIET COMPLEET'}**",
+        f"**{STATUS_NL.get(status, status)}**",
         "",
+    ]
+    if blank:
+        lines += [
+            f"**Geen enkel uur van deze dag was gedekt**: fart draaide niet (eerste start van een bron: "
+            f"{cvg.get('first_source_start') or 'onbekend'}). Alle percentages hieronder zijn leeg; het universum is onbekend, niet leeg.",
+            "",
+        ]
+    lines += [
         "## Samenvatting",
         "",
-        f"- Graduaties in ons eigen universum: **{u['graduations']}** (gemeten {u['measured']}, nog bezig {u['pending']}, ontbrekend {u['missing']})",
+        f"- Graduaties in ons eigen universum: **{u['graduations']}** (gemeten {u['measured']}, nog bezig {u['pending']}, ontbrekend {u['missing']})"
+        + (" · universum NIET GEDEKT" if blank else ""),
         f"- Winnaars (piek ≥ ${r['winner_definition']['peak_mcap_usd']:,} én volume ≥ ${r['winner_definition']['min_volume_usd']:,} binnen 24 u): "
         f"**{u['winners']}** waarvan organisch {u['winners_organic']}, gebundeld {u['winners_bundled']}, bundeling onbekend {u['winners_bundled_unknown']}",
         f"- Winnaars met een `observe`-beslissing vóór graduatie: **{rc['decision_before_graduation']}/{rc['winners']}** "
-        f"({_pct(rc['recall_before_graduation'])}); organisch: {_pct(rc['recall_organic_before_graduation'])}",
+        f"({pct(rc['recall_before_graduation'])}); organisch: {pct(rc['recall_organic_before_graduation'])}",
         f"- Winnaars met een thema-beslissing vóór graduatie: {rc['theme_before_graduation']}/{rc['winners']}",
-        f"- Precisie van de {p['decisions']} `observe`-beslissingen van deze dag: {_pct(p['precision'])} "
+        f"- Precisie van de {p['decisions']} `observe`-beslissingen van deze dag: {pct(p['precision'])} "
         f"({p['hits']} raak van {p['known']} bekend; {p['unknown']} onbekend, {p['pending']} nog bezig)",
         "",
         "## Dekking (coverage)",
         "",
-        f"- Complete uren: {cvg['hours_complete']}/24",
+        f"- Gedekte uren: {cvg.get('hours_covered', 'onbekend')}/24 · complete uren: {cvg['hours_complete']}/24"
+        + (f" · eerste start van een bron: {cvg['first_source_start']}" if cvg.get("first_source_start") else " · geen bron heeft ooit gedraaid"),
         f"- Creates: PumpPortal {cvg['creates_pp']}, RPC {cvg['creates_rpc']}, unie {cvg['creates_union']}",
         f"- Graduaties: {cvg['grads']}, waarvan zonder bekende create: {cvg['grads_without_create']}",
         f"- Gaten (seconden per bron): {json.dumps(cvg['gap_seconds_by_source']) if cvg['gap_seconds_by_source'] else 'geen'}",
         "",
-        "| uur (UTC) | creates | grads | gat (s) | compleet |",
-        "|---|---:|---:|---:|---|",
+        "| uur (UTC) | creates | grads | gat (s) | gedekt | compleet |",
+        "|---|---:|---:|---:|---|---|",
     ]
     for h in cvg["hours"]:
-        lines.append(f"| {h['hour']} | {_n(h['creates_union'])} | {_n(h['grads'])} | {h['gap_s']} | {'ja' if h['complete'] else 'nee'} |")
+        lines.append(f"| {h['hour']} | {_n(h['creates_union'])} | {_n(h['grads'])} | {h['gap_s']} | "
+                     f"{'ja' if h.get('covered') else 'nee'} | {'ja' if h['complete'] else 'nee'} |")
+    if ops:
+        en = ops.get("enrich", {})
+        bl = en.get("backlog", {})
+        hf = ops.get("handle_failed", {})
+        rt = ops.get("rpc_trades", {})
+        rej = ops.get("rejected_messages", {})
+        lines += [
+            "",
+            "## Verrijking en fouten",
+            "",
+            f"- Verrijking (getTransaction van gemiste creates/graduaties): {_n(en.get('used'))} van {_n(en.get('limit'))} vandaag gebruikt, "
+            f"{_n(en.get('skipped_budget'))} keer overgeslagen door de limiet; wachtrij nu: {_n(bl.get('migrate_tx'))} migraties, "
+            f"{_n(bl.get('create_tx'))} creates (migraties gaan voor)",
+            f"- Mislukte engine-ticks: {_n(ops.get('engine_tick_failed'))}",
+            f"- Mislukte ingest-handlers: " + ", ".join(f"{k} {_n(v)}" for k, v in hf.items()),
+            f"- Geweigerde berichten: " + (", ".join(f"{k} {_n(v)}" for k, v in rej.items()) if rej else "geen"),
+            f"- Trade-stroom: {_n(rt.get('subscription_capped'))} abonnementen afgekapt, {_n(rt.get('envelope_paused'))} keer gepauzeerd door de uurenvelop",
+        ]
     lines += [
         "",
         "## Winnaars",
@@ -341,7 +402,7 @@ def render_markdown(r: dict[str, Any]) -> str:
         "## Precisie van observaties",
         "",
         f"- Beslissingen: {p['decisions']} ({p['distinct_mints']} munten); bekend {p['known']}, raak {p['hits']}, mis {p['misses']}, onbekend {p['unknown']}, nog bezig {p['pending']}",
-        f"- Precisie: {_pct(p['precision'])}; organisch: {_pct(p['precision_organic'])} ({p['hits_organic']}/{p['known_organic']})",
+        f"- Precisie: {pct(p['precision'])}; organisch: {pct(p['precision_organic'])} ({p['hits_organic']}/{p['known_organic']})",
         f"- Gebundeld {p['bundled']} · organisch {p['organic']} · onbekend {p['bundled_unknown']}",
         "",
         "## Paper trades",
@@ -353,7 +414,7 @@ def render_markdown(r: dict[str, Any]) -> str:
         s = pa[k]
         tot = "onbekend" if s["pnl_sol_total"] is None else f"{s['pnl_sol_total']:.4f}"
         mean = "onbekend" if s["pnl_sol_mean"] is None else f"{s['pnl_sol_mean']:.4f}"
-        lines.append(f"| {label} | {s['trades']} | {s['with_exit']} | {s['no_exit']} | {tot} | {mean} | {_pct(s['win_rate'])} | "
+        lines.append(f"| {label} | {s['trades']} | {s['with_exit']} | {s['no_exit']} | {tot} | {mean} | {pct(s['win_rate'])} | "
                      f"{json.dumps(s['exit_reasons'])} |")
     lines += [
         "",
@@ -386,7 +447,7 @@ def run_report(settings: Settings, day: str) -> int:
         atomic_write_json(out_dir / f"{day}.json", rep)
         atomic_write_text(out_dir / f"{day}.md", render_markdown(rep))
         db.kv_set(conn, "measure.report.last_run", str(now), now)
-        log.info("report.written", day=day, complete=rep["complete"], winners=rep["universe"]["winners"], graduations=rep["universe"]["graduations"])
+        log.info("report.written", day=day, status=rep["coverage_status"], winners=rep["universe"]["winners"], graduations=rep["universe"]["graduations"])
     finally:
         conn.close()
     return 0

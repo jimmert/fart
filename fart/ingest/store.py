@@ -2,18 +2,90 @@
 
 Chain time (slot, block_time) and our clock (received_at) are always separate columns. Rows
 seen by several sources are merged: details are filled where missing, `sources` is the union.
+
+Milestone 3 guards: a mint on the configurable system-mint list (USDC, USDT, WSOL, PUMP;
+config/pumpfun.json -> system_mints) is never a coin, a migration or a watchlist candidate, and a
+PumpPortal migration is only accepted for a coin we know (`coins`). A refused message is kept in
+`rejected_messages` with its reason. pump-amm swaps get their mint exclusively through the pool ->
+base-mint mapping (CreatePoolEvent in the same transaction or `migrations.pool_address`).
 """
 from __future__ import annotations
 
 import json
 import sqlite3
-from typing import Any
+from typing import Any, Callable
 
 from ..chain.events import DecodedEvent, Undecoded
+from ..db import counter_bump as _db_counter_bump
 from ..util import fnum
 
 RPC_SOURCES = ("rpc_logs", "rpc_sigs", "rpc_backfill", "rpc_tx", "rpc_trades")
 TRADE_SOURCES = ("pumpportal", "rpc_logs", "rpc_trades", "pump_amm")
+
+# Fallback when config/pumpfun.json carries no list (the schema-v3 cleanup uses the same addresses).
+DEFAULT_SYSTEM_MINTS = {
+    "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "USDT": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "WSOL": "So11111111111111111111111111111111111111112",
+    "PUMP": "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn",
+}
+MAX_REJECTED_JSON = 4000
+
+
+def system_mints(pumpfun_cfg: dict[str, Any] | None) -> dict[str, str]:
+    """label -> mint. The list is configurable; the defaults cover what the VPS saw on 26 Oct 2026."""
+    raw = (pumpfun_cfg or {}).get("system_mints")
+    if isinstance(raw, dict) and raw:
+        return {str(k): str(v) for k, v in raw.items() if not str(k).startswith("_")}
+    if isinstance(raw, list) and raw:
+        return {str(m): str(m) for m in raw}
+    return dict(DEFAULT_SYSTEM_MINTS)
+
+
+def system_mint_label(mint: str | None, pumpfun_cfg: dict[str, Any] | None) -> str | None:
+    """The label (USDC, PUMP, ...) when `mint` is a system mint, else None."""
+    if not mint:
+        return None
+    for label, m in system_mints(pumpfun_cfg).items():
+        if m == mint:
+            return label
+    return None
+
+
+def coin_known(conn: sqlite3.Connection, mint: str | None) -> bool:
+    """A create was confirmed by any source (PumpPortal, the RPC stream or the backfill)."""
+    if not mint:
+        return False
+    return conn.execute("SELECT 1 FROM coins WHERE mint=?", (mint,)).fetchone() is not None
+
+
+def reject_message(conn: sqlite3.Connection, source: str, kind: str | None, reason: str, mint: str | None, msg: Any,
+                   received_at: float, raw_ref: str | None = None) -> int:
+    """Keep a refused message (bounded JSON) and count it: kv `ingest.rejected.<source>.<reason>`."""
+    try:
+        raw = json.dumps(msg, separators=(",", ":"), ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        raw = str(msg)
+    cur = conn.execute(
+        "INSERT INTO rejected_messages(received_at, source, kind, reason, mint, raw_json, raw_ref) VALUES(?,?,?,?,?,?,?)",
+        (received_at, source, kind, reason, mint, raw[:MAX_REJECTED_JSON], raw_ref),
+    )
+    counter_bump(conn, f"ingest.rejected.{source}.{reason}", 1, received_at)
+    return int(cur.lastrowid)
+
+
+def migration_rejection(conn: sqlite3.Connection, mint: str | None, pumpfun_cfg: dict[str, Any] | None,
+                        require_known_coin: bool) -> str | None:
+    """Why a migration / watchlist candidate must be refused: 'no_mint', 'system_mint:<label>' or
+    'unknown_coin' (only when `require_known_coin`); None when it is acceptable."""
+    if not mint:
+        return "no_mint"
+    label = system_mint_label(mint, pumpfun_cfg)
+    if label is not None:
+        return f"system_mint:{label}"
+    if require_known_coin and not coin_known(conn, mint):
+        return "unknown_coin"
+    return None
 
 
 def _sources_union(existing: str | None, new: str) -> str:
@@ -26,10 +98,12 @@ def _sources_union(existing: str | None, new: str) -> str:
     return json.dumps(cur)
 
 
-def upsert_coin(conn: sqlite3.Connection, rec: dict[str, Any], source: str, received_at: float, raw_ref: str | None = None) -> bool:
-    """Insert or merge a create record. Returns True when the mint was new."""
+def upsert_coin(conn: sqlite3.Connection, rec: dict[str, Any], source: str, received_at: float, raw_ref: str | None = None,
+                pumpfun_cfg: dict[str, Any] | None = None) -> bool:
+    """Insert or merge a create record. Returns True when the mint was new. A system mint (USDC, WSOL,
+    PUMP, ...) is never a coin and is ignored."""
     mint = rec.get("mint")
-    if not mint:
+    if not mint or system_mint_label(mint, pumpfun_cfg) is not None:
         return False
     row = conn.execute("SELECT * FROM coins WHERE mint=?", (mint,)).fetchone()
     if row is None:
@@ -220,23 +294,53 @@ def records_from_events(events: list[DecodedEvent], signature: str | None, slot:
     return out
 
 
-def pump_amm_trade_records(events: list[DecodedEvent], signature: str | None, slot: int | None, mint: str,
-                           expected_pool: str | None) -> tuple[list[dict[str, Any]], list[str]]:
-    """pump-amm BuyEvent/SellEvent -> trade records for `mint` (the subscription tells us the mint;
-    the event only carries the pool). Returns (records, rejected_reasons). An event whose `pool` differs
-    from the pool we subscribed to is rejected: that is the layout self-check (docs/PUMPFUN-EVENTS.md).
+def pool_base_mints(events: list[DecodedEvent], wsol_mint: str | None = None) -> dict[str, str | None]:
+    """pool -> base mint from the CreatePoolEvents of one transaction. A pool whose quote mint is not
+    WSOL maps to None (its amounts are not lamports; such a pool is never a trade source for us)."""
+    out: dict[str, str | None] = {}
+    for e in events:
+        if e.name != "CreatePoolEvent":
+            continue
+        f = e.fields
+        pool, base, quote = f.get("pool"), f.get("base_mint"), f.get("quote_mint")
+        if not pool or not base:
+            continue
+        out[pool] = base if (wsol_mint is None or quote is None or quote == wsol_mint) else None
+    return out
 
-    Amounts: quote = WSOL lamports, base = token base units (6 decimals) - TO VERIFY. The pool reserves
-    in the event are stored as virtual_sol/virtual_token so the price/mcap math works unchanged.
+
+def pump_amm_trade_records(events: list[DecodedEvent], signature: str | None, slot: int | None,
+                           lookup_pool: Callable[[str], str | None] | None = None,
+                           wsol_mint: str | None = None) -> tuple[list[dict[str, Any]], list[str]]:
+    """pump-amm BuyEvent/SellEvent -> trade records. The event only carries the pool; the mint comes
+    EXCLUSIVELY from the pool -> base-mint mapping: a CreatePoolEvent in the same transaction, else
+    `lookup_pool(pool)` (migrations.pool_address). Returns (records, rejected_reasons):
+    `pool_unknown` (no mapping: never guess the mint from the subscription), `quote_not_wsol` (pool
+    quoted in another mint: amounts would not be lamports), `suspect_layout`, `missing_amounts`.
+
+    Amounts: quote = WSOL lamports, base = token base units (6 decimals); the pool reserves in the
+    event are stored as virtual_sol/virtual_token so the price/mcap math works unchanged.
     """
     out: list[dict[str, Any]] = []
     rejected: list[str] = []
+    known = pool_base_mints(events, wsol_mint)
     swaps = [e for e in events if e.name in ("BuyEvent", "SellEvent")]
     for i, e in enumerate(swaps):
         f = e.fields
-        if expected_pool and f.get("pool") and f["pool"] != expected_pool:
-            rejected.append("pool_mismatch")
+        pool = f.get("pool")
+        if not pool:
+            rejected.append("pool_unknown")
             continue
+        if pool in known:
+            mint = known[pool]
+            if mint is None:
+                rejected.append("quote_not_wsol")
+                continue
+        else:
+            mint = lookup_pool(pool) if lookup_pool is not None else None
+            if not mint:
+                rejected.append("pool_unknown")
+                continue
         if any("implausible" in s for s in e.suspect):
             rejected.append("suspect_layout")
             continue
@@ -253,16 +357,23 @@ def pump_amm_trade_records(events: list[DecodedEvent], signature: str | None, sl
             "sol": sol_lamports / 1e9, "tokens": tokens_base / 1e6,
             "virtual_sol": f.get("pool_quote_token_reserves"), "virtual_token": f.get("pool_base_token_reserves"),
             "slot": slot, "block_time": ts if isinstance(ts, int) and not any("timestamp" in s for s in e.suspect) else None,
-            "pool": f.get("pool"),
+            "pool": pool,
         })
     return out, rejected
 
 
+def mint_of_pool(conn: sqlite3.Connection, pool: str) -> str | None:
+    """migrations.pool_address -> mint (filled by CompletePumpAmmMigrationEvent / CreatePoolEvent / backfill)."""
+    row = conn.execute("SELECT mint FROM migrations WHERE pool_address=? LIMIT 1", (pool,)).fetchone()
+    return row["mint"] if row is not None else None
+
+
 def pool_from_create_pool_event(events: list[DecodedEvent]) -> dict[str, Any] | None:
-    """pump-amm CreatePoolEvent (in the migration transaction) -> {mint, pool_address} when both decoded."""
+    """pump-amm CreatePoolEvent (in the migration transaction) -> {mint, pool_address, quote_mint} when decoded."""
     for e in events:
         if e.name == "CreatePoolEvent" and e.fields.get("base_mint") and e.fields.get("pool"):
-            return {"mint": e.fields["base_mint"], "pool_address": e.fields["pool"], "dex": "pump-amm"}
+            return {"mint": e.fields["base_mint"], "pool_address": e.fields["pool"], "dex": "pump-amm",
+                    "quote_mint": e.fields.get("quote_mint")}
     return None
 
 
@@ -288,8 +399,4 @@ def store_undecoded(conn: sqlite3.Connection, items: list[Undecoded], source: st
 
 
 def counter_bump(conn: sqlite3.Connection, key: str, n: int = 1, ts: float = 0.0) -> None:
-    conn.execute(
-        "INSERT INTO kv(key, value, updated_at) VALUES(?, ?, ?)"
-        " ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+? AS TEXT), updated_at=?",
-        (key, str(n), ts, n, ts),
-    )
+    _db_counter_bump(conn, key, n, ts)

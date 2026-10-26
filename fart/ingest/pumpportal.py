@@ -7,6 +7,12 @@ funded with at least some balance" and never sends a trade (VPS, 26 Oct 2026). W
 client is creates + migrations only and trades come from the RPC (`rpc_trades.py`). Every raw
 message is written to the hourly gzip store before normalization. Connects go through the budget
 gate (max 12 per hour). The connection URL may carry the key and is never logged.
+
+Milestone 3: a migration message is accepted only for a coin we know and never for a system mint
+(USDC, PUMP, ...: on 26 Oct 2026 PumpPortal put those in the `mint` field and they ended up on the
+watchlist); a refused message lands in `rejected_messages`. Every write is one short
+`BEGIN IMMEDIATE` transaction with retries; a handler that still fails is counted
+(`ingest.handle_failed.pumpportal`) and its raw hour file can be replayed (`fart ingest replay`).
 """
 from __future__ import annotations
 
@@ -18,6 +24,7 @@ import sqlite3
 import time
 from typing import Any, Callable
 
+from .. import db
 from ..db import kv_set
 from ..log import Throttle, get_logger
 from ..net.budget import Budget
@@ -54,6 +61,7 @@ class PumpPortalClient:
         connect: Callable[..., Any] | None = None,
         clock: Callable[[], float] = wall_now,
         trades_enabled: bool = False,
+        pumpfun_cfg: dict[str, Any] | None = None,
     ):
         self.conn = conn
         self.budget = budget
@@ -61,8 +69,12 @@ class PumpPortalClient:
         self.url = url
         self.cfg = cfg
         self.watch_cfg = watch_cfg
+        self.pf = pumpfun_cfg or {}
         self.clock = clock
         self.trades_enabled = trades_enabled
+        self.replay = False  # `fart ingest replay`: data writes only (no raw copy, no counters, no kv)
+        self.failures = 0
+        self._pending_failures = 0
         self._throttle = Throttle(3600)
         if connect is None:
             import websockets  # imported lazily so tests can run without the package
@@ -83,47 +95,80 @@ class PumpPortalClient:
             msg = json.loads(text)
         except json.JSONDecodeError:
             msg = None
-        ref = self.raw.write(msg if msg is not None else text, received_at)
+        ref = None if self.replay else self.raw.write(msg if msg is not None else text, received_at)
         kind = store.classify_pumpportal(msg) if msg is not None else "unparseable"
         self.counts[kind] = self.counts.get(kind, 0) + 1
         self.messages += 1
         cap = int(self.watch_cfg.get("cap", 200))
-        self.conn.execute("BEGIN")
-        try:
+        notes: dict[str, Any] = {}
+
+        def _apply(c: sqlite3.Connection) -> None:
+            notes.clear()
             if kind == "create":
                 rec = store.pumpportal_create_record(msg)
-                new = store.upsert_coin(self.conn, rec, SOURCE, received_at, raw_ref=ref)
+                new = store.upsert_coin(c, rec, SOURCE, received_at, raw_ref=ref, pumpfun_cfg=self.pf)
                 if new and rec.get("mint") and (rec.get("platform") or "pump") == "pump" and self.watch_cfg.get("probation", True):
-                    watch.add(self.conn, rec["mint"], "probation", received_at, float(self.watch_cfg.get("early_window_s", 300)), cap)
+                    watch.add(c, rec["mint"], "probation", received_at, float(self.watch_cfg.get("early_window_s", 300)), cap)
             elif kind == "trade":
                 rec = store.pumpportal_trade_record(msg)
-                if rec.get("mint") and watch.is_watched(self.conn, rec["mint"]):
-                    store.insert_trade(self.conn, rec, SOURCE, received_at)
+                if rec.get("mint") and watch.is_watched(c, rec["mint"]):
+                    store.insert_trade(c, rec, SOURCE, received_at)
                 else:
-                    self.counts["trade_unwatched"] = self.counts.get("trade_unwatched", 0) + 1
+                    notes["trade_unwatched"] = 1
             elif kind == "migrate":
                 rec = store.pumpportal_migration_record(msg)
-                store.upsert_migration(self.conn, rec, SOURCE, received_at)
-                if rec.get("mint") and self.watch_cfg.get("subscribe_graduations", True):
-                    watch.add(self.conn, rec["mint"], "graduation", received_at, float(self.watch_cfg.get("ttl_s", 86400)), cap)
+                why = store.migration_rejection(c, rec.get("mint"), self.pf, require_known_coin=True)
+                if why is not None:
+                    notes["rejected"] = why
+                    if not self.replay:
+                        store.reject_message(c, SOURCE, "migrate", why, rec.get("mint"), msg, received_at, ref)
+                else:
+                    store.upsert_migration(c, rec, SOURCE, received_at)
+                    if self.watch_cfg.get("subscribe_graduations", False):
+                        watch.add(c, rec["mint"], "graduation", received_at, float(self.watch_cfg.get("ttl_s", 86400)), cap)
             elif kind == "info":
                 text_l = str(msg)
                 if _REFUSAL_RE.search(text_l) and "trade" in text_l.lower():
                     # the funded-key refusal of subscribeTokenTrade; without a key we never send it
-                    store.counter_bump(self.conn, "pp.trade_sub_refused", 1, received_at)
-                    kv_set(self.conn, "ingest.pumpportal.trade_sub_refused_at", str(received_at), received_at)
-                    if self._throttle.allow("refusal", received_at):
-                        log.warning("pp.trade_subscription_refused", trades_enabled=self.trades_enabled, text=text_l[:200])
+                    notes["refusal"] = text_l[:200]
+                    if not self.replay:
+                        store.counter_bump(c, "pp.trade_sub_refused", 1, received_at)
+                        kv_set(c, "ingest.pumpportal.trade_sub_refused_at", str(received_at), received_at)
                 else:
-                    log.info("pp.info", text=text_l[:200])
-            else:
-                store.counter_bump(self.conn, "pp.unknown_messages", 1, received_at)
-            kv_set(self.conn, "ingest.pumpportal.last_msg_at", str(received_at), received_at)
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
+                    notes["info"] = text_l[:200]
+            elif not self.replay:
+                store.counter_bump(c, "pp.unknown_messages", 1, received_at)
+            if not self.replay:
+                kv_set(c, "ingest.pumpportal.last_msg_at", str(received_at), received_at)
+                if self._pending_failures:
+                    db.counter_bump(c, f"ingest.handle_failed.{SOURCE}", self._pending_failures, received_at)
+                    db.counter_bump(c, f"ingest.handle_failed.{SOURCE}.{db.day_of(received_at)}", self._pending_failures, received_at)
+
+        try:
+            db.write_tx(self.conn, _apply, what="pumpportal.handle")
+        except sqlite3.OperationalError as e:
+            self._handle_failed(received_at, ref, e)
             raise
+        self._pending_failures = 0
+        if "trade_unwatched" in notes:
+            self.counts["trade_unwatched"] = self.counts.get("trade_unwatched", 0) + 1
+        if "rejected" in notes:
+            self.counts["migrate_rejected"] = self.counts.get("migrate_rejected", 0) + 1
+            if self._throttle.allow(f"rejected:{notes['rejected']}", received_at):
+                log.warning("pp.migration_rejected", reason=notes["rejected"], mint=(msg or {}).get("mint"), raw_ref=ref,
+                            note="stored in rejected_messages; see docs/PUMPFUN-EVENTS.md")
+        if "refusal" in notes and self._throttle.allow("refusal", received_at):
+            log.warning("pp.trade_subscription_refused", trades_enabled=self.trades_enabled, text=notes["refusal"])
+        if "info" in notes:
+            log.info("pp.info", text=notes["info"])
         return kind
+
+    def _handle_failed(self, received_at: float, ref: str | None, exc: BaseException) -> None:
+        self.failures += 1
+        self._pending_failures += 1
+        detail = f"{ref or '-'} {type(exc).__name__}: {str(exc)[:120]}"
+        if db.record_failure(self.conn, f"ingest.handle_failed.{SOURCE}", received_at, self._pending_failures, detail=detail):
+            self._pending_failures = 0
 
     def desired_subscriptions(self, now: float) -> set[str]:
         watch.expire(self.conn, now)
@@ -149,8 +194,10 @@ class PumpPortalClient:
 
     # ----- connection loop -------------------------------------------------------------------
     async def run(self, stop: asyncio.Event) -> None:
-        kv_set(self.conn, "ingest.pumpportal.started", str(self.clock()), self.clock())
-        self._open_gap(self.clock(), "startup")
+        t0 = self.clock()
+        db.kv_setdefault(self.conn, "ingest.pumpportal.first_started", str(t0), t0)
+        kv_set(self.conn, "ingest.pumpportal.started", str(t0), t0)
+        self._open_gap(t0, "startup")
         backoff_min = float(self.cfg.get("backoff_min_s", 20))
         backoff_max = float(self.cfg.get("backoff_max_s", 180))
         attempt = 0

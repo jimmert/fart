@@ -1,14 +1,30 @@
-"""Per-mint trade capture over the keyed RPC websocket (PumpPortal only serves trades to funded keys).
+"""Per-mint trade capture over the keyed RPC websocket, BEFORE graduation only.
 
-One connection, many `logsSubscribe` subscriptions: for every active watchlist mint we subscribe on
-the bonding curve PDA before graduation (or the mint, config `rpc_trades.mention`) and on the
-pump-amm pool after it. Every notification is decoded (`TradeEvent` from the curve, pump-amm
-`BuyEvent`/`SellEvent` from the pool) and stored in `trades` with source `rpc_trades` /
-`pump_amm`. Every notification, subscribe and unsubscribe is booked in the budget ledger as
-estimated compute units; above `rpc_trades_cu_drop_fraction` of the daily CU cap only the
-`rpc_trades_keep_reasons_above_cu_fraction` watchlist reasons keep a subscription (probation is
-dropped first). Reconnects re-subscribe to the desired set. Per-subscription counters live in
-`ws_subscriptions` so `fart status` can show the top subscriptions by notifications.
+One connection, many `logsSubscribe` subscriptions: for every active watchlist mint whose reason is
+in `rpc_trades.reasons` (probation, early_buyers, meta_burst) and that has not graduated we subscribe
+on the bonding curve PDA (config `rpc_trades.mention`: 'bonding_curve' | 'mint'). Never on a pump-amm
+pool: one hot pool produced 79,604 notifications in two hours (VPS, 26 Oct 2026); graduated coins are
+measured by the tracker's 5-minute DexScreener samples instead.
+
+Every notification is decoded (`TradeEvent` from the curve; pump-amm `BuyEvent`/`SellEvent` only when
+the pool maps to a known base mint, e.g. the first pool buy inside a migration transaction) and stored
+in `trades` with source `rpc_trades` / `pump_amm`. Costs are booked in the ledger as
+`ws_trade_notification`, `ws_trade_subscribe`, `ws_trade_unsubscribe` (estimated CU, aggregated per
+minute) so the stream shows up on its own in `fart status` -> rpc CU today by method.
+
+Three limits, in this order:
+  * the hourly envelope: the stream's own CU in the current UTC hour may not exceed
+    `hourly_cu_fraction` (1/24) of the daily cap; above it every subscription is dropped until the next
+    hour (`rpc_trades.envelope_paused` counter, `policy.envelope_paused`);
+  * the per-subscription cap: `max_notifications_per_subscription_per_hour` (2000); above it the
+    subscription is dropped for the rest of its hour (`rpc_trades.subscription_capped` counter);
+  * the milestone-2 rules: at most `rpc_trades_cap` subscriptions, probation dropped above
+    `rpc_trades_cu_drop_fraction` of the daily cap, the stream closed at the daily cap.
+
+Every write is one short `BEGIN IMMEDIATE` transaction with retries (`db.write_tx`); a handler that
+still fails is counted (`ingest.handle_failed.rpc_trades`) and its raw line can be replayed
+(`fart ingest replay --source rpc_trades`): `ws_subscriptions.sub_id` maps a raw notification back
+to its mint.
 """
 from __future__ import annotations
 
@@ -19,6 +35,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .. import db
 from ..chain.events import decode_logs, summarize_undecoded
 from ..chain.pda import bonding_curve_address
 from ..db import kv_set
@@ -33,13 +50,18 @@ log = get_logger("rpc_trades")
 SOURCE = "rpc_trades"
 SOURCE_AMM = "pump_amm"
 KEEP_DEFAULT = ("observe", "early_buyers", "meta_burst")
+REASONS_DEFAULT = ("probation", "early_buyers", "meta_burst")
+M_NOTIFICATION = "ws_trade_notification"
+M_SUBSCRIBE = "ws_trade_subscribe"
+M_UNSUBSCRIBE = "ws_trade_unsubscribe"
+STREAM_METHODS = (M_NOTIFICATION, M_SUBSCRIBE, M_UNSUBSCRIBE)
 
 
 @dataclass
 class Sub:
     mint: str
     address: str
-    kind: str              # 'curve' | 'pool' | 'mint'
+    kind: str              # 'curve' | 'mint'
     reason: str | None
     req_id: int
     since: float
@@ -48,6 +70,8 @@ class Sub:
     notifications: int = 0
     trades: int = 0
     row_id: int | None = None   # ws_subscriptions.id
+    hour_start: float = 0.0     # per-subscription hourly cap window (UTC hour)
+    hour_notifications: int = 0
 
 
 class RpcTradesClient:
@@ -83,18 +107,23 @@ class RpcTradesClient:
         self.by_sub: dict[int, Sub] = {}        # confirmed, by server subscription id
         self.unsub_req: dict[int, int] = {}     # logsUnsubscribe request id -> subscription id
         self.outgoing: list[dict[str, Any]] = []
+        self.muted_until: dict[str, float] = {}  # mint -> end of the hour it was capped in
         self._req_id = 0
         self._pda_cache: dict[str, str] = {}
         self.connects = 0
         self.notifications = 0
+        self.failures = 0
+        self._pending_failures = 0
         self.counts: dict[str, int] = {}
         self._gap_id: int | None = None
         self._connected = False
+        self._envelope_paused = False
         self._pending_cost_n = 0
         self._pending_sub_n = 0
         self._pending_unsub_n = 0
         self._throttle = Throttle(3600)
         self.policy: dict[str, Any] = {}
+        self.replay = False  # `fart ingest replay`: data writes only, no raw copy, no costs, no counters
 
     # ----- subscription policy -------------------------------------------------------------------
     def cu_fraction(self) -> float | None:
@@ -103,6 +132,25 @@ class RpcTradesClient:
         if not cap:
             return None
         return float(u["cost"]) / float(cap)
+
+    def hourly_allowance(self) -> float | None:
+        """CU the trade stream itself may spend per UTC hour: hourly_cu_fraction x the daily cap."""
+        sc = self.budget.source(self.budget_source)
+        if not sc.daily_cost:
+            return None
+        return float(sc.daily_cost) * float(self.cfg.get("hourly_cu_fraction", 1.0 / 24.0))
+
+    def stream_cost_this_hour(self, now: float) -> float:
+        """Ledgered ws_trade_* cost since the start of the current UTC hour plus the unflushed pending counts."""
+        hour_start = now - (now % 3600.0)
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(cost), 0) FROM api_ledger WHERE source=? AND method IN (?,?,?) AND ts>=? AND blocked_reason IS NULL",
+            (self.budget_source, *STREAM_METHODS, hour_start),
+        ).fetchone()
+        sc = self.budget.source(self.budget_source)
+        pending = (sc.cost_of(M_NOTIFICATION) * self._pending_cost_n + sc.cost_of(M_SUBSCRIBE) * self._pending_sub_n
+                   + sc.cost_of(M_UNSUBSCRIBE) * self._pending_unsub_n)
+        return float(row[0]) + pending
 
     def _curve_address(self, mint: str, bonding_curve: str | None) -> str:
         if bonding_curve:
@@ -116,35 +164,63 @@ class RpcTradesClient:
 
     def _address_for(self, row: sqlite3.Row) -> tuple[str, str]:
         mint = row["mint"]
-        if row["migrated"]:
-            if row["pool_address"]:
-                return row["pool_address"], "pool"
-            return mint, "mint"
         if self.cfg.get("mention", "bonding_curve") == "bonding_curve":
             return self._curve_address(mint, row["bonding_curve"]), "curve"
         return mint, "mint"
+
+    def _set_envelope_paused(self, paused: bool, now: float, spent: float, allowance: float | None) -> None:
+        if paused == self._envelope_paused:
+            return
+        self._envelope_paused = paused
+        if paused:
+            log.warning("rpc_trades.envelope_paused", stream_cu_this_hour=round(spent), hourly_allowance=allowance,
+                        note="every trade subscription dropped until the next UTC hour")
+            try:
+                db.write_tx(self.conn, lambda c: (db.counter_bump_daily(c, "rpc_trades.envelope_paused", 1, now),
+                                                  kv_set(c, "rpc_trades.envelope_paused_at", str(now), now)),
+                            what="rpc_trades.envelope", attempts=2)
+            except sqlite3.OperationalError as e:
+                log.warning("rpc_trades.envelope_counter_failed", error=str(e)[:100])
+        else:
+            log.info("rpc_trades.envelope_resumed", stream_cu_this_hour=round(spent), hourly_allowance=allowance)
 
     def desired(self, now: float) -> dict[str, tuple[str, str, str | None]]:
         """mint -> (address, kind, reason) for the subscriptions we want right now."""
         watch.expire(self.conn, now)
         rows = self.conn.execute(
-            "SELECT w.mint, w.reason, w.since, c.bonding_curve, m.pool_address, (m.mint IS NOT NULL) AS migrated"
+            "SELECT w.mint, w.reason, w.since, c.bonding_curve, (m.mint IS NOT NULL) AS migrated"
             " FROM watchlist w LEFT JOIN coins c ON c.mint = w.mint LEFT JOIN migrations m ON m.mint = w.mint"
             " WHERE w.active = 1"
         ).fetchall()
+        for mint, until in list(self.muted_until.items()):
+            if until <= now:
+                del self.muted_until[mint]
+        reasons = set(self.cfg.get("reasons", REASONS_DEFAULT))
+        graduated = sum(1 for r in rows if r["migrated"])
+        cands = [r for r in rows if not r["migrated"] and (r["reason"] or "probation") in reasons and r["mint"] not in self.muted_until]
         frac = self.cu_fraction()
         drop_at = float(self.watch_cfg.get("rpc_trades_cu_drop_fraction", 0.8))
         dropping = frac is not None and frac >= drop_at
         keep = set(self.watch_cfg.get("rpc_trades_keep_reasons_above_cu_fraction", KEEP_DEFAULT))
+        if dropping:
+            cands = [r for r in cands if (r["reason"] or "probation") in keep]
+        allowance = self.hourly_allowance()
+        spent = self.stream_cost_this_hour(now)
+        paused = allowance is not None and spent >= allowance
+        self._set_envelope_paused(paused, now, spent, allowance)
+        if paused:
+            cands = []
         cap = int(self.watch_cfg.get("rpc_trades_cap", 150))
-        cands = [r for r in rows if not (dropping and (r["reason"] or "probation") not in keep)]
         cands.sort(key=lambda r: (watch.PRIORITY.get(r["reason"], 0), r["since"]), reverse=True)
         out: dict[str, tuple[str, str, str | None]] = {}
         for r in cands[:cap]:
             address, kind = self._address_for(r)
             out[r["mint"]] = (address, kind, r["reason"])
         self.policy = {"active_watchlist": len(rows), "eligible": len(cands), "subscribed": len(out), "cap": cap,
-                       "cu_fraction": None if frac is None else round(frac, 3), "dropping_low_priority": dropping}
+                       "cu_fraction": None if frac is None else round(frac, 3), "dropping_low_priority": dropping,
+                       "graduated_excluded": graduated, "muted": len(self.muted_until),
+                       "hourly_cu_allowance": None if allowance is None else round(allowance),
+                       "stream_cu_this_hour": round(spent), "envelope_paused": paused}
         if dropping and self._throttle.allow("dropping", now):
             log.warning("rpc_trades.cu_policy_dropping_probation", **self.policy)
         return out
@@ -160,72 +236,129 @@ class RpcTradesClient:
         self._pending_unsub_n += 1
         return {"jsonrpc": "2.0", "id": rid, "method": "logsUnsubscribe", "params": [sub.sub_id]}
 
-    def _close_row(self, sub: Sub, now: float) -> None:
+    @staticmethod
+    def _close_row(conn: sqlite3.Connection, sub: Sub, now: float) -> None:
         if sub.row_id is not None:
-            self.conn.execute("UPDATE ws_subscriptions SET until=? WHERE id=? AND until IS NULL", (now, sub.row_id))
+            conn.execute("UPDATE ws_subscriptions SET until=? WHERE id=? AND until IS NULL", (now, sub.row_id))
 
     def sync_messages(self, now: float) -> list[dict[str, Any]]:
-        """Diff the desired set against the current subscriptions; returns JSON-RPC messages to send."""
+        """Diff the desired set against the current subscriptions; returns JSON-RPC messages to send.
+        The ws_subscriptions rows are written first (one short transaction); the in-memory state and the
+        messages follow only when that succeeded, so a failed write changes nothing and the next sync
+        simply tries again."""
         desired = self.desired(now)
-        msgs: list[dict[str, Any]] = []
         commitment = self.cfg.get("commitment", "confirmed")
-        self.conn.execute("BEGIN")
-        try:
-            for mint, sub in list(self.subs.items()):
-                want = desired.get(mint)
-                if want is not None and want[0] == sub.address:
-                    continue
-                if sub.sub_id is None:
-                    sub.remove = True
-                else:
-                    self.by_sub.pop(sub.sub_id, None)
-                    msgs.append(self._unsubscribe_msg(sub))
-                self._close_row(sub, now)
-                del self.subs[mint]
-            for mint, (address, kind, reason) in desired.items():
-                if mint in self.subs:
-                    continue
-                rid = self._next_id()
-                sub = Sub(mint=mint, address=address, kind=kind, reason=reason, req_id=rid, since=now)
-                self.subs[mint] = sub
-                self.by_req[rid] = sub
-                self._pending_sub_n += 1
-                cur = self.conn.execute(
-                    "INSERT INTO ws_subscriptions(mint, address, kind, reason, since) VALUES(?,?,?,?,?)",
-                    (mint, address, kind, reason, now),
+        remove: list[Sub] = []
+        add: list[tuple[str, str, str, str | None]] = []
+        for mint, sub in list(self.subs.items()):
+            want = desired.get(mint)
+            if want is not None and want[0] == sub.address:
+                continue
+            remove.append(sub)
+        for mint, (address, kind, reason) in desired.items():
+            if mint not in self.subs:
+                add.append((mint, address, kind, reason))
+        if not remove and not add:
+            return []
+
+        def _write(c: sqlite3.Connection) -> list[int]:
+            for sub in remove:
+                self._close_row(c, sub, now)
+            ids = []
+            for mint, address, kind, reason in add:
+                cur = c.execute(
+                    "INSERT INTO ws_subscriptions(mint, address, kind, reason, since) VALUES(?,?,?,?,?)", (mint, address, kind, reason, now)
                 )
-                sub.row_id = int(cur.lastrowid)
-                msgs.append({"jsonrpc": "2.0", "id": rid, "method": "logsSubscribe",
-                             "params": [{"mentions": [address]}, {"commitment": commitment}]})
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
+                ids.append(int(cur.lastrowid))
+            return ids
+
+        row_ids = db.write_tx(self.conn, _write, what="rpc_trades.sync")
+        msgs: list[dict[str, Any]] = []
+        for sub in remove:
+            if sub.sub_id is None:
+                sub.remove = True
+            else:
+                self.by_sub.pop(sub.sub_id, None)
+                msgs.append(self._unsubscribe_msg(sub))
+            del self.subs[sub.mint]
+        for (mint, address, kind, reason), row_id in zip(add, row_ids):
+            rid = self._next_id()
+            sub = Sub(mint=mint, address=address, kind=kind, reason=reason, req_id=rid, since=now, row_id=row_id)
+            self.subs[mint] = sub
+            self.by_req[rid] = sub
+            self._pending_sub_n += 1
+            msgs.append({"jsonrpc": "2.0", "id": rid, "method": "logsSubscribe",
+                         "params": [{"mentions": [address]}, {"commitment": commitment}]})
         return msgs
 
     # ----- notification handling (sync, testable) ---------------------------------------------------
+    def _sub_for(self, params: dict[str, Any], received_at: float) -> Sub | None:
+        sid = params.get("subscription")
+        sub = self.by_sub.get(sid)
+        if sub is None and self.replay and isinstance(sid, int):
+            row = self.conn.execute(
+                "SELECT mint, address, kind, reason, since FROM ws_subscriptions WHERE sub_id=? AND since<=?"
+                " AND (until IS NULL OR until>=?) ORDER BY since DESC LIMIT 1", (sid, received_at, received_at),
+            ).fetchone()
+            if row is not None:
+                sub = Sub(mint=row["mint"], address=row["address"], kind=row["kind"], reason=row["reason"], req_id=0,
+                          since=float(row["since"]), sub_id=sid)
+        return sub
+
+    def _cap_subscription(self, sub: Sub, now: float) -> None:
+        """The per-subscription hourly cap was hit: drop it for the rest of its hour and count it."""
+        until = sub.hour_start + 3600.0
+        self.muted_until[sub.mint] = until
+        if sub.sub_id is not None:
+            self.by_sub.pop(sub.sub_id, None)
+            self.outgoing.append(self._unsubscribe_msg(sub))
+        else:
+            sub.remove = True
+        if self.subs.get(sub.mint) is sub:
+            del self.subs[sub.mint]
+        detail = {"mint": sub.mint, "kind": sub.kind, "reason": sub.reason, "notifications_this_hour": sub.hour_notifications, "muted_until": until}
+        log.warning("rpc_trades.subscription_capped", **detail)
+        try:
+            db.write_tx(self.conn, lambda c: (self._close_row(c, sub, now),
+                                              db.counter_bump_daily(c, "rpc_trades.subscription_capped", 1, now),
+                                              kv_set(c, "rpc_trades.last_capped", json.dumps(detail), now)),
+                        what="rpc_trades.cap", attempts=2)
+        except sqlite3.OperationalError as e:
+            log.warning("rpc_trades.cap_counter_failed", error=str(e)[:100])
+
     def handle_text(self, text: str, received_at: float) -> str:
         try:
             msg = json.loads(text)
         except json.JSONDecodeError:
             msg = None
-        self.raw.write(msg if msg is not None else text, received_at)
+        ref = None if self.replay else self.raw.write(msg if msg is not None else text, received_at)
         if not isinstance(msg, dict):
             self._bump("unparseable")
             return "unparseable"
         if msg.get("method") != "logsNotification":
             return self._handle_response(msg, received_at)
         self.notifications += 1
-        self._pending_cost_n += 1
+        if not self.replay:
+            self._pending_cost_n += 1
         params = msg.get("params") or {}
         result = params.get("result") or {}
         value = result.get("value") or {}
         slot = (result.get("context") or {}).get("slot")
-        sub = self.by_sub.get(params.get("subscription"))
+        sub = self._sub_for(params, received_at)
         if sub is None:
             self._bump("orphan")
             return "orphan"
         sub.notifications += 1
+        if not self.replay:
+            if sub.hour_start == 0.0 or received_at - sub.hour_start >= 3600.0:
+                sub.hour_start = received_at - (received_at % 3600.0)
+                sub.hour_notifications = 0
+            sub.hour_notifications += 1
+            cap = int(self.cfg.get("max_notifications_per_subscription_per_hour", 2000))
+            if cap > 0 and sub.hour_notifications > cap:
+                self._cap_subscription(sub, received_at)
+                self._bump("capped")
+                return "capped"
         signature = value.get("signature")
         if value.get("err"):
             self._bump("failed_tx")
@@ -233,42 +366,68 @@ class RpcTradesClient:
             return "failed_tx"
         events, undecoded = decode_logs(value.get("logs"))
         recs = store.records_from_events(events, signature, slot)
-        expected_pool = sub.address if sub.kind == "pool" else self._pool_of(sub.mint)
-        amm, rejected = store.pump_amm_trade_records(events, signature, slot, sub.mint, expected_pool)
-        n_trades = 0
-        self.conn.execute("BEGIN")
-        try:
-            if undecoded:
-                store.store_undecoded(self.conn, undecoded, SOURCE, signature, slot, received_at)
+        amm, rejected = store.pump_amm_trade_records(events, signature, slot, self._mint_of_pool, self.pf.get("wsol_mint"))
+        pool = store.pool_from_create_pool_event(events)
+        mig = recs["migration"]
+        counts = {"other_mint": 0, "amm_unwatched": 0}
+        n_trades = {"n": 0}
+
+        def _apply(c: sqlite3.Connection) -> None:
+            n_trades["n"] = 0
+            counts["other_mint"] = counts["amm_unwatched"] = 0
+            if undecoded and not self.replay:
+                store.store_undecoded(c, undecoded, SOURCE, signature, slot, received_at)
                 for reason, n in summarize_undecoded(undecoded).items():
-                    store.counter_bump(self.conn, f"decode.{reason}", n, received_at)
+                    store.counter_bump(c, f"decode.{reason}", n, received_at)
             for t in recs["trades"]:
                 if t.get("mint") != sub.mint:
-                    self._bump("trade_other_mint")
+                    counts["other_mint"] += 1
                     continue
-                if store.insert_trade(self.conn, t, SOURCE, received_at):
-                    n_trades += 1
+                if store.insert_trade(c, t, SOURCE, received_at):
+                    n_trades["n"] += 1
             for t in amm:
-                if store.insert_trade(self.conn, t, SOURCE_AMM, received_at):
-                    n_trades += 1
-            for r in rejected:
-                store.counter_bump(self.conn, f"decode.pump_amm_{r}", 1, received_at)
-                self._bump(f"amm_{r}")
-            mig = recs["migration"]
-            if mig and mig.get("mint") == sub.mint:
-                store.upsert_migration(self.conn, mig, SOURCE, received_at)
-            pool = store.pool_from_create_pool_event(events)
-            if pool and pool["mint"] == sub.mint:
-                store.upsert_migration(self.conn, dict(pool, signature=signature, slot=slot, block_time=None), SOURCE, received_at)
-            self._touch(sub, received_at, n_trades)
-            kv_set(self.conn, "ingest.rpc_trades.last_msg_at", str(received_at), received_at)
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
+                if not watch.is_watched(c, t["mint"]):
+                    counts["amm_unwatched"] += 1
+                    continue
+                if store.insert_trade(c, t, SOURCE_AMM, received_at):
+                    n_trades["n"] += 1
+            if not self.replay:
+                for r in rejected:
+                    store.counter_bump(c, f"decode.pump_amm_{r}", 1, received_at)
+            if mig and mig.get("mint") == sub.mint and store.migration_rejection(c, mig.get("mint"), self.pf, False) is None:
+                store.upsert_migration(c, mig, SOURCE, received_at)
+            if pool and pool["mint"] == sub.mint and store.migration_rejection(c, pool["mint"], self.pf, False) is None:
+                store.upsert_migration(c, dict(pool, signature=signature, slot=slot, block_time=None), SOURCE, received_at)
+            if not self.replay:
+                self._touch_row(c, sub, received_at, n_trades["n"])
+                kv_set(c, "ingest.rpc_trades.last_msg_at", str(received_at), received_at)
+                if self._pending_failures:
+                    db.counter_bump(c, f"ingest.handle_failed.{SOURCE}", self._pending_failures, received_at)
+                    db.counter_bump(c, f"ingest.handle_failed.{SOURCE}.{db.day_of(received_at)}", self._pending_failures, received_at)
+
+        try:
+            db.write_tx(self.conn, _apply, what="rpc_trades.handle")
+        except sqlite3.OperationalError as e:
+            self._handle_failed(received_at, ref, e)
             raise
-        kind = "trade" if n_trades else "notification"
+        self._pending_failures = 0
+        sub.trades += n_trades["n"]
+        for r in rejected:
+            self._bump(f"amm_{r}")
+        if counts["other_mint"]:
+            self._bump("trade_other_mint", counts["other_mint"])
+        if counts["amm_unwatched"]:
+            self._bump("amm_unwatched", counts["amm_unwatched"])
+        kind = "trade" if n_trades["n"] else "notification"
         self._bump(kind)
         return kind
+
+    def _handle_failed(self, received_at: float, ref: str | None, exc: BaseException) -> None:
+        self.failures += 1
+        self._pending_failures += 1
+        detail = f"{ref or '-'} {type(exc).__name__}: {str(exc)[:120]}"
+        if db.record_failure(self.conn, f"ingest.handle_failed.{SOURCE}", received_at, self._pending_failures, detail=detail):
+            self._pending_failures = 0
 
     def _handle_response(self, msg: dict[str, Any], received_at: float) -> str:
         rid = msg.get("id")
@@ -278,7 +437,7 @@ class RpcTradesClient:
                 log.warning("rpc_trades.subscribe_error", mint=sub.mint, kind=sub.kind, error=str(msg.get("error"))[:200])
                 if self.subs.get(sub.mint) is sub:
                     del self.subs[sub.mint]
-                self._close_row(sub, received_at)
+                self._close_row(self.conn, sub, received_at)
                 self._bump("subscribe_error")
             elif rid in self.unsub_req:
                 self.unsub_req.pop(rid)
@@ -292,6 +451,8 @@ class RpcTradesClient:
             result = msg.get("result")
             if isinstance(result, int):
                 sub.sub_id = result
+                if sub.row_id is not None:
+                    self.conn.execute("UPDATE ws_subscriptions SET sub_id=? WHERE id=?", (result, sub.row_id))
                 if sub.remove:
                     self.outgoing.append(self._unsubscribe_msg(sub))
                 else:
@@ -306,38 +467,44 @@ class RpcTradesClient:
         self._bump("other")
         return "other"
 
-    def _pool_of(self, mint: str) -> str | None:
-        row = self.conn.execute("SELECT pool_address FROM migrations WHERE mint=?", (mint,)).fetchone()
-        return row["pool_address"] if row is not None else None
+    def _mint_of_pool(self, pool: str) -> str | None:
+        return store.mint_of_pool(self.conn, pool)
 
     def _touch(self, sub: Sub, received_at: float, n_trades: int) -> None:
         sub.trades += n_trades
+        if sub.row_id is not None and not self.replay:
+            self._touch_row(self.conn, sub, received_at, n_trades)
+
+    @staticmethod
+    def _touch_row(conn: sqlite3.Connection, sub: Sub, received_at: float, n_trades: int) -> None:
         if sub.row_id is not None:
-            self.conn.execute(
+            conn.execute(
                 "UPDATE ws_subscriptions SET notifications=notifications+1, trades=trades+?, last_notification_at=? WHERE id=?",
                 (n_trades, received_at, sub.row_id),
             )
 
-    def _bump(self, k: str) -> None:
-        self.counts[k] = self.counts.get(k, 0) + 1
+    def _bump(self, k: str, n: int = 1) -> None:
+        self.counts[k] = self.counts.get(k, 0) + n
 
     # ----- budget ------------------------------------------------------------------------------------
     def flush_cost(self) -> None:
         """Book notifications and (un)subscribes as estimated compute units (aggregated, about once a minute)."""
         sc = self.budget.source(self.budget_source)
-        for method, n in (("ws_notification", self._pending_cost_n), ("ws_subscribe", self._pending_sub_n), ("ws_unsubscribe", self._pending_unsub_n)):
+        for method, n in ((M_NOTIFICATION, self._pending_cost_n), (M_SUBSCRIBE, self._pending_sub_n), (M_UNSUBSCRIBE, self._pending_unsub_n)):
             if n:
                 self.budget.record(self.budget_source, method, sc.cost_of(method) * n, True, None, None)
         self._pending_cost_n = self._pending_sub_n = self._pending_unsub_n = 0
 
     def cap_reached(self) -> bool:
-        v = self.budget.peek(self.budget_source, "ws_notification")
+        v = self.budget.peek(self.budget_source, M_NOTIFICATION)
         return (not v.allowed) and v.reason in ("daily_cost_cap", "daily_requests_cap")
 
     # ----- connection loop -------------------------------------------------------------------------------
     async def run(self, stop: asyncio.Event) -> None:
-        kv_set(self.conn, "ingest.rpc_trades.started", str(self.clock()), self.clock())
-        self._open_gap(self.clock(), "startup")
+        t0 = self.clock()
+        db.kv_setdefault(self.conn, "ingest.rpc_trades.first_started", str(t0), t0)
+        kv_set(self.conn, "ingest.rpc_trades.started", str(t0), t0)
+        self._open_gap(t0, "startup")
         backoff_min = float(self.cfg.get("backoff_min_s", 10))
         backoff_max = float(self.cfg.get("backoff_max_s", 300))
         attempt = 0
@@ -379,8 +546,12 @@ class RpcTradesClient:
         self.raw.flush()
 
     def _reset_subscriptions(self, now: float) -> None:
-        for sub in self.subs.values():
-            self._close_row(sub, now)
+        subs = list(self.subs.values())
+        if subs:
+            try:
+                db.write_tx(self.conn, lambda c: [self._close_row(c, s, now) for s in subs], what="rpc_trades.reset", attempts=2)
+            except sqlite3.OperationalError as e:
+                log.warning("rpc_trades.reset_rows_failed", error=str(e)[:100])
         self.subs.clear()
         self.by_req.clear()
         self.by_sub.clear()
@@ -429,10 +600,15 @@ class RpcTradesClient:
                 self.raw.maybe_flush()
                 if time.monotonic() - last_sync >= sync_every:
                     last_sync = time.monotonic()
-                    msgs = self.sync_messages(self.clock())
+                    try:
+                        msgs = self.sync_messages(self.clock())
+                    except sqlite3.OperationalError as e:
+                        log.warning("rpc_trades.sync_failed", error=str(e)[:100])
+                        msgs = []
                     if msgs:
                         await self._send_all(ws, msgs)
-                        log.info("rpc_trades.subscriptions", sent=len(msgs), active=len(self.subs), confirmed=len(self.by_sub))
+                        log.info("rpc_trades.subscriptions", sent=len(msgs), active=len(self.subs), confirmed=len(self.by_sub),
+                                 envelope_paused=self.policy.get("envelope_paused"))
                 if time.monotonic() - last_cost >= 60:
                     last_cost = time.monotonic()
                     self.flush_cost()
@@ -462,7 +638,8 @@ class RpcTradesClient:
 
     def stats(self) -> dict[str, Any]:
         return {"connects": self.connects, "notifications": self.notifications, "subscriptions": len(self.subs),
-                "confirmed": len(self.by_sub), "counts": dict(self.counts), "policy": dict(self.policy)}
+                "confirmed": len(self.by_sub), "failures": self.failures, "muted": len(self.muted_until),
+                "counts": dict(self.counts), "policy": dict(self.policy)}
 
 
 def fill_block_times(conn: sqlite3.Connection, rpc, max_n: int, now: float) -> dict[str, int]:

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# SQLite online backup (backup API) + quick_check; keeps 14 days under $FART_ROOT/data/backup.
+# SQLite online backup (backup API) + quick_check; keeps $KEEP_DAYS days under $FART_ROOT/data/backup.
 # Runs as the fart user (systemd fart-backup.timer) or manually: sudo -u fart deploy/backup.sh
+#
+# Compression never uses `gzip -f FILE`: gzip then copies the ownership of the input onto the output
+# with fchown(2), which the unit's SystemCallFilter (~@privileged contains @chown) kills with SIGSYS
+# (exit 159) - the archive was complete but the retention step never ran (VPS, 26 Oct 2026).
+# `gzip -n -c` writes to stdout and calls no chown; the output file is created by the shell.
 set -euo pipefail
 FART_ROOT="${FART_ROOT:-/opt/fart}"
 PY="${PY:-$FART_ROOT/venv/bin/python}"
@@ -35,6 +40,16 @@ if res != "ok":
 os.replace(tmp, out_path)
 print(f"backup: ok quick_check=ok coins={n_coins} decisions={n_dec} -> {out_path}")
 PYEOF
-gzip -f "$OUT"
+# compress without fchown (see the header); verify the archive before the plain copy goes
+gzip -n -c "$OUT" > "$OUT.gz.tmp"
+mv -f "$OUT.gz.tmp" "$OUT.gz"
+if ! gzip -t "$OUT.gz"; then
+  echo "backup: gzip -t FAILED for $OUT.gz (plain copy kept at $OUT)" >&2
+  rm -f "$OUT.gz"
+  exit 1
+fi
+rm -f "$OUT"
+echo "backup: compressed $OUT.gz (gzip -t ok)"
+# retention: archives older than KEEP_DAYS days
 find "$DEST" -name 'fart-*.db.gz' -type f -mtime "+$KEEP_DAYS" -print -delete | sed 's/^/backup: removed /' || true
 echo "backup: done $(ls -1 "$DEST" | wc -l) file(s) kept"

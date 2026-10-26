@@ -150,3 +150,101 @@ Format: decision — why — where. Newest at the bottom.
 43. **Failed pay-per-use calls cost nothing**: when a call's price depends on its response (X: per post
     returned), a transport error, 429 or 5xx books $0 in the ledger (the estimate stays the gate's check
     before the call). RPC calls keep booking their estimate on failure as in milestone 1.
+
+## Milestone 3 (26 oktober 2026)
+
+**Samenvatting voor Jim.** Mijlpaal 3 repareert wat de uitrol van mijlpaal 2 op de VPS blootlegde en
+voegt geen functies toe. (1) De engine schreef niets meer: elke schrijftransactie begon met een gewone
+`BEGIN`, las eerst (features van 200 munten, clustering) en schreef daarna; in WAL-modus geeft SQLite dan
+meteen `database is locked` zodra een ander proces intussen heeft gecommit, zonder de busy-timeout te
+gebruiken. Nu begint elke schrijftransactie met `BEGIN IMMEDIATE`, blijft kort (rekenwerk en netwerk
+erbuiten), wordt bij een lock maximaal drie keer met jitter herhaald, de busy-timeout is 15 s, en een
+tick of handler die tóch faalt wordt geteld (`engine.tick_failed`, `ingest.handle_failed.<bron>` in
+`fart status` en het dagrapport); een mislukte ruwe regel is herverwerkbaar met `fart ingest replay`.
+(2) De CU-vloed van de trade-stroom: PumpPortal-migratieberichten droegen de USDC- en PUMP-mint, die als
+"graduatie" op de watchlist belandden (72.770 + 8.142 notificaties in 6 minuten, 2.729 valse rijen in
+`trades`), en één hete pool gaf 79.604 notificaties in 2 uur. Nu wordt een migratie alleen aanvaard voor
+een bekende pump-coin en nooit voor een quote-/systeemmint (configureerbare lijst), geweigerde berichten
+blijven bewaard in `rejected_messages`, pump-amm-trades krijgen hun mint uitsluitend via pool → base-mint,
+de valse rijen worden door schemamigratie v3 opgeruimd, en `rpc_trades` abonneert alleen nog vóór
+graduatie (probation, early_buyers, meta_burst) met een plafond van 2.000 notificaties per abonnement per
+uur en een uurenvelop van 1/24 van het dagplafond voor de hele stroom; gegradueerde munten meet de tracker
+via DexScreener. (3) De backup-unit stierf aan `fchown` in `gzip -f`; het script comprimeert nu via
+`gzip -n -c`, test het archief en ruimt op. (4) Het dagrapport noemt uren waarin fart niet draaide
+"niet gedekt" (kop **NIET GEDEKT**, percentages leeg), rekent de dekking altijd live uit, en toont de
+verrijkingslimiet (nu CU-gebaseerd, migraties vóór creates) en de fouten van de dag. (5) De
+Global-layout is tegen de officiële IDL geverifieerd: creator-fee 5 bps, dus 95 + 5 = 100 bps
+(`config/pumpfun.json`), en `fart events classify` benoemt de resterende discriminators met hun programma
+(onder meer `InitBoostEvent` van pump-amm). Deploy: `deploy/DEPLOY.md`, sectie "Upgrade to milestone 3".
+
+44. **Branch and PR**: all work on the harness branch `claude/lucid-cori-l2e105`; the PR targets `main`.
+45. **`BEGIN IMMEDIATE` everywhere** (`fart/db.py`): `immediate()` / `write_tx()` are the only way to
+    write; `read_tx()` is a closed, read-only snapshot for the heavy reads. A plain `BEGIN` no longer
+    occurs outside `db.py`. `write_tx` retries SQLITE_BUSY/LOCKED up to 3 times with 50 ms to 1 s of
+    jitter and propagates everything else at once; the function it runs must be database-only because
+    it may run more than once. `busy_timeout` 15 s on every connection (read-only ones too).
+46. **Engine tick in six steps** (expire, features in a read snapshot, promotions, RPC enrichment, metas
+    in a read snapshot, decisions + heartbeat): the two read phases never write, the three write phases
+    are milliseconds. A failed tick is counted in kv (`engine.tick_failed`, `.<day>`, `.last`) and the
+    loop continues; it is never retried as a whole.
+47. **Failure counters have a per-day twin** (`<key>.<YYYY-MM-DD>`) so the daily report can show the
+    day's failures; the all-time key is what `fart status` prints. The same shape is used for
+    `ingest.handle_failed.<source>`, `rpc_trades.subscription_capped`, `rpc_trades.envelope_paused`
+    and `enrich.skipped_budget`.
+48. **Raw replay** (`fart ingest replay --source S --since T`): the handler runs in `replay` mode
+    (data writes only: no raw copy, no CU booking, no counters, no kv timestamps); `ws_subscriptions.sub_id`
+    (schema v3) maps a raw rpc_trades notification back to its mint. Idempotent by construction (upserts
+    and the `(signature, mint)` primary key of `trades`).
+49. **System mints** (`config/pumpfun.json` -> `system_mints`: USDC, USDT, WSOL, PUMP) are never a coin,
+    a migration or a watchlist entry, from any source. A PumpPortal migration also needs a known coin
+    (`coins`); an RPC-decoded migration of an unknown coin is stored (the universe must stay complete,
+    `grads_without_create` shows it) but never watched. Refused messages land in `rejected_messages`
+    with the raw JSON (bounded), the reason and the raw file reference, counted per reason.
+50. **pump-amm swaps resolve their mint through the pool only**: a CreatePoolEvent in the same
+    transaction (quote mint must be WSOL, else `quote_not_wsol`) or `migrations.pool_address`
+    (`pool_unknown` otherwise). The milestone-2 `pool_mismatch` check (compare with the subscribed pool)
+    is gone with the pool subscriptions.
+51. **Schema v3** is idempotent like v2 and additionally deletes the rows the USDC/PUMP "migrations"
+    caused (`trades`, `migrations`, `mcap_samples`, `coins`; `watchlist` and `ws_subscriptions` rows are
+    closed) and records the counts in kv `schema.v3.cleanup` (printed by `install.sh`). On the VPS the
+    analysis of 26 Oct 2026 counted 2,729 bogus `trades` rows (mint USDC/PUMP, source `pump_amm`); the
+    installer prints the number it actually removed. `decisions`/`outcomes` rows that mention those
+    mints stay (append-only); they are invisible to the report because the universe is `migrations`.
+52. **The trade stream is pre-graduation only** (`config/ingest.json` -> `rpc_trades.reasons`:
+    probation, early_buyers, meta_burst; a migrated coin is dropped at the next sync; `subscribe_graduations`
+    is false). Graduated coins are measured by the tracker's 5-minute DexScreener samples; the optional
+    `getMultipleAccounts` pool-reserve sampling from the brief was not built (DexScreener is free and
+    already there, and nothing in the measurement needs on-chain reserves).
+53. **Two hard limits on the stream**: 2,000 notifications per subscription per UTC hour (then the
+    subscription is dropped for the rest of that hour and counted) and an hourly envelope for the whole
+    stream of 1/24 of the daily CU cap (its own ledger methods `ws_trade_notification`/`_subscribe`/
+    `_unsubscribe`, including the unflushed pending counts); above it every subscription is dropped until
+    the next hour. The milestone-2 rules (cap 150, probation dropped above 80% of the daily cap, closed at
+    the cap) stay as the outer guard. Expect the envelope to pause the stream for part of each hour as
+    long as a notification is estimated at 10 CU (12,500 notifications per hour at the 3M cap); whether
+    Alchemy bills them at all is the open item in `docs/UNVERIFIED.md`.
+54. **`rpc_trades.enabled` stays true** in the repo because (a) and (b) ship with tests in the same
+    release and the envelope bounds the damage to 1/24 of the daily cap per hour; the VPS override that
+    disabled the stream is overwritten by the rsync (documented in DEPLOY.md with the way to keep it off).
+55. **Backup compression** never lets gzip own the output: `gzip -n -c > file.gz.tmp`, `mv`, `gzip -t`,
+    then remove the plain copy and run the retention. The syscall filter of the unit is unchanged.
+56. **Covered versus complete** (`fart/ingest/coverage.py`): a source counts from its first run
+    (`ingest.<source>.first_started`, else its earliest gap row; the old `started` key is overwritten at
+    every restart and was the cause of the "complete" day before the first run); a period without a
+    running process becomes a closed `down` gap at the next start (from the previous heartbeat, when it is
+    older than 60 s and no shutdown gap is open); an hour is covered when a create source was active
+    during part of it, complete only when a source was active for the whole hour without an unrecovered
+    gap. The report recomputes the hours live and carries `coverage_status` (complete / incomplete /
+    not_covered); NIET GEDEKT blanks every percentage.
+57. **Enrich queue**: migrations before creates, oldest first; the daily limit is
+    `max_cu_fraction_per_day` (15%) of the daily CU cap divided by the getTransaction estimate (7,627 at
+    3M CU and 59 CU) instead of a fixed 1,500; without a cap (public RPC) the fixed number remains.
+    Used/limit/skipped per day live in kv and in the report's "Verrijking en fouten" section.
+58. **Event layouts follow the official IDLs** (26 Oct 2026, `idl/pump.json`, `idl/pump_amm.json`):
+    the trailing fields were appended (the decoder reads what is there, so an older payload decodes as
+    `partial` and a current one as `full` with zero extra bytes), every IDL event name is known (so
+    `fart events classify` labels `InitBoostEvent`, `MigrateBondingCurveCreatorEvent`,
+    `DistributeCreatorFeesEvent` with their program), and the Global account layout past offset 113 is
+    verified: `creator_fee_basis_points` at offset 154 is the 5 the VPS read. Fees in config: 95 + 5 = 100.
+    The synthetic fixtures were left at the milestone-2 field counts on purpose (they are what an older
+    program version emitted).

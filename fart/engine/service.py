@@ -1,5 +1,16 @@
 """Engine daemon: every 15 s compute features as_of now, promote watchlist entries, and write
-`observe` decisions for coins and metas that pass the thresholds. Observations only."""
+`observe` decisions for coins and metas that pass the thresholds. Observations only.
+
+Transaction shape (milestone 3, after the VPS lock storm): every tick is
+  1. one short IMMEDIATE write (expire the watchlist),
+  2. a closed read snapshot (features of every watched coin: no writes inside),
+  3. one short IMMEDIATE write (promotions),
+  4. RPC enrichment of the strongest candidates (network, no transaction),
+  5. a closed read snapshot (recent coins, clustering, meta features),
+  6. one short IMMEDIATE write (decisions, meta_burst watchlist entries, heartbeat).
+A tick that still fails is counted in kv (`engine.tick_failed`, `engine.tick_failed.<day>`) so
+`fart status` and the daily report show it; the next tick runs 15 s later as before.
+"""
 from __future__ import annotations
 
 import signal
@@ -45,32 +56,42 @@ class Engine:
         ccfg = dict(self.cfg["coin"])
         ccfg.setdefault("bundled_graduation_window_s", self.pf.get("bundled_graduation_window_s", 60))
         ccfg.setdefault("bundled_dev_buy_fraction", self.pf.get("bundled_dev_buy_fraction", 0.5))
+        mcfg = self.cfg["meta"]
         cooldown = float(self.cfg.get("decision_cooldown_s", 1800))
         summary: dict[str, Any] = {"as_of": as_of, "coins": 0, "promoted": 0, "coin_decisions": 0, "meta_decisions": 0,
                                    "bursting_metas": 0, "rpc_lookups": 0}
-        self.conn.execute("BEGIN")
-        try:
-            watch.expire(self.conn, now, float(wcfg.get("dead_after_idle_s", 7200)))
+        t_start = time.monotonic()
+
+        # 1. expire (short write)
+        db.write_tx(self.conn, lambda c: watch.expire(c, now, float(wcfg.get("dead_after_idle_s", 7200))), what="engine.expire")
+
+        # 2. features (read snapshot, no writes)
+        candidates: list[dict[str, Any]] = []
+        promotions: list[dict[str, Any]] = []
+        with db.read_tx(self.conn):
             mints = watch.active_mints(self.conn)
             summary["coins"] = len(mints)
             mega = features.mega_post_feature(self.conn, as_of)
-            candidates: list[dict[str, Any]] = []
             for mint in mints:
                 f = features.coin_features(self.conn, mint, as_of, self.params, ccfg)
                 if f is None:
                     continue
                 f["mega_post"] = mega
-                if decide.promote_watchlist(self.conn, f, now, wcfg):
-                    summary["promoted"] += 1
+                if decide.wants_promotion(f, wcfg):
+                    promotions.append(f)
                 passes, _ = decide.coin_verdict(f, ccfg)
                 if passes or f["unique_buyers_5m"] >= int(ccfg["observe_min_unique_buyers_5m"]) // 2:
                     candidates.append(f)
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
+        summary["features_s"] = round(time.monotonic() - t_start, 3)
 
-        # RPC enrichment for the strongest candidates only (outside the transaction: network)
+        # 3. promotions (short write; promote_watchlist re-checks the probation reason)
+        if promotions:
+            def _promote(c: sqlite3.Connection) -> int:
+                return sum(1 for f in promotions if decide.promote_watchlist(c, f, now, wcfg))
+
+            summary["promoted"] = db.write_tx(self.conn, _promote, what="engine.promote")
+
+        # 4. RPC enrichment for the strongest candidates only (network: outside every transaction)
         candidates.sort(key=lambda f: (f["net_sol_5m"], f["unique_buyers_5m"]), reverse=True)
         if self.rpc is not None:
             h_budget = int(ccfg.get("max_holder_lookups_per_loop", 3))
@@ -85,13 +106,8 @@ class Engine:
                     c_budget -= 1
                     summary["rpc_lookups"] += 1
 
-        self.conn.execute("BEGIN")
-        try:
-            for f in candidates:
-                if decide.observe_coin(self.conn, f, as_of, now, ccfg, cooldown, self.rules_version) is not None:
-                    summary["coin_decisions"] += 1
-            # metas
-            mcfg = self.cfg["meta"]
+        # 5. metas (read snapshot, no writes)
+        with db.read_tx(self.conn):
             recent = features.recent_coins(self.conn, as_of, float(mcfg.get("window_s", 10800)))
             clusters = cluster(recent, self.stopwords, int(mcfg.get("min_token_len", 4)))
             metas = []
@@ -100,22 +116,30 @@ class Engine:
                     continue
                 metas.append(features.meta_features(self.conn, term, members, as_of, mcfg, self.stopwords))
             metas = features.rank_metas(metas)[: int(mcfg.get("max_terms", 50))]
+        bursting = [m for m in metas if decide.is_bursting(m, mcfg)]
+        summary["bursting_metas"] = len(bursting)
+        summary["metas"] = len(metas)
+        summary["top_metas"] = [(m["term"], m["sol_inflow"], m["unique_buyers"], m["n_coins"]) for m in metas[:5]]
+
+        # 6. decisions, meta_burst watchlist entries, heartbeat (short write)
+        def _write(c: sqlite3.Connection) -> tuple[int, int]:
+            n_coin = n_meta = 0
+            for f in candidates:
+                if decide.observe_coin(c, f, as_of, now, ccfg, cooldown, self.rules_version) is not None:
+                    n_coin += 1
+            if wcfg.get("subscribe_bursting_meta", True):
+                for m in bursting:
+                    for mint in [x["mint"] for x in clusters[m["term"]]][:20]:
+                        watch.add(c, mint, "meta_burst", now, float(wcfg.get("ttl_s", 86400)), int(wcfg.get("cap", 200)))
             for m in metas:
-                if decide.is_bursting(m, mcfg):
-                    summary["bursting_metas"] += 1
-                    if wcfg.get("subscribe_bursting_meta", True):
-                        for mint in [c["mint"] for c in clusters[m["term"]]][:20]:
-                            watch.add(self.conn, mint, "meta_burst", now, float(wcfg.get("ttl_s", 86400)), int(wcfg.get("cap", 200)))
-                if decide.observe_meta(self.conn, m, as_of, now, mcfg, cooldown, self.rules_version) is not None:
-                    summary["meta_decisions"] += 1
-            summary["metas"] = len(metas)
-            summary["top_metas"] = [(m["term"], m["sol_inflow"], m["unique_buyers"], m["n_coins"]) for m in metas[:5]]
-            db.kv_set(self.conn, "engine.heartbeat", str(now), now)
-            db.kv_set(self.conn, "engine.rules_version", self.rules_version, now)
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
+                if decide.observe_meta(c, m, as_of, now, mcfg, cooldown, self.rules_version) is not None:
+                    n_meta += 1
+            db.kv_set(c, "engine.heartbeat", str(now), now)
+            db.kv_set(c, "engine.rules_version", self.rules_version, now)
+            return n_coin, n_meta
+
+        summary["coin_decisions"], summary["meta_decisions"] = db.write_tx(self.conn, _write, what="engine.decisions")
+        summary["tick_s"] = round(time.monotonic() - t_start, 3)
         return summary
 
 
@@ -135,6 +159,7 @@ def run_engine(settings: Settings) -> int:
     signal.signal(signal.SIGINT, _stop)
     log.info("engine.started", rules_version=eng.rules_version, interval_s=interval, **settings.describe())
     last_log = 0.0
+    failures = 0
     while not stopping["v"]:
         t0 = time.monotonic()
         try:
@@ -142,13 +167,15 @@ def run_engine(settings: Settings) -> int:
             if s["coin_decisions"] or s["meta_decisions"] or time.monotonic() - last_log > 300:
                 last_log = time.monotonic()
                 log.info("engine.tick", **s)
-        except Exception:
-            log.error("engine.tick_failed", exc_info=True)
+        except Exception as e:
+            failures += 1
+            log.error("engine.tick_failed", exc_info=True, failures=failures)
+            db.record_failure(conn, "engine.tick_failed", wall_now(), detail=f"{type(e).__name__}: {str(e)[:150]}")
         elapsed = time.monotonic() - t0
         for _ in range(int(max(0.0, interval - elapsed) * 10)):
             if stopping["v"]:
                 break
             time.sleep(0.1)
     conn.close()
-    log.info("engine.stopped")
+    log.info("engine.stopped", failures=failures)
     return 0
