@@ -163,15 +163,48 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
      that differs from ours (a price per request where we assume per post) is a code change in
      `fart/social/x.py` (`_search` books posts and authors; `confirm` books requests), not a config change.
   3. `fart social dryrun` (milestone 6, no HTTP) then shows what the watch would cost per day at those prices
-     against `X_DAILY_BUDGET_USD`, per kind, with the hours in which the envelope, the 30% reserve or the KOL
-     sub-cap would refuse calls.
-  4. After the first full day with the token (shadow mode): compare `fart status` → `x spend today` and
-     `select kind, sum(n), round(sum(usd), 3) from x_spend where day='<day>' group by kind` with the console's
-     usage / billing page of the same UTC day. A gap means a wrong unit or price; the per-day dedupe (`x_dedupe`)
-     and the "refresh is free" assumption below are the first suspects. Write the console figures here (day,
-     per endpoint: units and USD) next to ours; nothing is "verified" without them.
+     against `X_DAILY_BUDGET_USD`, per kind, the planner's full-load ceiling (below), and the hours in which the
+     envelope would defer calls or the 30% reserve or the KOL sub-cap would refuse them.
+  4. After the first full day with the token (shadow mode): run
+     ```
+     sudo -u fart /opt/fart/bin/fart social calibrate --day <day> --console-usd <the console's USD for that UTC day>
+     ```
+     (milestone 7). It prints our `x_spend` rows per kind and unit (post, request, author; the refresh posts), the
+     calls per kind, the gap, the uniform factor console / booked and, per component, the price that would explain the
+     whole gap if only that one is wrong, each with the `config/x.json` → `prices` line it implies; within 5% the prices
+     are confirmed. Which hypothesis is true follows from the console's per-endpoint breakdown, not from the command.
+     A gap that no price explains means a wrong unit (per request where we assume per post): a code change in
+     `fart/social/x.py`. The per-day dedupe (`x_dedupe`) and the "refresh is free" assumption below are the first
+     suspects. Write the console figures here (day, per endpoint: units and USD) next to ours; nothing is "verified"
+     without them.
 - [ ] **Per-day deduplication** of billed posts/authors (assumed by the pricing notes; `x_dedupe`).
 - [ ] **`GET /2/tweets?ids=` re-reads are free** for same-day ids (booked as `refresh` at $0).
+- [ ] **`GET /2/users?ids=` bills per user object at the author-expansion price** (milestone 7: the confirmation search
+  requests no `expansions` any more and looks up at most 3 authors afterwards, booked as kind `ca_authors` at
+  `author_expansion_usd` per new user per UTC day). If the console bills the users endpoint per request, or differently
+  from the expansion user objects, `fart social calibrate` shows it as an `author` component gap; the price is a config
+  change, a per-request unit is a code change (`fart/social/x.py`, `_lookup_authors`).
+- [ ] **The full-load formula of the planner** (milestone 7, `fart social dryrun` → "full load", `fart/social/dryrun.py`
+  → `full_load`): with K keys a day, C counts per key, one search of P posts and A author lookups per key,
+
+  ```
+  confirmation ceiling = K x (C x counts_request_usd + P x post_usd + A x author_expansion_usd)
+                       = 60 x (12 x $0.005 + 10 x $0.005 + 3 x $0.010) = 60 x $0.14 = $8.40 per day
+  account watches      = mega posts x post_usd + mega accounts x author_expansion_usd (80 x $0.005 + 9 x $0.010 = $0.49)
+                       + KOL at its sub-cap ($1.00; unthrottled 200 x $0.005 + 13 x $0.010 = $1.13)
+  total ceiling        = $9.89 per day = 66% of X_DAILY_BUDGET_USD 15.00
+  ```
+
+  C = 12 comes from the schedule (a count at 0, 15, ..., 120 minutes after the decision, then hourly at 180, 240, 300:
+  `planner.schedule_counts`), P = `confirm.search_max_results`, A = `planner.search_max_authors`, K =
+  `planner.full_load_keys_per_day`. The ceiling counts every key both fully counted and searched, which the stop rules
+  make impossible (a confirmed key stops counting, a refuted key never searches: a silent coin costs 4 counts = $0.02);
+  the expected load with the dry-run assumptions (half the keys confirmed after four counts) is about $6.40 a day. To
+  verify after the first shadow days: `fart status` → `x plan vs spend today` and the week report's "Kwaliteit per
+  dollar" table should stay under the ceiling; `x_keys` holds every key with its counts, search and USD
+  (`select stop_reason, count(*), round(avg(counts_n),1), round(sum(usd),2) from x_keys where stopped_at is not null group by 1`).
+  The milestone-6 layer cost about $119 a day in the dry run of 26 Oct 2026 (61 keys x 96 counts, a search with author
+  expansion for 10% of the counts).
 - [ ] **Response field names** (`data[].public_metrics.like_count/quote_count/impression_count`,
   `includes.users[].public_metrics.followers_count`, `meta.newest_id`, counts `data[].tweet_count`,
   `meta.total_tweet_count`) come from the public docs; the fixtures under `tests/fixtures/x_*.json` are
@@ -200,6 +233,23 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
 - [ ] **Preview volume** (`TELEGRAM_COMMUNITY_PREVIEW=1`): previews count towards the owner's 6 observation
   batches per hour; on a busy day the owner may receive fewer observation batches because of them (by design,
   per the brief). Check `fart notify outbox` for `community_preview` rows and `observe_deferred` in the tick log.
+
+## Milestone 7
+
+- [ ] **The planner's stop rules against real chatter**: `refuted` after three consecutive counts without growth of the
+  24 h count assumes that `meta.total_tweet_count` of `counts/recent` with a 24 h `start_time` only grows for a coin
+  younger than a day (posts never leave the window). Check on the first shadow days that refuted keys were really silent
+  (`select key, last_n_1h, last_n_24h, peak_n_1h, counts_n from x_keys where stop_reason='refuted'`) and that confirmed
+  keys were confirmed early (`counts_n` small); many `exhausted` keys mean the growth test never bites (chatter that grows
+  by one post an hour) and `refute_after_flat_counts` or the growth measure should be revisited in a commit.
+- [ ] **The hourly envelope defers, the hard rules refuse**: on the first shadow days `fart status` → `x planner` should
+  show `deferred today` only in the morning hours (UTC 02:00 to 12:00 have weight 0.4) and `api_ledger` no
+  `hourly_envelope` rows at all; `account_watch_reserve` and `daily_cost_cap` refusals should not appear with the cap at
+  15.00 (the full load is 66% of it), `kol_daily_cap` refusals in the evening are expected (the KOL watch is $1.13 a day
+  unthrottled against its $1.00 sub-cap).
+- [ ] **Observed rates replace the assumptions** (`fart social dryrun` → "observed rates") from 5 stopped keys and 3
+  searches on; compare the dry run's expected total with `x spend today` after the first full shadow day and write the
+  observed confirmed share, counts per key, posts and authors per search into `config/x.json` → `dryrun` in a commit.
 
 ## Milestone 6
 

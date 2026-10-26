@@ -222,13 +222,27 @@ def day_block(rep: dict[str, Any], rvs: list[str]) -> dict[str, Any]:
     xs = rep.get("x_shadow") or {}
     xo = xs.get("outcomes") or {}
     xc = xs.get("confirmations") or {}
+    xq = xs.get("quality") or {}
+    xq_groups = xq.get("outcomes_by_confirmation") or {}
     return {
         "day": rep.get("day"),
         "x_shadow": {"active": bool(xs.get("active")), "decisions": int((xs.get("decisions") or {}).get("total", 0)),
                      "confirmed_1h": int(xc.get("confirmed_1h", 0)), "confirmed_24h": int(xc.get("confirmed_24h", 0)),
                      "counts_taken": int(xc.get("counts_taken", 0)), "observations": int(xc.get("observations_of_day", 0)),
                      "elapsed": int(xo.get("elapsed", 0)), "winner": int(xo.get("winner", 0)), "not_winner": int(xo.get("not_winner", 0)),
-                     "unknown": int(xo.get("unknown", 0)), "pending": int(xo.get("pending", 0))},
+                     "unknown": int(xo.get("unknown", 0)), "pending": int(xo.get("pending", 0)),
+                     # milestone 7: quality per dollar
+                     "spend_usd": float((xq.get("spend_usd") or {}).get("total", 0.0) or 0.0),
+                     "confirmed_observations": int(xq.get("confirmed_observations", 0) or 0),
+                     "observations_counted": int(xq.get("observations_counted", 0) or 0),
+                     "confirmed_within_1h": int(xq.get("confirmed_within_1h", 0) or 0),
+                     "waste_counts": int(xq.get("counts_after_first_confirmation", 0) or 0),
+                     "waste_usd": float(xq.get("waste_usd", 0.0) or 0.0),
+                     "refuted_n": int((xq.get("refuted") or {}).get("n", 0) or 0),
+                     "refuted_usd": float((xq.get("refuted") or {}).get("usd", 0.0) or 0.0),
+                     "keys_stopped": {k: int(v.get("n", 0)) for k, v in (xq.get("keys_stopped") or {}).items()},
+                     "by_confirmation": {g: {k: int((xq_groups.get(g) or {}).get(k, 0) or 0) for k in ("decisions", "elapsed", "winner", "not_winner", "unknown", "pending")}
+                                         for g in ("confirmed", "unconfirmed", "not_counted")}},
         "synthetic": bool(rep.get("synthetic", False)),
         "covered": covered,
         "coverage_status": rep.get("coverage_status") or ("incomplete" if covered else "not_covered"),
@@ -438,6 +452,23 @@ def aggregate(day_reports_by_mv: dict[str, list[dict[str, Any]]], fp_map: dict[s
                 "pending": sum(d["pending"] for d in shadow_days)}
     x_shadow["rate"] = _ratio(x_shadow["winner"], x_shadow["elapsed"])
     x_shadow["rate_known"] = _ratio(x_shadow["winner"], x_shadow["winner"] + x_shadow["not_winner"])
+    # milestone 7: quality per dollar over the window
+    for k in ("spend_usd", "confirmed_observations", "observations_counted", "confirmed_within_1h", "waste_counts", "waste_usd", "refuted_n", "refuted_usd"):
+        x_shadow[k] = sum(d.get(k, 0) or 0 for d in shadow_days)
+    x_shadow["usd_per_confirmed"] = (x_shadow["spend_usd"] / x_shadow["confirmed_observations"]) if x_shadow["confirmed_observations"] else None
+    x_shadow["confirmed_within_1h_share"] = _ratio(x_shadow["confirmed_within_1h"], x_shadow["observations_counted"])
+    stopped: dict[str, int] = {}
+    for d in shadow_days:
+        for k, v in (d.get("keys_stopped") or {}).items():
+            stopped[k] = stopped.get(k, 0) + int(v)
+    x_shadow["keys_stopped"] = dict(sorted(stopped.items()))
+    by_conf: dict[str, dict[str, Any]] = {}
+    for g in ("confirmed", "unconfirmed", "not_counted"):
+        t = {k: sum(int(((d.get("by_confirmation") or {}).get(g) or {}).get(k, 0) or 0) for d in shadow_days) for k in ("decisions", "elapsed", "winner", "not_winner", "unknown", "pending")}
+        t["rate"] = _ratio(t["winner"], t["elapsed"])
+        t["rate_known"] = _ratio(t["winner"], t["winner"] + t["not_winner"])
+        by_conf[g] = t
+    x_shadow["by_confirmation"] = by_conf
     day_list = window_days(end_day, days)
     return {
         "kind": "week",
@@ -678,6 +709,34 @@ def render_markdown(r: dict[str, Any]) -> str:
         for d in xs.get("per_day") or []:
             lines.append(f"| {d['day']} | {d['decisions']} | {d['counts_taken']} | {d['confirmed_1h']} | {d['confirmed_24h']} | {d['observations']} | "
                          f"{d['elapsed']} | {d['winner']} | {d['not_winner']} | {d['unknown']} | {d['pending']} |")
+        bc = xs.get("by_confirmation") or {}
+        stopped = ", ".join(f"{k} {v}" for k, v in (xs.get("keys_stopped") or {}).items()) or "geen"
+
+        def _grp(label: str, g: dict[str, Any]) -> str:
+            return (f"{label} {g.get('decisions', 0)} observaties: verstreken {g.get('elapsed', 0)} (winnaar {g.get('winner', 0)}, geen winnaar "
+                    f"{g.get('not_winner', 0)}, onbekend {g.get('unknown', 0)}), nog bezig {g.get('pending', 0)}, trefkans {_pct(g.get('rate'))}")
+
+        lines += [
+            "",
+            "### Kwaliteit per dollar van de X-bevestiging",
+            "",
+            f"- Uitgaven aan de bevestigingslaag in het venster: **${float(xs.get('spend_usd') or 0):.2f}**; bevestigde observaties: {xs.get('confirmed_observations', 0)}; "
+            f"per bevestigde observatie: " + ("onbekend (geen bevestiging)" if xs.get("usd_per_confirmed") is None else f"**${float(xs['usd_per_confirmed']):.2f}**"),
+            f"- Observaties met een telling: {xs.get('observations_counted', 0)}; bevestigd binnen 1 u na de beslissing: **{xs.get('confirmed_within_1h', 0)}** "
+            f"({_pct(xs.get('confirmed_within_1h_share'))})",
+            f"- Tellingen ná de eerste bevestiging (verspilling): {xs.get('waste_counts', 0)} (≈ ${float(xs.get('waste_usd') or 0):.2f}); "
+            f"weerlegde sleutels: {xs.get('refuted_n', 0)} (kosten ${float(xs.get('refuted_usd') or 0):.2f}); sleutels gestopt per reden: {stopped}",
+            f"- Uitkomst munt-observaties naar bevestiging (dezelfde noemerregels als de trefkans): {_grp('bevestigd', bc.get('confirmed') or {})}; "
+            f"{_grp('geteld maar niet bevestigd', bc.get('unconfirmed') or {})}; {_grp('zonder telling', bc.get('not_counted') or {})}",
+            "- Dit rapport geeft geen advies over X live; de cijfers zijn de basis voor dat besluit na de meetweek.",
+            "",
+            "| dag | uitgaven bevestiging | bevestigd | $/bevestiging | geteld | binnen 1 u | verspilde tellingen | weerlegd (kosten) |",
+            "|---|---:|---:|---:|---:|---:|---:|---|",
+        ]
+        for d in xs.get("per_day") or []:
+            per = "–" if not d.get("confirmed_observations") else f"${float(d.get('spend_usd') or 0) / d['confirmed_observations']:.2f}"
+            lines.append(f"| {d['day']} | ${float(d.get('spend_usd') or 0):.2f} | {d.get('confirmed_observations', 0)} | {per} | {d.get('observations_counted', 0)} | "
+                         f"{d.get('confirmed_within_1h', 0)} | {d.get('waste_counts', 0)} | {d.get('refuted_n', 0)} (${float(d.get('refuted_usd') or 0):.2f}) |")
     lines += [
         "",
         "## Versies",

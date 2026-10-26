@@ -3,7 +3,8 @@ and the ONE way to write: `write_tx()`.
 
 Time columns: `slot`/`block_time` are chain time, `received_at`/`created_at`/`measured_at`
 are our clock. `decisions` and `outcomes` are append-only (enforced by triggers); so are the milestone-6
-shadow tables `shadow_decisions` and `shadow_confirmations`.
+shadow tables `shadow_decisions` and `shadow_confirmations`. The milestone-7 planner table `x_keys` is the one
+X table that is updated in place (one row per confirmation key episode: counts, confirmation, stop reason).
 
 Write rules (milestone 3, after the VPS lock storm of 26 Oct 2026):
 
@@ -35,7 +36,7 @@ from .util import day_key
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 BUSY_TIMEOUT_MS = 15000
 WRITE_RETRY_ATTEMPTS = 3
@@ -661,6 +662,71 @@ def _migrate_v6(conn: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[6] = _migrate_v6
+
+
+# ----- schema version 7 (milestone 7) --------------------------------------------------------------
+# One new table and one new column, no cleanup; every statement is idempotent.
+# * `x_keys`: the state of the X confirmation planner (`fart/social/planner.py`), one row per key episode
+#   (a key = a mint or `meta:<term>`, an episode = the observe / observe_meta decision that admitted it; a key is
+#   planned at most once per `confirm.window_s`). The row carries the rank at admission, the next due count, the
+#   counts and searches taken, the last and peak counts, the streak of counts without growth, the confirmation
+#   time, the money spent on the key (`usd`, of which `usd_search` for the one search and its author lookups),
+#   and when and why the key stopped (`stop_reason`: confirmed, refuted, expired, graduated, dead, displaced,
+#   exhausted). Updated in place by the social daemon; read by `fart status`, the dry run and the reports. The
+#   count rows themselves stay in `shadow_confirmations` (shadow) or `social_counts` (live), append-only.
+# * `x_spend.unit`: what a ledger row's `n` counts (post, request, author), so `fart social calibrate` can put
+#   the console's amount next to the units per price component; rows from before milestone 7 have NULL (mixed).
+SCHEMA_V7_SQL = [
+    """CREATE TABLE IF NOT EXISTS x_keys(
+        key            TEXT NOT NULL,
+        decision_id    INTEGER NOT NULL,
+        kind           TEXT NOT NULL,
+        decision_kind  TEXT NOT NULL,
+        decision_as_of REAL NOT NULL,
+        mint           TEXT,
+        term           TEXT,
+        query          TEXT NOT NULL,
+        prio_class     INTEGER NOT NULL DEFAULT 0,
+        prio_value     REAL NOT NULL DEFAULT 0,
+        rank           INTEGER,
+        started_at     REAL NOT NULL,
+        next_due_at    REAL,
+        counts_n       INTEGER NOT NULL DEFAULT 0,
+        searches_n     INTEGER NOT NULL DEFAULT 0,
+        authors_n      INTEGER NOT NULL DEFAULT 0,
+        last_count_at  REAL,
+        last_n_1h      INTEGER,
+        last_n_24h     INTEGER,
+        peak_n_1h      INTEGER,
+        flat_streak    INTEGER NOT NULL DEFAULT 0,
+        confirmed_at   REAL,
+        search_pending INTEGER NOT NULL DEFAULT 0,
+        usd            REAL NOT NULL DEFAULT 0,
+        usd_search     REAL NOT NULL DEFAULT 0,
+        stopped_at     REAL,
+        stop_reason    TEXT,
+        rules_version  TEXT,
+        PRIMARY KEY(key, decision_id)
+    ) WITHOUT ROWID""",
+    "CREATE INDEX IF NOT EXISTS x_keys_open ON x_keys(stopped_at, next_due_at)",
+    "CREATE INDEX IF NOT EXISTS x_keys_started ON x_keys(started_at)",
+    "CREATE INDEX IF NOT EXISTS x_keys_stopped ON x_keys(stopped_at, stop_reason)",
+    "CREATE INDEX IF NOT EXISTS x_keys_decision ON x_keys(decision_id)",
+]
+SCHEMA_V7_COLUMNS = [
+    ("x_spend", "unit", "TEXT"),
+]
+
+
+def _migrate_v7(conn: sqlite3.Connection) -> None:
+    for stmt in SCHEMA_V7_SQL:
+        conn.execute(stmt)
+    for table, column, ctype in SCHEMA_V7_COLUMNS:
+        if not _column_exists(conn, table, column):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ctype}")
+
+
+MIGRATIONS[7] = _migrate_v7
 
 
 def _apply_pragmas(conn: sqlite3.Connection, readonly: bool) -> None:

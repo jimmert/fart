@@ -12,7 +12,12 @@
                          X_MODE off | shadow (default with a token: nothing reaches decisions) | live (needs the x_live rules key)
   social dryrun [--hours N] [--arrival uniform|envelope]
                          no HTTP: requests and USD per kind per day from config/x.json, the current confirmation keys and the
-                         observed post rates; the next N hours through the envelope, reserve and KOL cap (milestone 6)
+                         observed rates; the planner's full-load ceiling against the cap; the next N hours through the planner
+                         (hard cap, reserve, KOL cap refuse; the envelope defers) (milestones 6 and 7)
+  social calibrate --day D --console-usd N
+                         read-only: the day's x_spend ledger per kind and unit next to the X developer console's amount for that
+                         UTC day; the price per unit that fits (uniform or one component) and the config/x.json lines a commit
+                         would need; writes nothing (milestone 7)
   backup verify          unpack the newest data/backup/fart-*.db.gz under data/, quick_check, row counts vs the live database
                          (live >= archive), clean up; exit 1 on failure, 2 without an archive (deploy/backup.sh calls it)
   budget calibrate --day D --dashboard-cu N
@@ -62,8 +67,10 @@ def _parser() -> argparse.ArgumentParser:
     en.add_argument("ecmd", nargs="?", choices=["explain"], help="explain (default: run the daemon)")
     en.add_argument("--day", help="explain: UTC day YYYY-MM-DD (default: today)")
     so = sub.add_parser("social")
-    so.add_argument("scmd", nargs="?", choices=["dryrun"], help="dryrun (default: run the daemon)")
+    so.add_argument("scmd", nargs="?", choices=["dryrun", "calibrate"], help="dryrun | calibrate (default: run the daemon)")
     so.add_argument("--once", action="store_true", help="run one tick and print the summary")
+    so.add_argument("--day", help="calibrate: UTC day YYYY-MM-DD of the console amount")
+    so.add_argument("--console-usd", type=float, help="calibrate: the X developer console's amount (USD) for that UTC day")
     so.add_argument("--hours", type=int, default=24, help="dryrun: hours to walk through the envelope from the current UTC hour (default 24)")
     so.add_argument("--arrival", choices=["uniform", "envelope"], default="uniform",
                     help="dryrun: how the day's posting volume arrives over the hours (default uniform)")
@@ -198,6 +205,19 @@ def cmd_status(settings, as_json: bool) -> int:
                                    "mismatches": json.loads(kv.get("chain.global.mismatches") or "[]")}
             out["x_spend_today"] = [dict(r) for r in conn.execute(
                 "SELECT kind, SUM(n) AS n, ROUND(SUM(usd), 4) AS usd FROM x_spend WHERE day=? GROUP BY kind ORDER BY usd DESC", (day_key(t),))]
+            # milestone 7: the confirmation planner (active keys, stop reasons, deferrals) and the planned versus actual USD per kind
+            from .social import planner as xplanner
+            from .social.dryrun import planned_by_kind
+            from .social.xbudget import XBudget
+
+            out["x_planner"] = xplanner.status_counters(conn, t)
+            xb = XBudget(conn, budget, settings.config("x"), settings.x_daily_budget_usd)
+            try:
+                planned = planned_by_kind(conn, settings, t)
+            except Exception as e:  # the status must never die on the plan model
+                planned = None
+                out["x_plan_error"] = f"{type(e).__name__}: {str(e)[:120]}"
+            out["x_plan"] = xb.plan_view(t, planned)
             out["outbox"] = {r[0]: r[1] for r in conn.execute("SELECT status, COUNT(*) FROM outbox GROUP BY status")}
             last_dec = conn.execute("SELECT MAX(as_of) FROM decisions").fetchone()[0]
             out["last_decision_at"] = utc_iso(last_dec) if last_dec else None
@@ -262,6 +282,21 @@ def cmd_status(settings, as_json: bool) -> int:
             f"{r['mint'][:8]}… {r['kind']}/{r['reason']} {r['notifications']} (trades {r['trades']})" for r in out["top_subscriptions"]))
     if out["x_spend_today"]:
         print("  x spend today: " + ", ".join(f"{r['kind']} ${r['usd']:.3f} ({r['n']})" for r in out["x_spend_today"]))
+    xp = out.get("x_planner") or {}
+    if xp:
+        act = xp.get("active") or {}
+        stopped = xp.get("stopped_today") or {}
+        deferred = {p["kind"]: p["deferred"] for p in (out.get("x_plan") or []) if p.get("deferred")}
+        print(f"  x planner: active keys {xp.get('active_total', 0)}" + (" (" + ", ".join(f"{k} {v}" for k, v in sorted(act.items())) + ")" if act else "")
+              + f", search pending {xp.get('search_pending', 0)}, due now {xp.get('due_now', 0)}; started today {xp.get('started_today', 0)}; stopped today: "
+              + (", ".join(f"{k} {v['n']} (${v['usd']:.2f})" for k, v in sorted(stopped.items())) or "none")
+              + "; deferred today: " + (", ".join(f"{k} {v}" for k, v in sorted(deferred.items())) or "none"))
+    if out.get("x_plan"):
+        cap = s["x_daily_budget_usd"]
+        print(f"  x plan vs spend today (planned/actual USD, % of the ${cap:.2f} cap): " + ", ".join(
+            f"{p['kind']} " + ("?" if p["planned_usd"] is None else f"${p['planned_usd']:.2f}") + f"/${p['actual_usd']:.2f} ("
+            + ("?" if p["planned_share"] is None else f"{100 * p['planned_share']:.0f}%") + f"/{100 * (p['actual_share'] or 0):.0f}%)"
+            for p in out["x_plan"]) + (f"  [plan error: {out['x_plan_error']}]" if out.get("x_plan_error") else ""))
     if out["outbox"]:
         print("  outbox: " + ", ".join(f"{k}={v}" for k, v in sorted(out["outbox"].items())))
     g = out["global_check"]
@@ -572,6 +607,30 @@ def cmd_social_dryrun(settings, hours: int, arrival: str, as_json: bool) -> int:
     return 0
 
 
+def cmd_social_calibrate(settings, day: str | None, console_usd: float | None, as_json: bool) -> int:
+    """Read-only: the day's X ledger per kind and unit against the console's amount (milestone 7)."""
+    from .social.calibrate import calibrate, render_text
+
+    if not day or console_usd is None:
+        print("social calibrate needs --day YYYY-MM-DD and --console-usd <the console's USD for that UTC day>")
+        return 2
+    if not settings.db_path.exists():
+        print("no database yet")
+        return 2
+    try:
+        day_bounds_check(day)
+    except ValueError:
+        print(f"bad day: {day} (YYYY-MM-DD)")
+        return 2
+    conn = db.connect_ro(settings.db_path)
+    try:
+        res = calibrate(conn, settings, day, float(console_usd))
+    finally:
+        conn.close()
+    print(json.dumps(res, indent=2, default=str) if as_json else render_text(res))
+    return 0
+
+
 def cmd_budget_calibrate(settings, day: str, dashboard_cu: float, as_json: bool) -> int:
     """Read-only: the implied CU per byte from the ledger and the dashboard total (milestone 6)."""
     from .net.calibrate import calibrate, render_text
@@ -625,6 +684,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "social":
         if args.scmd == "dryrun":
             return cmd_social_dryrun(settings, args.hours, args.arrival, args.json)
+        if args.scmd == "calibrate":
+            return cmd_social_calibrate(settings, args.day, args.console_usd, args.json)
         from .social.service import run_social
 
         return run_social(settings, once=args.once)

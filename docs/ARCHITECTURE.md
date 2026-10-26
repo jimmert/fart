@@ -1,4 +1,4 @@
-# Architecture (milestone 6)
+# Architecture (milestone 7)
 
 `fart` is a read-only consumer of public Solana / pump.fun data. It never signs, never trades.
 Milestone 1 delivered complete and redundant ingestion, an event-time data model in which hindsight
@@ -21,9 +21,12 @@ land in `shadow_decisions`, confirmation counts in `shadow_confirmations`, and t
 features and no mega post to every decision until `live` is allowed by the `x_live` rules key (a new
 fingerprint). It also records per day what the engine saw of every candidate (`engine_candidates`, read by
 `fart engine explain` and the daily report), verifies every backup by restoring it (`fart backup verify`), and
-adds two read-only tools (`fart social dryrun`, `fart budget calibrate`). Still no ML, no web UI, no trading, and
-the only outbound write anywhere is `sendMessage` to the owner chat (and, once Jim switches it on after the
-week, to the community chat).
+adds two read-only tools (`fart social dryrun`, `fart budget calibrate`). Milestone 7 turns the X confirmation layer into a
+cost-aware planner (`fart/social/planner.py`, `fart/social/xbudget.py`): keys only from observations in a hard order, an
+adaptive count schedule with stop rules per key (`x_keys`), a budget planner that defers on the hourly envelope and
+never exceeds the cap, quality-per-dollar lines in the reports and `fart social calibrate` for the console prices. Still
+no ML, no web UI, no trading, and the only outbound write anywhere is `sendMessage` to the owner chat (and, once Jim
+switches it on after the week, to the community chat).
 
 ## Processes
 
@@ -58,12 +61,18 @@ week, to the community chat).
   writes `features_asof` and `decisions` (kind `observe` / `observe_meta`), and since milestone 6 the per-day
   candidate maxima (`engine_candidates`, `fart/engine/candidates.py`) that `fart engine explain --day` and the
   daily report's "Waarom wel of geen observaties" read. Observations only.
-* **fart-social** (`fart/social/service.py`): X mega-account watch (60 s), velocity refresh (120 s),
-  KOL watch (180 s), contract-address / ticker confirmation counts (15 min per key) and `fast_post`
-  decisions; idles without `X_BEARER_TOKEN` or with `X_MODE=off`. Since milestone 6 the default with a token
-  is shadow mode (`fart/social/shadow.py`): `shadow_decisions` instead of `decisions`, `shadow_confirmations`
-  instead of `social_counts`; `live` needs `X_MODE=live` and `"x_live": true` in config/engine.json. Money:
-  `fart/social/xbudget.py`; `fart social dryrun` estimates it without HTTP (`fart/social/dryrun.py`).
+* **fart-social** (`fart/social/service.py`): X mega-account watch (60 s in the peak hours 13:00-02:00 UTC, 120 s
+  outside), velocity refresh (120 s), KOL watch (180 s / 300 s), the confirmation planner and `fast_post` decisions;
+  idles without `X_BEARER_TOKEN` or with `X_MODE=off`. Since milestone 6 the default with a token is shadow mode
+  (`fart/social/shadow.py`): `shadow_decisions` instead of `decisions`, `shadow_confirmations` instead of
+  `social_counts`; `live` needs `X_MODE=live` and `"x_live": true` in config/engine.json. Since milestone 7 the
+  confirmation layer is a planner (`fart/social/planner.py`): keys only from observations (the mint, a non-generic
+  ticker, the exact multi-word name; the 5 strongest themes), youngest coin first, at most 20 at once; a count as soon
+  as a key is admitted, every 15 min for two hours, hourly after that, at most 12; one search of 10 posts with a user
+  lookup of at most 3 authors when a count reaches the threshold; a key stops as `confirmed`, `refuted` (three flat
+  counts), `expired`, `graduated`, `dead`, `displaced` or `exhausted`, recorded in `x_keys` with what it cost. Money:
+  `fart/social/xbudget.py` (the budget planner); `fart social dryrun` estimates it without HTTP (`fart/social/dryrun.py`,
+  with the full-load formula), `fart social calibrate` compares the ledger with the console (`fart/social/calibrate.py`).
 * **fart-notify** (`fart/notify/service.py`): builds Dutch messages into the `outbox` (observation
   batches, fast posts, the daily digest, health alerts) and sends what is due to the owner chat
   (`notify/telegram.py`); idles unless `TELEGRAM_NOTIFY_ENABLED=1`.
@@ -80,7 +89,7 @@ week, to the community chat).
   go/no-go criteria of `config/measure.json` → `community_gate` printed as voldaan / niet voldaan / te weinig
   data. It decides nothing and sends nothing.
 
-All processes share `data/fart.db` (SQLite, WAL, 15 s busy timeout, schema `PRAGMA user_version` 6) and
+All processes share `data/fart.db` (SQLite, WAL, 15 s busy timeout, schema `PRAGMA user_version` 7) and
 the budget lock file. Cross-process coordination happens through tables only: the engine writes the
 `watchlist` (and its frozen meta_burst choice in kv `engine.meta_burst_sets`), the ingest daemon diffs
 the watchlist against its subscriptions every 5 s with hysteresis; the social daemon writes `decisions`,
@@ -126,10 +135,14 @@ it keeps only the early_buyers / meta_burst subscriptions; at the cap the log st
 sweep pauses until the next UTC day; PumpPortal keeps running (graceful degradation).
 
 The X source costs estimated USD per call (`X_DAILY_BUDGET_USD` hard cap, actual cost booked from the
-response: posts and author expansions billed once per UTC day) and adds a pacing policy on top
-(`XBudget`: hourly envelope weighted to 13:00-02:00 UTC, 30% reserved for the account watches,
-$1/day KOL sub-cap). The Telegram source is a 20-per-minute bucket. Refusals of every kind are rows in
-`api_ledger` with a reason; `fart status` shows spend per RPC method and per X kind.
+response: posts and author expansions billed once per UTC day, every `x_spend` row with its unit) and adds a planner on
+top (`XBudget.admit`, milestone 7): every call carries a ceiling cost (every post and author new) and an expected cost
+(today's average for the kind); the hard rules (the cap, 30% of it reserved for the account watches, the $1/day KOL
+sub-cap) test the ceiling and refuse for the day, so the cap can never be exceeded; the hourly envelope (weighted to
+13:00-02:00 UTC) tests the expected cost and defers to the next hour instead of refusing (counted in kv, never a blocked
+row). Inside a round the search of a confirmed key goes first, then the counts, then the account watches. The Telegram
+source is a 20-per-minute bucket. Refusals are rows in `api_ledger` with a reason; `fart status` shows spend per RPC
+method and per X kind, the planner's keys and the planned versus actual USD per kind.
 
 ## Event time versus our clock
 
@@ -201,10 +214,12 @@ graduation the tracker's 5-minute DexScreener samples carry the measurement.
 
 ## Social confirmation
 
-`social_posts` keeps the platform time and our clock apart; `social_counts` holds the per-key
-counts; `x_spend`/`x_dedupe` the money. Confirmation runs on unambiguous keys only (the mint, a
-non-generic `$TICKER`, an exact multi-word name). `fast_post` decisions tie a fast mega post to a
-burst of coin names and stay observations: no tier words anywhere.
+`social_posts` keeps the platform time and our clock apart; `social_counts` (live) or `shadow_confirmations` (shadow)
+hold the per-key counts; `x_spend`/`x_dedupe` the money; `x_keys` the planner's state per key episode (milestone 7).
+Confirmation runs on unambiguous keys only (the mint, a non-generic `$TICKER`, an exact multi-word name; a theme term of
+eight or more characters), only for observations, in a hard order, with a per-key schedule and stop rules so that every
+dollar can be traced to an observation it confirmed or refuted; the reports show what a confirmation costs. `fast_post`
+decisions tie a fast mega post to a burst of coin names and stay observations: no tier words anywhere.
 
 ## Notifications
 
@@ -251,13 +266,14 @@ the copy removed; a failure exits 1 and fails the unit; the result lands in kv `
   `fart measure week --end 2026-11-02 --days 7`; only then does Jim decide about `TELEGRAM_COMMUNITY_ENABLED`.
   The preview mode shows him during the week what the community would have received.
 * X during the week: the token may go in after a day of watching without X; the watch then runs in shadow
-  mode and the reports' "X-schaduw" section shows what it would have added. The step shadow → live is a rules
-  change (`"x_live": true` in config/engine.json, a new fingerprint) after the week, never during it.
+  mode under the milestone-7 planner (within `X_DAILY_BUDGET_USD` 15.00) and the reports' "X-schaduw" section shows
+  what it would have added and what a confirmation cost. The step shadow → live is a rules change (`"x_live": true` in
+  config/engine.json, a new fingerprint) after the week, never during it, taken on the quality-per-dollar figures.
 * Reconcile every estimate in `docs/UNVERIFIED.md` on the VPS, first of all the CU per byte of the
   websocket frames against the Alchemy dashboard (`fart budget calibrate --day D --dashboard-cu N`: 0.0002 or
   0.04 decides how much of the trade stream the daily share lets through), then the HTTP methods, the X prices
-  (`fart social dryrun` before, `x spend today` after) and the real recordings that prove the event layouts
-  byte for byte.
+  (`fart social dryrun` before, `fart social calibrate --day D --console-usd N` after) and the real recordings that
+  prove the event layouts byte for byte.
 * Why the coin branch gives few observations: `fart engine explain --day D` and the daily report show the
   distribution; a change of thresholds, if any, is a decision after the week (a new rules_version), not a
   conclusion of this milestone.

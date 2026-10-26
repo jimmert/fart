@@ -1,5 +1,40 @@
 # fart
 
+## Voor Jim: wat milestone 7 toevoegt
+
+Mijlpaal 7 maakt van de X-bevestigingslaag een kostenbewuste planner: binnen jouw dagplafond van $10 tot $20 haalt hij
+de meeste bevestigende informatie uit X en geeft hij niets uit wat geen informatie toevoegt. Geen regel verandert (de
+vingerafdruk blijft `sha256:e3bf4320c45c`; dezelfde test bewaakt dat). De beslissingen staan in `docs/DECISIONS.md`, de
+definities in `docs/METING.md`, de formule in `docs/UNVERIFIED.md`, de upgrade stap voor stap in `deploy/DEPLOY.md`
+("Upgrade to milestone 7"):
+
+1. **Sleutels alleen van observaties, in een harde volgorde.** Per `observe`-beslissing het mint-adres, de `$TICKER`
+   (≥ 3 tekens, niet generiek) en de exacte naam van ≥ 2 woorden; van thema's alleen de 5 sterkste. Jongste munt eerst,
+   thema's daarna, hoogstens 20 tegelijk. Een sleutel stopt zodra hij beslist is en de nieuwe tabel `x_keys` zegt
+   waarom: bevestigd (telling ≥ 10 in het laatste uur, daarna precies één zoekopdracht), weerlegd (drie tellingen zonder
+   groei: een stille munt kost 4 tellingen, 45 minuten, $0,02), verlopen (6 u), gegradueerd, dood, verdrongen, uitgeput.
+2. **Adaptief schema.** Tellingen om de 15 minuten in de eerste 2 uur, daarna elk uur (hoogstens 12), één zoekopdracht
+   van hoogstens 10 posts met een opvraag van hoogstens 3 auteurs; mega-watch 60 s in de piekuren en 120 s daarbuiten,
+   KOL-watch 180 s / 300 s. Volle belasting: 60 sleutels × (12 × $0,005 + 10 × $0,005 + 3 × $0,010) = **$8,40 per dag**
+   als plafond voor de bevestigingslaag, $9,89 met mega en KOL = 66% van $15 (M6 zou circa $119 per dag kosten).
+3. **Planner in plaats van weigeraar.** Het dagplafond, de 30%-reserve voor mega + KOL en het KOL-plafond toetsen het
+   plafondbedrag van elke aanroep (het plafond kan nooit overschreden worden); de uurenvelop stelt uit in plaats van te
+   weigeren. Zet in `.env` `X_DAILY_BUDGET_USD=15.00` (binnen je $10 tot $20; zonder die regel valt de code terug op
+   $3,00, waaronder de volle belasting niet past). `fart social dryrun` en `fart status` tonen per soort het geplande en
+   het werkelijke bedrag en het aandeel van het plafond.
+4. **Kwaliteit per dollar, meetbaar in schaduw.** Dag- en weekrapport tonen in "X-schaduw" de kosten per bevestigde
+   observatie, het aandeel observaties dat binnen 1 uur bevestigd werd, de tellingen ná de eerste bevestiging
+   (verspilling), de gestopte sleutels per reden met wat de weerlegde kostten, en de uitkomst van bevestigde tegenover
+   niet-bevestigde observaties met dezelfde noemerregels als de trefkans. Geen advies: jij beslist hierop na de meetweek
+   of X live gaat.
+5. **Echte prijzen:** `fart social calibrate --day <dag> --console-usd <N>` zet het bedrag uit de X-developer-console
+   naast ons grootboek per soort en eenheid en zegt welke prijs daarbij hoort en welke `prices`-regel een commit vraagt;
+   het schrijft niets. Zodra er echte aanroepen zijn, rekent de droogloop met de waargenomen aantallen ("observed rates").
+
+Na de upgrade: `fart status` toont `schema_version: 7`, `daily budget $15.00`, de regels `x planner:` en `x plan vs
+spend today:`; de rooktest vóór de sleutel is `fart social dryrun` (de regel `full load: ... fits`), de ijkstap na de
+eerste volle dag met sleutel `fart social calibrate`.
+
 ## Voor Jim: wat milestone 6 toevoegt
 
 Mijlpaal 6 maakt de X-laag veilig in gebruik te nemen zonder de meetweek te raken, laat zien waarom de munt-tak
@@ -188,6 +223,8 @@ python -m fart ingest            # daemon; creates+migrations via PumpPortal and
 python -m fart ingest replay --source rpc_logs --since 2026-10-26T08:00Z   # re-feed raw hour files after handler failures
 python -m fart engine            # daemon; 15 s loop
 python -m fart social --once     # one X tick (idle without X_BEARER_TOKEN)
+python -m fart social dryrun     # the X plan and USD per kind per day, the full-load formula, no HTTP
+python -m fart social calibrate --day 2026-10-28 --console-usd 7.10   # our X ledger against the console's amount, writes nothing
 python -m fart notify outbox     # last 20 Telegram outbox rows; `notify test` sends one message when enabled
 python -m fart events classify   # undecoded event discriminators with best-guess names
 python -m fart chain global      # pump.fun Global account vs config (exit 1 on mismatch)
@@ -203,12 +240,12 @@ Configuration: `config/*.json` (thresholds, cost tables, curve parameters) and
 Layout:
 
 ```
-fart/          package: config, db (schema v5, write_tx), log, util, version (rules_version + rules_fingerprint), cli
+fart/          package: config, db (schema v7, write_tx), log, util, version (rules_version + rules_fingerprint), cli
 fart/net/      budget gate (rate, daily caps, health, backoff) + urllib JSON client
 fart/chain/    base58, PDA derivation, Anchor event decoder (pump.fun + pump-amm), tx parsing, curve math, Global account, RPC client
 fart/ingest/   raw store, normalization, PumpPortal + RPC log + RPC per-mint trade clients, sweep, coverage, retention
 fart/engine/   meta clustering, as-of features (incl. X), decisions, RPC enrichment, daemon
-fart/social/   X budget (USD), X client (mega/KOL/refresh/confirmation/fast posts), daemon
+fart/social/   X budget planner (USD), confirmation planner (keys, schedule, stop reasons), X client (mega/KOL/refresh/confirmation/fast posts), dry run, console calibration, daemon
 fart/notify/   outbox, Telegram sender, Dutch formatting (owner + community), daemon with the chat guard
 fart/measure/  prices, outcomes, paper trades, daily report, week report (bootstrap, go/no-go)
 config/        pumpfun, budget, ingest, engine, measure, stopwords, x, x_kols, notify

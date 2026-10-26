@@ -96,7 +96,7 @@ def test_shadow_fast_post_lands_in_shadow_decisions_and_never_in_decisions(setti
     assert json.loads(d["features_json"])["mints"] == ["MINT0", "MINT1", "MINT2"] and d["rules_version"] == "test-rules"
     # idempotent per post, and the money is booked exactly as in live mode
     assert c.fast_post_decisions(clock.t + 15) == 0 and conn.execute("SELECT COUNT(*) FROM shadow_decisions").fetchone()[0] == 1
-    assert c.xb.spend_by_kind(clock.t)["mega_search"] == {"n": 3, "usd": pytest.approx(0.035)}
+    assert c.xb.spend_by_kind(clock.t)["mega_search"] == {"n": 5, "usd": pytest.approx(0.035), "units": {"post": 3, "author": 2}}
     assert c.tick(clock.t + 61)["x_mode"] == "shadow"
     # the engine would see the fast post as a mega feature, but only in live mode (next test); append-only like decisions
     assert features.mega_post_feature(conn, clock.t + 1)["account"] == "elonmusk"
@@ -126,17 +126,19 @@ def test_shadow_confirmation_counts_land_in_shadow_confirmations_linked_to_the_d
     c = shadow_client(settings, conn, clock, req)
     keys = c.confirmation_keys(T0)
     assert [(k["key"], k["decision_id"], k["decision_kind"]) for k in keys] == [(mint, did, "observe"), ("meta:goldberg cat", mid, "observe_meta")]
-    assert c.confirm(T0) == {"counts": 2, "searches": 1, "posts": 3}  # the 13-per-hour count still triggers the search (same calls, same money)
+    s = c.confirm(T0)
+    assert (s["counts"], s["searches"], s["posts"]) == (2, 1, 3)  # the 13-per-hour count still triggers the search (same calls, same money)
     assert conn.execute("SELECT COUNT(*) FROM social_counts").fetchone()[0] == 0
     rows = conn.execute("SELECT * FROM shadow_confirmations ORDER BY id").fetchall()
     assert [(r["key"], r["decision_id"], r["n_last_hour"], r["n_24h"], r["threshold"], r["confirmed_1h"], r["confirmed_24h"]) for r in rows] == [
         (mint, did, 13, 19, 10, 1, 1), ("meta:goldberg cat", mid, 0, 0, 10, 0, 0)]
     assert rows[0]["decision_as_of"] == T0 - 840 and rows[0]["rules_version"] == "test-rules"
-    # the keys are due again after the interval, judged on the shadow table
-    assert c.confirmation_keys(T0 + 60) == [] and len(c.confirmation_keys(T0 + 901)) == 2
+    # the theme key is due again after the interval; the confirmed mint key stopped after its one search (milestone 7, x_keys)
+    assert c.confirmation_keys(T0 + 60) == [] and [k["key"] for k in c.confirmation_keys(T0 + 901)] == ["meta:goldberg cat"]
+    assert conn.execute("SELECT stop_reason, searches_n FROM x_keys WHERE key=?", (mint,)).fetchone()[:] == ("confirmed", 1)
     # the features of the mint stay what they are without X counts (the engine neutralizes the ca posts as well)
     assert features.x_features(conn, mint, T0 + 1)["x_count_1h"] is None
-    assert c.xb.spend_by_kind(T0)["ca_counts"] == {"n": 2, "usd": pytest.approx(0.01)}
+    assert c.xb.spend_by_kind(T0)["ca_counts"] == {"n": 2, "usd": pytest.approx(0.01), "units": {"request": 2}}
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("DELETE FROM shadow_confirmations")
 

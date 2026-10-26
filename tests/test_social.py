@@ -85,9 +85,13 @@ def test_xbudget_envelope_reserve_and_caps(settings, conn):
     assert xb.allow("mega_search", 0.015, T0).allowed
     xb.book("mega_search", 1, 0.015, T0)
     assert xb.spend_today(T0) == pytest.approx(0.015)
-    # hourly envelope: $4.5 at 13:05 UTC is refused although the day cap is $5
+    # hourly envelope: $4.5 at 13:05 UTC is DEFERRED to the next hour although the day cap is $5 (milestone 7: never refused)
     v = xb.allow("mega_search", 4.5, T0)
-    assert not v.allowed and v.reason == "hourly_envelope"
+    assert not v.allowed and v.reason == "hourly_envelope" and v.deferred and v.retry_at == 1_793_023_200.0  # 14:00 UTC
+    # the envelope judges the expected cost, the hard cap the ceiling: a $2.50 ceiling with a $0.01 expectation passes, a $5 ceiling never
+    assert xb.admit("mega_search", 2.5, 0.01, T0).allowed
+    v = xb.admit("mega_search", 5.0, 0.01, T0)
+    assert not v.allowed and v.reason == "daily_cost_cap" and not v.deferred
     # hard cap
     v = xb.allow("mega_search", 5.1, T0)
     assert not v.allowed and v.reason == "daily_cost_cap"
@@ -102,12 +106,13 @@ def test_xbudget_envelope_reserve_and_caps(settings, conn):
     v = xb.allow("kol_search", 0.01, late)
     assert not v.allowed and v.reason == "kol_daily_cap"
     assert xb.allow("mega_search", 0.01, late).allowed
-    # refusals are ledgered like gate refusals
+    # hard refusals are ledgered like gate refusals; the deferral is not (it is counted in kv instead)
     reasons = [r[0] for r in conn.execute("SELECT blocked_reason FROM api_ledger WHERE source='x' AND blocked_reason IS NOT NULL ORDER BY id")]
-    assert reasons == ["hourly_envelope", "daily_cost_cap", "account_watch_reserve", "kol_daily_cap"]
+    assert reasons == ["daily_cost_cap", "daily_cost_cap", "account_watch_reserve", "kol_daily_cap"]
     assert conn.execute("SELECT blocked_count FROM health WHERE source='x'").fetchone()[0] == 4
+    assert xb.deferred_today(T0) == {"mega_search": 1}
     by_kind = xb.spend_by_kind(late)
-    assert by_kind["ca_counts"]["n"] == 698 and by_kind["kol_search"]["usd"] == pytest.approx(0.995)
+    assert by_kind["ca_counts"]["n"] == 698 and by_kind["ca_counts"]["units"] == {"request": 698} and by_kind["kol_search"]["usd"] == pytest.approx(0.995)
     # dedupe is per UTC day
     assert xb.dedupe_new("post", ["a", "b"], T0) == ["a", "b"]
     assert xb.dedupe_new("post", ["a", "c"], T0) == ["c"]
@@ -151,13 +156,13 @@ def test_mega_watch_stores_posts_and_books_dedupe_cost(settings, conn, fx):
     assert db.kv_get(conn, "x.mega.since_id") == "1990000000000000001"
     # 3 new posts x $0.005 + 2 new authors x $0.010 = $0.035, in x_spend and in the gate ledger
     spend = c.xb.spend_by_kind(T0)
-    assert spend["mega_search"] == {"n": 3, "usd": pytest.approx(0.035)}
+    assert spend["mega_search"] == {"n": 5, "usd": pytest.approx(0.035), "units": {"post": 3, "author": 2}}  # milestone 7: posts and authors in their own rows
     assert c.budget.daily_usage("x")["cost"] == pytest.approx(0.035)
-    # first call had no since_id -> start_time; the next uses since_id and a 1-post estimate
+    # first call had no since_id -> start_time; the next uses since_id; the gate always sees the ceiling (20 posts + 9 accounts: $0.19)
     assert "start_time=" in req.calls[0]["url"] and "since_id=1990000000000000001" in req.calls[-1]["url"] if len(req.calls) > 1 else True
     s2 = c.mega_watch(T0 + 60)
     assert s2 == {"new_posts": 0} and "since_id=1990000000000000001" in req.calls[-1]["url"]
-    assert req.calls[-1]["cost_est"] == pytest.approx(0.015)
+    assert req.calls[-1]["cost_est"] == pytest.approx(0.19)
     assert c.budget.daily_usage("x")["cost"] == pytest.approx(0.035)  # same posts again: nothing billed
     assert conn.execute("SELECT COUNT(*) FROM social_posts").fetchone()[0] == 3
     assert conn.execute("SELECT received_at FROM social_posts WHERE id='1990000000000000001'").fetchone()[0] == T0  # first arrival kept
@@ -177,7 +182,7 @@ def test_refresh_marks_fast_posts(settings, conn, fx):
     assert p["likes"] == 40000 and p["refreshed_at"] == T0 + 120 and p["received_at"] == T0
     slow = conn.execute("SELECT fast, likes_per_min FROM social_posts WHERE id='1990000000000000002'").fetchone()
     assert slow["fast"] == 0 and slow["likes_per_min"] == pytest.approx(30.0)
-    assert c.xb.spend_by_kind(clock.t)["refresh"] == {"n": 3, "usd": 0.0}  # assumed free (VERIFY)
+    assert c.xb.spend_by_kind(clock.t)["refresh"] == {"n": 3, "usd": 0.0, "units": {"post": 3}}  # assumed free (VERIFY)
     assert "ids=1990000000000000001" in req.calls[-1]["url"]
     # a second refresh keeps fast_at and does not count it as newly fast
     clock.t = T0 + 240
@@ -212,17 +217,21 @@ def test_confirmation_counts_search_and_features(settings, conn, fx):
     assert [k["key"] for k in keys] == [other, mint, "meta:goldberg cat"]  # most recent decision first; 'gold' is not specific enough
     assert keys[1]["query"] == f'"{mint}" OR $ZORB OR "Zorblax Cat"' and keys[0]["query"] == f'"{other}"'
     s = c.confirm(T0)
-    assert s == {"counts": 3, "searches": 1, "posts": 3}
+    assert (s["counts"], s["searches"], s["posts"], s["authors"], s["active"]) == (3, 1, 3, 0, 3)  # no /users body scripted: the lookup returns nothing
+    assert s["outcomes"] == {"counted": 2, "confirmed": 1}
     row = conn.execute("SELECT * FROM social_counts WHERE key=?", (mint,)).fetchone()
     assert row["n_last_hour"] == 13 and row["n_24h"] == 19 and row["kind"] == "mint"  # buckets ending within the last hour: 7 + 6
     assert conn.execute("SELECT n_last_hour FROM social_counts WHERE key=?", (other,)).fetchone()[0] == 0
     posts = conn.execute("SELECT * FROM social_posts WHERE kind='ca' ORDER BY id").fetchall()
     assert len(posts) == 3 and all(p["query_key"] == mint for p in posts)
     spend = c.xb.spend_by_kind(T0)
-    assert spend["ca_counts"] == {"n": 3, "usd": pytest.approx(0.015)} and spend["ca_search"] == {"n": 3, "usd": pytest.approx(0.035)}
-    # keys are due again only after the interval
+    # milestone 7: the confirmation search carries no author expansion (a separate lookup of at most 3 authors, none scripted here)
+    assert spend["ca_counts"] == {"n": 3, "usd": pytest.approx(0.015), "units": {"request": 3}} and spend["ca_search"] == {"n": 3, "usd": pytest.approx(0.015), "units": {"post": 3}}
+    # the confirmed key stopped after its one search; the other two are due again after the interval (youngest coin first, the theme last)
     assert c.confirmation_keys(T0 + 60) == []
-    assert [k["key"] for k in c.confirmation_keys(T0 + 901)] == [other, mint, "meta:goldberg cat"]
+    assert [k["key"] for k in c.confirmation_keys(T0 + 901)] == [other, "meta:goldberg cat"]
+    k = conn.execute("SELECT * FROM x_keys WHERE key=?", (mint,)).fetchone()
+    assert k["stop_reason"] == "confirmed" and k["counts_n"] == 1 and k["searches_n"] == 1 and k["usd"] == pytest.approx(0.02) and k["confirmed_at"] == T0
     # as-of features: everything received at T0; one post was created after T0 - 1 (13:01 > 13:00)...
     f = features.x_features(conn, mint, T0 + 1)
     assert f["x_mentions_1h"] == 3 and f["x_distinct_authors_1h"] == 2 and f["x_count_1h"] == 13 and f["x_count_24h"] == 19
@@ -307,8 +316,9 @@ def test_tick_schedules_jobs_and_cli_once(settings, conn, fx, capsys):
     s = c.tick(T0)
     assert set(s) == {"mega", "refresh", "kol", "confirm", "fast_post_decisions", "spend_today_usd", "x_mode"}
     n_calls = len(req.calls)
-    assert c.tick(T0 + 15) == {"confirm": {"counts": 0, "searches": 0, "posts": 0}, "fast_post_decisions": 0, "spend_today_usd": s["spend_today_usd"],
-                               "x_mode": "live"}
+    s2 = c.tick(T0 + 15)
+    assert set(s2) == {"confirm", "fast_post_decisions", "spend_today_usd", "x_mode"} and s2["x_mode"] == "live" and s2["spend_today_usd"] == s["spend_today_usd"]
+    assert (s2["confirm"]["counts"], s2["confirm"]["searches"], s2["confirm"]["active"]) == (0, 0, 0)
     assert len(req.calls) == n_calls  # nothing due 15 s later (no confirmation keys)
     s3 = c.tick(T0 + 61)
     assert "mega" in s3 and "kol" not in s3 and "refresh" not in s3

@@ -1,10 +1,13 @@
 """The social daemon: `fart social` (15 s loop) and `fart social --once`.
 
 Without X_BEARER_TOKEN (or with X_MODE=off) it idles with a heartbeat and says so once. Every tick runs
-the due jobs (mega 60 s, refresh 120 s, KOL 180 s, confirmation 15 min per key) and the fast-post matching.
-Milestone 6: with a token the default mode is `shadow` (`Settings.x_mode`): the same calls and money, but
-fast posts go to `shadow_decisions` and confirmation counts to `shadow_confirmations`; `live` needs
-`X_MODE=live` and the `x_live` rules key (fart/social/shadow.py). The mode runs in kv `social.x_mode`.
+the due jobs (mega 60 s in the peak hours / 120 s outside, refresh 120 s, KOL 180 s / 300 s, the confirmation
+planner every 15 s: counts per key every 15 min for two hours and hourly after, one search per confirmed key)
+and the fast-post matching. Milestone 6: with a token the default mode is `shadow` (`Settings.x_mode`): the
+same calls and money, but fast posts go to `shadow_decisions` and confirmation counts to `shadow_confirmations`;
+`live` needs `X_MODE=live` and the `x_live` rules key (fart/social/shadow.py). The mode runs in kv `social.x_mode`.
+Milestone 7: the money goes through the budget planner (`XBudget.admit`: the cap is never exceeded, the hourly
+envelope defers instead of refusing) and the keys through `fart/social/planner.py`.
 """
 from __future__ import annotations
 
@@ -69,8 +72,15 @@ def run_social(settings: Settings, once: bool = False) -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     client = build_client(conn, settings) if settings.x_active else None
+    pcfg = settings.config("x").get("planner", {})
     log.info("social.started", enabled=client is not None, x_mode=settings.x_mode, x_mode_requested=settings.x_mode_requested or "unset",
-             interval_s=interval, x_daily_budget_usd=settings.x_daily_budget_usd, kols=len(settings.config("x_kols").get("accounts", [])))
+             interval_s=interval, x_daily_budget_usd=settings.x_daily_budget_usd, kols=len(settings.config("x_kols").get("accounts", [])),
+             planner_max_active_keys=pcfg.get("max_active_keys"), planner_max_counts_per_key=pcfg.get("max_counts_per_key"),
+             planner_target_cap_usd=pcfg.get("target_daily_cap_usd"))
+    target = float(pcfg.get("target_daily_cap_usd", 15.0))
+    if abs(float(settings.x_daily_budget_usd) - target) > 1e-9:
+        log.warning("social.cap_differs_from_planner_target", x_daily_budget_usd=settings.x_daily_budget_usd, target=target,
+                    note="the planner is tuned to the target cap; `fart social dryrun` shows whether the full load fits the configured cap")
     if settings.x_mode_note:
         log.warning("social.x_mode_note", note=settings.x_mode_note)
     if client is None:

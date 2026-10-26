@@ -1,25 +1,26 @@
-"""X API v2 watch: mega accounts every 60 s, KOLs every 180 s, velocity refresh every 2 min,
-contract-address / ticker confirmation counts every 15 min per key, fast-post matching.
+"""X API v2 watch: mega accounts every 60 s in the peak hours and 120 s outside, KOLs every 180 s / 300 s, velocity
+refresh every 2 min, and the confirmation planner (milestone 7, `fart/social/planner.py`): counts per key every 15 min
+in the first two hours after an observation and hourly after that, one search per confirmed key, fast-post matching.
 
 Endpoints (pay-per-use, prices in config/x.json, TO VERIFY against the console):
-  GET /2/tweets/search/recent   per post returned (deduplicated per UTC day) + per author expansion
+  GET /2/tweets/search/recent   per post returned (deduplicated per UTC day) + per author expansion (mega/KOL only)
   GET /2/tweets/counts/recent   per request
+  GET /2/users?ids=             per user (the author lookup of at most `search_max_authors` authors after a confirmation search)
   GET /2/tweets?ids=            assumed free for same-day re-reads (booked as `refresh`, TO VERIFY)
 
-Every call: XBudget policy (envelope, reserve, sub-cap) -> generic gate (rate, hard USD cap,
-backoff on 429 with x-rate-limit-reset) -> urllib -> actual cost booked in x_spend and api_ledger.
-The bearer token travels only in the Authorization header and is never logged.
+Every call: the budget planner (`XBudget.admit`: hard caps against the ceiling cost, the hourly envelope against the
+expected cost, deferral instead of refusal) -> generic gate (rate, hard USD cap, backoff on 429 with
+x-rate-limit-reset) -> urllib -> actual cost booked in x_spend (with its unit) and api_ledger, and against the key it
+served (`x_keys.usd`). The bearer token travels only in the Authorization header and is never logged.
 
-Milestone 6, shadow mode (`XClient(shadow=True)`, the default with a token until `X_MODE=live` is allowed):
-the same calls and the same money, but a fast post becomes a `shadow_decisions` row (never a `decisions`
-row) and a confirmation count a `shadow_confirmations` row (never a `social_counts` row), each linked to the
-observe / observe_meta decision it would have confirmed (`fart/social/shadow.py`).
+Milestone 6, shadow mode (`XClient(shadow=True)`, the default with a token until `X_MODE=live` is allowed): the same
+calls and the same money, but a fast post becomes a `shadow_decisions` row (never a `decisions` row) and a
+confirmation count a `shadow_confirmations` row (never a `social_counts` row), each linked to the observe /
+observe_meta decision it would have confirmed (`fart/social/shadow.py`).
 """
 from __future__ import annotations
 
 import datetime as _dt
-import json
-import math
 import re
 import sqlite3
 import urllib.parse
@@ -33,14 +34,16 @@ from ..log import Throttle, get_logger
 from ..net.budget import Blocked, Budget
 from ..net.http import HttpError, request_json
 from ..util import now as wall_now
+from . import planner
 from . import shadow as shadow_mod
-from .xbudget import SOURCE, XBudget
+from .planner import clean_ticker, confirmation_query, meta_term_query  # noqa: F401  (re-exported: the query builders live with the planner)
+from .xbudget import SOURCE, XBudget, XVerdict
 
 log = get_logger("x")
 
 TWEET_FIELDS = "public_metrics,created_at,author_id"
 USER_FIELDS = "username,public_metrics"
-_TICKER_RE = re.compile(r"[^A-Z0-9]")
+_FROM_RE = re.compile(r"from:([A-Za-z0-9_]+)")
 
 
 # ----- pure helpers ----------------------------------------------------------------------------------
@@ -62,37 +65,16 @@ def kol_query(accounts: list[str]) -> str:
     return "(" + " OR ".join(f"from:{a}" for a in accounts) + ") -is:retweet"
 
 
-def clean_ticker(symbol: str | None) -> str:
-    return _TICKER_RE.sub("", str(symbol or "").upper().lstrip("$"))
+def accounts_in_query(query: str) -> int:
+    return len(set(_FROM_RE.findall(query or "")))
 
 
-def confirmation_query(mint: str, name: str | None, symbol: str | None, stopwords: set[str], ccfg: dict[str, Any]) -> str:
-    """`"<mint>" OR $TICKER OR "<exact name>"` on unambiguous keys only: the ticker when it is long
-    enough and not generic, the name when it has >= 2 words that are not all stopwords."""
-    terms = [f'"{mint}"']
-    ticker = clean_ticker(symbol)
-    generic = {g.upper() for g in ccfg.get("generic_tickers", [])}
-    if len(ticker) >= int(ccfg.get("min_ticker_len", 3)) and ticker not in generic and ticker.lower() not in stopwords and not ticker.isdigit():
-        terms.append(f"${ticker}")
-    nw = words(name)
-    if len(nw) >= 2 and any(w not in stopwords for w in nw):
-        clean_name = re.sub(r'["\\\n\r]+', " ", str(name)).strip()
-        if clean_name:
-            terms.append(f'"{clean_name}"')
-    return " OR ".join(terms)
-
-
-def meta_term_query(term: str, stopwords: set[str], ccfg: dict[str, Any]) -> str | None:
-    """A meta term is only searched when it is specific: a bigram or a long single word, never a stopword."""
-    t = normalize(term).strip()
-    if not t or t in stopwords or t.isdigit():
-        return None
-    generic = {g.lower() for g in ccfg.get("generic_tickers", [])}
-    if t in generic:
-        return None
-    if " " in t or len(t) >= int(ccfg.get("min_meta_term_len", 8)):
-        return f'"{t}"'
-    return None
+def interval_for(section: dict[str, Any], peak: bool, default_peak: float, default_off: float) -> float:
+    """The interval of an account watch: `interval_peak_s` in the peak hours, `interval_off_s` outside (milestone 7);
+    an old config with a single `interval_s` keeps it for both."""
+    if "interval_peak_s" in section or "interval_off_s" in section:
+        return float(section.get("interval_peak_s" if peak else "interval_off_s", default_peak if peak else default_off))
+    return float(section.get("interval_s", default_peak if peak else default_off))
 
 
 def rare_words(text: str | None, stopwords: set[str], min_len: int = 4) -> list[str]:
@@ -130,7 +112,7 @@ def is_fast(likes: int, likes_per_min: float | None, quotes_per_min: float | Non
 
 
 def posts_from_response(resp: Any, kind: str, received_at: float, query_key: str | None = None) -> list[dict[str, Any]]:
-    """Normalize a search / lookup response into post dicts (author from includes.users)."""
+    """Normalize a search / lookup response into post dicts (author from includes.users when expanded)."""
     if not isinstance(resp, dict):
         return []
     users = {}
@@ -150,6 +132,32 @@ def posts_from_response(resp: Any, kind: str, received_at: float, query_key: str
             "likes": pm.get("like_count"), "quotes": pm.get("quote_count"), "replies": pm.get("reply_count"), "impressions": pm.get("impression_count"),
             "kind": kind, "followers": upm.get("followers_count"), "query_key": query_key,
         })
+    return out
+
+
+def users_from_response(resp: Any) -> list[dict[str, Any]]:
+    """Normalize a `GET /2/users?ids=` response: id, username, followers."""
+    if not isinstance(resp, dict):
+        return []
+    out = []
+    for u in resp.get("data") or []:
+        if isinstance(u, dict) and u.get("id"):
+            out.append({"id": str(u["id"]), "username": u.get("username"), "followers": ((u.get("public_metrics") or {}).get("followers_count"))})
+    return out
+
+
+def pick_authors(posts: list[dict[str, Any]], max_authors: int, already_seen: Callable[[str], bool]) -> list[str]:
+    """The distinct authors of a confirmation search worth a lookup: the most engaged posts first (likes + quotes +
+    replies), newest first on a tie, skipping authors already expanded today (known and paid for), at most `max_authors`."""
+    ranked = sorted(posts, key=lambda p: (-(int(p.get("likes") or 0) + int(p.get("quotes") or 0) + int(p.get("replies") or 0)), -(p.get("created_at") or 0.0)))
+    out: list[str] = []
+    for p in ranked:
+        a = p.get("author_id")
+        if not a or a in out or already_seen(a):
+            continue
+        out.append(a)
+        if len(out) >= max(0, int(max_authors)):
+            break
     return out
 
 
@@ -174,27 +182,12 @@ def counts_from_response(resp: Any, now: float) -> tuple[int | None, int | None]
     return (last_hour if seen or buckets else None), (int(total) if isinstance(total, int) else None)
 
 
-def confirmation_candidates(conn: sqlite3.Connection, now: float, ccfg: dict[str, Any], stopwords: set[str]) -> list[dict[str, Any]]:
-    """Every key a confirmation count would be taken for right now, regardless of the interval: mints with an
-    observe decision in the last `window_s` that are still on the active watchlist (most recent first), then
-    the observe_meta terms of the window that are specific enough to search. Each entry carries the decision
-    it belongs to (id, kind, as_of) so a shadow row can be linked to it; `fart social dryrun` counts them."""
-    window = float(ccfg.get("window_s", 21600))
-    out: list[dict[str, Any]] = []
-    for r in conn.execute(
-        "SELECT d.id, d.mint, MAX(d.as_of) AS t, c.name, c.symbol FROM decisions d JOIN coins c ON c.mint = d.mint"
-        " WHERE d.kind='observe' AND d.verdict='observe' AND d.as_of >= ? AND d.mint IN (SELECT mint FROM watchlist WHERE active=1)"
-        " GROUP BY d.mint ORDER BY t DESC", (now - window,)):
-        out.append({"key": r["mint"], "kind": "mint", "query": confirmation_query(r["mint"], r["name"], r["symbol"], stopwords, ccfg),
-                    "decision_id": int(r["id"]), "decision_kind": "observe", "decision_as_of": float(r["t"])})
-    for r in conn.execute(
-        "SELECT id, term, MAX(as_of) AS t FROM decisions WHERE kind='observe_meta' AND verdict='observe' AND as_of >= ? GROUP BY term ORDER BY t DESC",
-        (now - window,)):
-        q = meta_term_query(r["term"], stopwords, ccfg)
-        if q:
-            out.append({"key": f"meta:{r['term']}", "kind": "meta", "query": q, "decision_id": int(r["id"]), "decision_kind": "observe_meta",
-                        "decision_as_of": float(r["t"])})
-    return out
+def confirmation_candidates(conn: sqlite3.Connection, now: float, cfg: dict[str, Any], stopwords: set[str]) -> list[dict[str, Any]]:
+    """The ranked candidate keys of the planner right now (`planner.candidates`): coin observations youngest first,
+    then the strongest themes. `cfg` is the whole X config (milestone 6 passed the `confirm` block alone)."""
+    if "confirm" not in cfg:
+        cfg = {"confirm": cfg}
+    return planner.candidates(conn, now, cfg, stopwords)
 
 
 # ----- storage ------------------------------------------------------------------------------------------
@@ -257,24 +250,32 @@ class XClient:
         self.base = cfg.get("api_base", "https://api.x.com/2").rstrip("/")
         self._throttle = Throttle(3600)
         self.stats: dict[str, int] = {}
+        self.last_verdict: XVerdict | None = None
 
     def _bump(self, k: str, n: int = 1) -> None:
         self.stats[k] = self.stats.get(k, 0) + n
 
     # ----- HTTP ---------------------------------------------------------------------------------------------
-    def _get(self, kind: str, path: str, params: dict[str, Any], est_usd: float, cost_fn: Callable[[Any], float] | None) -> Any | None:
-        """Policy -> gate -> GET. Returns the parsed body, or None when refused/failed (logged, ledgered)."""
+    def _get(self, kind: str, path: str, params: dict[str, Any], ceiling_usd: float, cost_fn: Callable[[Any], float] | None,
+             expected_usd: float | None = None) -> Any | None:
+        """Planner -> gate -> GET. Returns the parsed body, or None when deferred / refused / failed (counted, logged,
+        a refusal ledgered). `ceiling_usd` is what the call can cost at most (the gate's estimate as well), `expected_usd`
+        what it is expected to cost (the envelope's measure; the ceiling when omitted)."""
         now = self.clock()
-        v = self.xb.allow(kind, est_usd, now)
+        v = self.xb.admit(kind, ceiling_usd, expected_usd, now)
+        self.last_verdict = v
         if not v.allowed:
-            self._bump(f"blocked_{v.reason}")
-            if self._throttle.allow(f"blocked:{kind}:{v.reason}", now):
-                log.warning("x.blocked", kind=kind, reason=v.reason, spend_today=round(v.spend_today, 4), cap=self.xb.cap)
+            if v.deferred:
+                self._bump(f"deferred_{kind}")
+            else:
+                self._bump(f"blocked_{v.reason}")
+                if self._throttle.allow(f"blocked:{kind}:{v.reason}", now):
+                    log.warning("x.blocked", kind=kind, reason=v.reason, spend_today=round(v.spend_today, 4), cap=self.xb.cap)
             return None
         url = f"{self.base}{path}?{urllib.parse.urlencode(params, safe=':,')}"
         headers = {"Authorization": f"Bearer {self._token}"}
         try:
-            return self._request(self.budget, SOURCE, kind, url, headers=headers, timeout_s=10.0, cost=est_usd, cost_from_response=cost_fn)
+            return self._request(self.budget, SOURCE, kind, url, headers=headers, timeout_s=10.0, cost=ceiling_usd, cost_from_response=cost_fn)
         except Blocked as e:
             self._bump("blocked_gate")
             if self._throttle.allow(f"gate:{kind}:{e.reason}", now):
@@ -285,10 +286,12 @@ class XClient:
         return None
 
     def _search(self, kind: str, post_kind: str, query: str, max_results: int, since_id: str | None, start_time: float | None,
-                query_key: str | None, with_authors: bool = True) -> tuple[list[dict[str, Any]], str | None]:
-        """search/recent -> (new posts stored, newest_id). `kind` is the budget kind (mega_search, kol_search,
-        ca_search), `post_kind` what the rows carry (mega, kol, ca). Cost = new posts today x price + new
-        authors today x price."""
+                query_key: str | None, with_authors: bool = True, n_accounts: int = 0, extra_ceiling_usd: float = 0.0) -> dict[str, Any] | None:
+        """search/recent. Returns {new: stored new posts, posts: every post of the response, newest: newest_id, usd} or
+        None when nothing was called. `kind` is the budget kind (mega_search, kol_search, ca_search), `post_kind` what
+        the rows carry (mega, kol, ca). Cost = new posts today x price + new authors today x price (with_authors).
+        Ceiling = every post and every account new (`extra_ceiling_usd` adds the author lookup of a confirmation search);
+        an incremental call (since_id) is paced at the observed average cost of the kind."""
         now = self.clock()
         params: dict[str, Any] = {"query": query, "max_results": max(10, min(100, int(max_results))), "tweet.fields": TWEET_FIELDS}
         if with_authors:
@@ -298,9 +301,8 @@ class XClient:
             params["since_id"] = since_id
         elif start_time is not None:
             params["start_time"] = iso_utc(start_time)
-        est = self.xb.price("post_usd") + (self.xb.price("author_expansion_usd") if with_authors else 0.0)
-        if not since_id:
-            est *= params["max_results"]
+        ceiling = self.xb.search_ceiling(params["max_results"], n_accounts if with_authors else 0) + float(extra_ceiling_usd)
+        expected = self.xb.expected_cost(kind, ceiling, now) if since_id else ceiling
         booked: dict[str, Any] = {}
 
         def cost_fn(resp: Any) -> float:
@@ -308,46 +310,79 @@ class XClient:
             new_posts = self.xb.dedupe_new("post", [p["id"] for p in posts], now)
             authors = {p["author_id"] for p in posts if p.get("author_id")} if with_authors else set()
             new_authors = self.xb.dedupe_new("author", sorted(authors), now)
-            usd = len(new_posts) * self.xb.price("post_usd") + len(new_authors) * self.xb.price("author_expansion_usd")
-            booked.update(posts=posts, usd=usd, n=len(new_posts))
-            return usd
+            usd_posts = len(new_posts) * self.xb.price("post_usd")
+            usd_authors = len(new_authors) * self.xb.price("author_expansion_usd")
+            booked.update(posts=posts, usd=usd_posts + usd_authors, usd_posts=usd_posts, usd_authors=usd_authors, n=len(new_posts), n_authors=len(new_authors))
+            return usd_posts + usd_authors
 
-        resp = self._get(kind, "/tweets/search/recent", params, est, cost_fn)
+        resp = self._get(kind, "/tweets/search/recent", params, ceiling, cost_fn, expected)
         if resp is None:
-            return [], None
+            return None
         posts = booked.get("posts", posts_from_response(resp, post_kind, now, query_key))
 
         def _write(c) -> list[dict[str, Any]]:
-            self.xb.book(kind, booked.get("n", len(posts)), booked.get("usd", 0.0), now)
+            self.xb.book(kind, booked.get("n", len(posts)), booked.get("usd_posts", 0.0), now, unit="post")
+            if booked.get("n_authors"):
+                self.xb.book(kind, booked["n_authors"], booked.get("usd_authors", 0.0), now, unit="author")
             return [p for p in posts if upsert_post(c, p)]
 
         new = db.write_tx(self.conn, _write, what="x.search")
         newest = (resp.get("meta") or {}).get("newest_id") if isinstance(resp, dict) else None
         self._bump(f"{kind}_posts", len(new))
-        return new, (str(newest) if newest else None)
+        return {"new": new, "posts": posts, "newest": (str(newest) if newest else None), "usd": float(booked.get("usd", 0.0))}
+
+    def _lookup_authors(self, author_ids: list[str], now: float, post_kind: str = "ca") -> tuple[int, float]:
+        """`GET /2/users?ids=` for the chosen authors of a confirmation search (at most `search_max_authors`, chosen by
+        `pick_authors`); their username and follower count land on their posts. Returns (users looked up, USD)."""
+        if not author_ids:
+            return 0, 0.0
+        unit_price = self.xb.price("author_expansion_usd")
+        params = {"ids": ",".join(author_ids), "user.fields": USER_FIELDS}
+        booked: dict[str, Any] = {}
+
+        def cost_fn(resp: Any) -> float:
+            users = users_from_response(resp)
+            new = self.xb.dedupe_new("author", [u["id"] for u in users], now)
+            booked.update(users=users, n=len(new), usd=len(new) * unit_price)
+            return len(new) * unit_price
+
+        resp = self._get("ca_authors", "/users", params, unit_price * len(author_ids), cost_fn)
+        if resp is None:
+            return 0, 0.0
+        users = booked.get("users", users_from_response(resp))
+
+        def _write(c) -> None:
+            self.xb.book("ca_authors", booked.get("n", len(users)), booked.get("usd", 0.0), now, unit="author")
+            for u in users:
+                c.execute("UPDATE social_posts SET author=COALESCE(author, ?), followers=COALESCE(?, followers) WHERE author_id=? AND kind=?",
+                          (u.get("username"), u.get("followers"), u["id"], post_kind))
+
+        db.write_tx(self.conn, _write, what="x.authors")
+        self._bump("ca_authors", len(users))
+        return len(users), float(booked.get("usd", 0.0))
 
     # ----- jobs ----------------------------------------------------------------------------------------------
     def mega_watch(self, now: float) -> dict[str, Any]:
         mcfg = self.cfg["mega"]
         since = kv_get(self.conn, "x.mega.since_id")
-        new, newest = self._search("mega_search", "mega", mcfg["query"], int(mcfg.get("max_results", 20)), since,
-                                   now - float(mcfg.get("refresh_max_age_s", 7200)), None)
-        if newest:
-            kv_set(self.conn, "x.mega.since_id", newest, now)
+        res = self._search("mega_search", "mega", mcfg["query"], int(mcfg.get("max_results", 20)), since,
+                           now - float(mcfg.get("refresh_max_age_s", 7200)), None, n_accounts=accounts_in_query(str(mcfg.get("query", ""))))
+        if res and res["newest"]:
+            kv_set(self.conn, "x.mega.since_id", res["newest"], now)
         kv_set(self.conn, "x.mega.last", str(now), now)
-        return {"new_posts": len(new)}
+        return {"new_posts": len(res["new"]) if res else 0}
 
     def kol_watch(self, now: float) -> dict[str, Any]:
         if not self.kols:
             return {"new_posts": 0}
         kcfg = self.cfg["kol"]
         since = kv_get(self.conn, "x.kol.since_id")
-        new, newest = self._search("kol_search", "kol", kol_query(self.kols), int(kcfg.get("max_results", 20)), since,
-                                   now - 3600.0, None)
-        if newest:
-            kv_set(self.conn, "x.kol.since_id", newest, now)
+        res = self._search("kol_search", "kol", kol_query(self.kols), int(kcfg.get("max_results", 20)), since, now - 3600.0, None,
+                           n_accounts=len(self.kols))
+        if res and res["newest"]:
+            kv_set(self.conn, "x.kol.since_id", res["newest"], now)
         kv_set(self.conn, "x.kol.last", str(now), now)
-        return {"new_posts": len(new)}
+        return {"new_posts": len(res["new"]) if res else 0}
 
     def refresh_recent(self, now: float) -> dict[str, Any]:
         """Re-read today's mega posts younger than refresh_max_age_s to compute likes/min and mark `fast`."""
@@ -362,15 +397,16 @@ class XClient:
             return {"refreshed": 0, "fast": 0}
         ids = [r["id"] for r in rows]
         params = {"ids": ",".join(ids), "tweet.fields": TWEET_FIELDS}
-        unit = self.xb.price("refresh_post_usd")
-        resp = self._get("refresh", "/tweets", params, unit * len(ids), lambda r: unit * len((r or {}).get("data") or []) if isinstance(r, dict) else 0.0)
+        unit_price = self.xb.price("refresh_post_usd")
+        resp = self._get("refresh", "/tweets", params, unit_price * len(ids),
+                         lambda r: unit_price * len((r or {}).get("data") or []) if isinstance(r, dict) else 0.0)
         if resp is None:
             return {"refreshed": 0, "fast": 0}
         posts = posts_from_response(resp, "mega", now)
 
         def _write(c) -> int:
             n = 0
-            self.xb.book("refresh", len(posts), unit * len(posts), now)
+            self.xb.book("refresh", len(posts), unit_price * len(posts), now, unit="post")
             for p in posts:
                 upsert_post(c, p)
                 if self._update_velocity(p["id"], now, mcfg):
@@ -397,47 +433,86 @@ class XClient:
             return True
         return False
 
+    # ----- the confirmation planner ------------------------------------------------------------------------------
+    def sync_plan(self, now: float) -> dict[str, Any]:
+        """Admit, stop and displace keys (one short write); the counters of the sync."""
+        return db.write_tx(self.conn, lambda c: planner.sync(c, now, self.cfg, self.stopwords, self.rules_version), what="x.plan")
+
     def confirmation_keys(self, now: float) -> list[dict[str, Any]]:
-        """Keys due for a counts call: mints with an observe decision in the window that are still on the
-        active watchlist (most recent first), then observe_meta terms; each at most once per interval."""
-        ccfg = self.cfg["confirm"]
-        interval = float(ccfg.get("interval_s", 900))
-        out = confirmation_candidates(self.conn, now, ccfg, self.stopwords)
-        table = "shadow_confirmations" if self.shadow else "social_counts"
-        due = []
-        for k in out:
-            last = self.conn.execute(f"SELECT MAX(ts) FROM {table} WHERE key=?", (k["key"],)).fetchone()[0]
-            if last is None or now - float(last) >= interval:
-                due.append(k)
-        return due[: int(ccfg.get("max_keys_per_loop", 4))]
+        """The keys due for a count right now, in plan order (after syncing the plan): youngest coin observation
+        first, themes last. A confirmed key (search pending) is not in it; `due_requests` carries the searches."""
+        self.sync_plan(now)
+        return [r for r in planner.due_requests(self.conn, now) if r["request"] == planner.REQUEST_COUNT]
+
+    def _confirm_count(self, req: dict[str, Any], now: float, threshold: int, stats: dict[str, Any]) -> bool:
+        """One counts/recent call for a planned key; records it against the key and decides the key. False when the
+        call did not happen (deferred, refused or failed): the key stays due."""
+        params = {"query": req["query"], "granularity": "hour", "start_time": iso_utc(now - 86400.0)}
+        unit_price = self.xb.price("counts_request_usd")
+        resp = self._get("ca_counts", "/tweets/counts/recent", params, unit_price, lambda r: unit_price)
+        if resp is None:
+            if self.last_verdict is not None and self.last_verdict.deferred:
+                stats["deferred"] += 1
+            return False
+        n1h, n24 = counts_from_response(resp, now)
+
+        def _write(c) -> str:
+            self.xb.book("ca_counts", 1, unit_price, now, unit="request")
+            if self.shadow:
+                # shadow: the count is kept next to the decision it would have confirmed, never in social_counts
+                shadow_mod.write_shadow_confirmation(c, now, req, n1h, n24, threshold, self.rules_version)
+            else:
+                c.execute("INSERT OR REPLACE INTO social_counts(key, kind, ts, n_last_hour, n_24h, query) VALUES(?,?,?,?,?,?)",
+                          (req["key"], req["kind"], now, n1h, n24, req["query"]))
+            return planner.record_count(c, req, now, n1h, n24, threshold, unit_price, self.cfg)
+
+        outcome = db.write_tx(self.conn, _write, what="x.counts")
+        stats["counts"] += 1
+        stats["outcomes"][outcome] = stats["outcomes"].get(outcome, 0) + 1
+        if outcome == "confirmed":
+            log.info("x.key_confirmed", key=req["key"][:20], kind=req["kind"], n_last_hour=n1h, counts=req["counts_n"] + 1, shadow=self.shadow)
+            self._confirm_search(req, now, stats)  # the one search, right away when the planner admits it
+        elif outcome in planner.STOP_REASONS:
+            log.info("x.key_stopped", key=req["key"][:20], kind=req["kind"], reason=outcome, counts=req["counts_n"] + 1)
+        return True
+
+    def _confirm_search(self, req: dict[str, Any], now: float, stats: dict[str, Any]) -> bool:
+        """The single search of a confirmed key: `search_max_results` posts without author expansion, then a user lookup
+        of at most `search_max_authors` authors; the key stops as `confirmed`. False when the search did not happen
+        (it stays pending; the planner offers it first next tick)."""
+        ccfg, pcfg = self.cfg["confirm"], self.cfg.get("planner", {})
+        max_authors = max(0, int(pcfg.get("search_max_authors", 3)))
+        res = self._search("ca_search", "ca", req["query"], int(ccfg.get("search_max_results", 10)), None, now - 3600.0, req["key"],
+                           with_authors=False, extra_ceiling_usd=max_authors * self.xb.price("author_expansion_usd"))
+        if res is None:
+            if self.last_verdict is not None and self.last_verdict.deferred:
+                stats["deferred"] += 1
+            return False
+        authors_n, usd_authors = 0, 0.0
+        if max_authors and res["posts"]:
+            chosen = pick_authors(res["posts"], max_authors, lambda a: self.xb.seen_today("author", a, now))
+            authors_n, usd_authors = self._lookup_authors(chosen, now)
+        db.write_tx(self.conn, lambda c: planner.record_search(c, req, now, authors_n, res["usd"] + usd_authors), what="x.key_search")
+        stats["searches"] += 1
+        stats["posts"] += len(res["new"])
+        stats["authors"] += authors_n
+        return True
 
     def confirm(self, now: float) -> dict[str, Any]:
+        """One round of the confirmation planner: sync the plan, then serve what is due in plan order (pending
+        searches first, then the due counts). A deferred or refused count ends the round (the cheaper requests behind
+        it cost the same); a deferred search does not stop the counts behind it."""
         ccfg = self.cfg["confirm"]
-        stats = {"counts": 0, "searches": 0, "posts": 0}
-        for k in self.confirmation_keys(now):
-            params = {"query": k["query"], "granularity": "hour", "start_time": iso_utc(now - 86400.0)}
-            unit = self.xb.price("counts_request_usd")
-            resp = self._get("ca_counts", "/tweets/counts/recent", params, unit, lambda r: unit)
-            if resp is None:
+        stats: dict[str, Any] = {"counts": 0, "searches": 0, "posts": 0, "authors": 0, "deferred": 0, "outcomes": {}}
+        plan = self.sync_plan(now)
+        stats.update(admitted=plan.get("admitted", 0), stopped=plan.get("stopped", {}), active=plan.get("active", 0), waiting=plan.get("waiting", 0))
+        threshold = int(ccfg.get("search_when_count_1h", 10))
+        for req in planner.due_requests(self.conn, now):
+            if req["request"] == planner.REQUEST_SEARCH:
+                self._confirm_search(req, now, stats)
+                continue
+            if not self._confirm_count(req, now, threshold, stats):
                 break  # budget or transport: stop this round, keep the keys due
-            n1h, n24 = counts_from_response(resp, now)
-            threshold = int(ccfg.get("search_when_count_1h", 10))
-
-            def _write(c, k=k, n1h=n1h, n24=n24) -> None:
-                self.xb.book("ca_counts", 1, unit, now)
-                if self.shadow:
-                    # shadow: the count is kept next to the decision it would have confirmed, never in social_counts
-                    shadow_mod.write_shadow_confirmation(c, now, k, n1h, n24, threshold, self.rules_version)
-                else:
-                    c.execute("INSERT OR REPLACE INTO social_counts(key, kind, ts, n_last_hour, n_24h, query) VALUES(?,?,?,?,?,?)",
-                              (k["key"], k["kind"], now, n1h, n24, k["query"]))
-
-            db.write_tx(self.conn, _write, what="x.counts")
-            stats["counts"] += 1
-            if n1h is not None and n1h >= int(ccfg.get("search_when_count_1h", 10)):
-                new, _ = self._search("ca_search", "ca", k["query"], int(ccfg.get("search_max_results", 10)), None, now - 3600.0, k["key"])
-                stats["searches"] += 1
-                stats["posts"] += len(new)
         kv_set(self.conn, "x.confirm.last", str(now), now)
         return stats
 
@@ -503,12 +578,13 @@ class XClient:
 
     def tick(self, now: float) -> dict[str, Any]:
         summary: dict[str, Any] = {}
-        mcfg, kcfg, ccfg = self.cfg["mega"], self.cfg["kol"], self.cfg["confirm"]
-        if self.due("x.mega.last", float(mcfg.get("interval_s", 60)), now):
+        mcfg, kcfg = self.cfg["mega"], self.cfg["kol"]
+        peak = self.xb.is_peak(now)
+        if self.due("x.mega.last", interval_for(mcfg, peak, 60.0, 120.0), now):
             summary["mega"] = self.mega_watch(now)
         if self.due("x.refresh.last", float(mcfg.get("refresh_interval_s", 120)), now):
             summary["refresh"] = self.refresh_recent(now)
-        if self.due("x.kol.last", float(kcfg.get("interval_s", 180)), now):
+        if self.due("x.kol.last", interval_for(kcfg, peak, 180.0, 300.0), now):
             summary["kol"] = self.kol_watch(now)
         if self.due("x.confirm.last", 15.0, now):
             summary["confirm"] = self.confirm(now)
