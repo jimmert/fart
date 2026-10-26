@@ -62,14 +62,14 @@ def test_kv_roundtrip(conn):
 def test_settings_never_expose_secret_values(tmp_path, monkeypatch):
     from fart.config import load_settings
 
-    (tmp_path / ".env").write_text("RPC_HTTP_URL=https://solana-mainnet.g.alchemy.com/v2/SECRETKEY123\nRPC_DAILY_BUDGET_CU=1234\n")
+    (tmp_path / ".env").write_text("RPC_HTTP_URL=https://solana-mainnet.g.alchemy.com/v2/PLACEHOLDER-NOT-A-REAL-KEY\nRPC_DAILY_BUDGET_CU=1234\n")
     monkeypatch.delenv("RPC_HTTP_URL", raising=False)
     monkeypatch.delenv("RPC_DAILY_BUDGET_CU", raising=False)
     s = load_settings(root=tmp_path)
     assert s.rpc_daily_budget_cu == 1234
     assert s.rpc_is_public is False
     desc = s.describe()
-    assert "SECRETKEY123" not in str(desc)
+    assert "PLACEHOLDER-NOT-A-REAL-KEY" not in str(desc)
     assert desc["rpc_http"] == "https://solana-mainnet.g.alchemy.com"
 
 

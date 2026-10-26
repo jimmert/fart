@@ -24,6 +24,6 @@ def test_status_and_coverage_on_empty_database(settings, capsys):
 
 
 def test_status_output_contains_no_secret(settings, capsys, monkeypatch):
-    (settings.root / ".env").write_text("RPC_HTTP_URL=https://solana-mainnet.g.alchemy.com/v2/SECRETKEY123\n")
+    (settings.root / ".env").write_text("RPC_HTTP_URL=https://solana-mainnet.g.alchemy.com/v2/PLACEHOLDER-NOT-A-REAL-KEY\n")
     assert main(["--root", str(settings.root), "--quiet", "status"]) == 0
-    assert "SECRETKEY123" not in capsys.readouterr().out
+    assert "PLACEHOLDER-NOT-A-REAL-KEY" not in capsys.readouterr().out

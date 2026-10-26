@@ -8,7 +8,7 @@
     "raw_flush_interval_s": 5,
     "raw_flush_lines": 200,
     "watchlist_sync_interval_s": 5,
-    "max_trade_subscriptions": 200
+    "_comment": "trade subscription cap lives in config/engine.json -> watchlist.cap"
   },
   "rpc_logs": {
     "enabled": true,
@@ -23,7 +23,8 @@
     "min_gap_s": 30,
     "max_signatures_per_gap": 1000,
     "max_transactions_per_gap": 100,
-    "max_transactions_per_day": 1500
+    "max_transactions_per_day": 1500,
+    "sweep_interval_s": 300
   },
   "enrich": {
     "enabled": true,

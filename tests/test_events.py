@@ -154,3 +154,25 @@ def test_events_from_transaction_tolerates_garbage():
     te = events_from_transaction({"meta": {"logMessages": None, "innerInstructions": [{"instructions": [{"data": 5}, {"data": "0OIl"}]}]}})
     assert te.events == [] and te.signature is None
     assert create_from_tx(te) is None and migration_from_tx(te) is None
+
+
+@pytest.mark.parametrize("name,kind", [("tx_create_real.json", "create"), ("tx_migration_real.json", "migrate")])
+def test_real_recordings_if_present(fixtures_dir, name, kind):
+    """Drop real getTransaction responses into tests/fixtures/ (see docs/PUMPFUN-EVENTS.md)."""
+    path = fixtures_dir / name
+    if not path.exists():
+        pytest.skip(f"{name} not recorded yet (docs/PUMPFUN-EVENTS.md, step 5)")
+    data = json.loads(path.read_text())
+    tx = data.get("result", data)
+    te = events_from_transaction(tx)
+    assert te.signature and te.slot and te.block_time
+    assert not te.undecoded or all(u.reason == "ignored_event" for u in te.undecoded), [u.reason for u in te.undecoded]
+    if kind == "create":
+        ev = te.first("CreateEvent")
+        rec = create_from_tx(te)
+        assert rec and rec["mint"] and rec["creator"]
+    else:
+        ev = te.first("CompletePumpAmmMigrationEvent")
+        rec = migration_from_tx(te)
+        assert rec and rec["mint"] and rec["pool_address"]
+    assert ev is not None and not ev.suspect and ev.extra_bytes == 0, (ev.layout, ev.suspect, ev.extra_bytes)
