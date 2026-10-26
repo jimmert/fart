@@ -126,10 +126,14 @@ def coin_features(conn: sqlite3.Connection, mint: str, as_of: float, params: Cur
     bf = float(cfg.get("bundled_dev_buy_fraction", 0.5))
     fast_grad = f["graduated"] and f["graduation_time"] is not None and (f["graduation_time"] - created) <= bw
     big_dev = f["dev_buy_frac_of_curve"] is not None and f["dev_buy_frac_of_curve"] >= bf
-    if f["dev_buy_frac_of_curve"] is None and not f["graduated"]:
-        f["bundled"] = None  # unknown: no dev-buy information yet
+    if fast_grad or big_dev:
+        f["bundled"] = True
+    elif f["dev_buy_frac_of_curve"] is None:
+        f["bundled"] = None  # the dev-buy criterion cannot be ruled out without dev-buy information
+    elif f["graduated"] or f["age_s"] > bw:
+        f["bundled"] = False  # small dev buy and no (possible) instant graduation
     else:
-        f["bundled"] = bool(fast_grad or big_dev)
+        f["bundled"] = None  # too young to rule out an instant graduation
     f["bundled_reasons"] = [r for r, ok in (("fast_graduation", fast_grad), ("dev_buy_ge_half_curve", big_dev)) if ok]
 
     # creator history from our own data (creates by the same wallet before this coin)
