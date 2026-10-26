@@ -354,3 +354,146 @@ vervallen door de rsync. Deploy: `deploy/DEPLOY.md`, sectie "Upgrade to mileston
     `hourly_cu_fraction=0.015`, `RPC_DAILY_BUDGET_CU=4500000`) end with the upgrade: the rsync replaces the
     config files, the deployer puts the cap back to 3,000,000 (DEPLOY.md, "Upgrade to milestone 4"). The
     expected `fart status` lines after 15 minutes and the dashboard calibration step are written down there.
+
+## Milestone 5 (26 oktober 2026)
+
+**Samenvatting voor Jim.** Mijlpaal 5 levert wat de meetweek nodig heeft en bereidt de community-stap
+voor zonder hem te zetten. Niets aan de engine-regels, de winnaarsdefinitie of de meetmethode verandert
+(`method_version` blijft m1.0; de vingerafdruk van de regelbestanden is gelijk aan die van `150ca73cb354`,
+een test bewaakt dat). (1) **Weekrapport** `fart measure week --end <dag> --days 7` (timer dagelijks 06:30
+UTC; de maandagrun is de hele kalenderweek), per segment van gelijke regels × meetmethode: universum per
+dag (creates per bron, graduaties, `coin_unknown`, winnaars organisch/gebundeld/onbekend, uren NIET GEDEKT,
+budgetpauzes), trefkans van munt-observaties (raak binnen 24 u gedeeld door de beslissingen waarvan de 24 u
+verstreken zijn; onbekend telt mee in de noemer, nog bezig staat apart), recall (winnaars met munt- óf
+thema-beslissing vóór eerste trade en vóór graduatie), lead time (mediaan, p25, p75, bins), blokbootstrap per
+dag (9.999 trekkingen, seed 20261026, alpha 0,05; minder dan 3 gedekte dagen of 20 winnaars = "te weinig
+data"; een NIET GEDEKT-dag is geen blok en nooit een dag met nul winnaars), kosten per dag (CU-schatting met
+de kanttekening dat de ijking met Alchemy open staat; X in dollars) en de go/no-go-toets. (2) **Go/no-go-
+criteria** vooraf bevroren in `config/measure.json` → `community_gate` (hieronder in het Nederlands). Het
+rapport toont alleen voldaan / niet voldaan / te weinig data; het beslist niets en verstuurt niets.
+(3) **Community-kanaal** in `fart-notify`, standaard uit: pas met `TELEGRAM_COMMUNITY_CHAT_ID` én
+`TELEGRAM_COMMUNITY_ENABLED=1` gaat er ooit iets naar een andere chat dan die van de eigenaar (de uitgaande
+poort weigert elke andere chat, ook een rij die al in de outbox stond); de community-opmaak in gewone taal
+(wat gezien is, waarom het opvalt, de bevroren regels, een vaste waarschuwing, de footer, het mint-adres als
+tekst, geen link of koopknop); `TELEGRAM_COMMUNITY_PREVIEW=1` stuurt die tekst als extra bericht naar Jim met
+de kop "VOORBEELD community-bericht", binnen zijn eigen limieten; de community-regels (1 per munt en per
+thema per 24 u, 6 per uur, stille uren 02:00-08:00 Amsterdam) en het wekelijkse verantwoordingsbericht
+bestaan al, ook zolang het kanaal uit staat. (4) **Meetfidelity**: het dag- en weekrapport tonen het aandeel
+graduaties met minstens elke 10 minuten een sample; een graduatie zonder voldoende samples telt als
+"uitkomst onbekend", nooit als "geen winnaar"; de tracker telt wat hij overslaat (`measure.track.skipped`
+in `fart status`). (5) **M4-restpunt**: de engine sluit elke tick `meta_burst`-rijen boven 40 die niet in de
+bevroren sets zitten (oudste eerst, nooit met een trade in de laatste 10 minuten) en schemamigratie v5 doet
+dat eenmalig bij de upgrade; de test met 195 oude rijen plus reserve 100 geeft na één tick 40 `meta_burst`
+en probation krijgt plek. Deploy: `deploy/DEPLOY.md`, sectie "Upgrade to milestone 5".
+
+**Go/no-go-criteria voor community-alerts (bevroren op 26 oktober 2026, vóór de meetweek).** Startwaarden
+gekozen door de bouwer; Jim kan ze bijstellen vóór het einde van de meetweek, nooit erna. Ze staan in
+`config/measure.json` → `community_gate`; het weekrapport toetst ze en drukt per criterium "voldaan",
+"niet voldaan" of "te weinig data" af, plus één oordeel (GO / NO-GO / TE WEINIG DATA). Niets in het rapport
+beslist of verstuurt iets.
+
+1. Minimaal **5 complete dagen** in het venster: een dag telt als compleet wanneer geen enkel piekuur
+   (12:00 tot 02:00 UTC, in het rapport de uren 12 tot en met 23 en 0 en 1 van die UTC-dag) NIET GEDEKT was.
+2. Minimaal **30 winnaars** in het universum (gemeten graduaties met piek ≥ $100.000 én volume ≥ $20.000
+   binnen 24 u, gedekte dagen).
+3. De **ondergrens van het bootstrapinterval van de trefkans** van munt-observaties is **≥ 0,15**. Trefkans =
+   raak binnen 24 u gedeeld door de observaties waarvan de 24 u verstreken zijn; een onbekende uitkomst
+   telt mee in de noemer (een niet-meetbare observatie is geen aangetoonde treffer), een nog lopende staat
+   apart en komt in de noemer zodra haar 24 u voorbij zijn.
+4. De **ondergrens van het bootstrapinterval van de recall vóór graduatie** is **≥ 0,25**: het aandeel
+   winnaars met een munt- óf thema-beslissing vóór hun graduatie.
+5. De **mediane lead time vóór graduatie** (graduatie minus de vroegste munt- of thema-beslissing, over de
+   winnaars die een beslissing hadden) is **≥ 10 minuten**.
+6. Gemiddeld **hoogstens 12 observaties per gedekte dag** (munt- plus thema-beslissingen).
+
+Bij minder dan 3 gedekte dagen of minder dan 20 winnaars tonen de criteria 3 en 4 "te weinig data" in plaats
+van een interval; de intervallen komen uit een blokbootstrap met de gedekte dagen als blokken (9.999
+trekkingen, seed 20261026, alpha 0,05). Een regelwijziging tijdens de week (nieuwe vingerafdruk) opent een
+nieuw segment in het rapport; de criteria worden per segment getoetst.
+
+71. **Branch and PR**: all work on the harness branch `claude/hopeful-hamilton-6b9ld0`; the PR targets `main`.
+72. **No rule change, provably** (`fart/version.py` → `rules_fingerprint()`, `RULE_FILES`): every deploy is a
+    new commit and therefore a new `rules_version`, including this one, while the engine rules did not change.
+    The fingerprint is a sha256 over the rule-defining files (config/engine.json, config/pumpfun.json,
+    config/stopwords.json, fart/chain/curve.py, fart/engine/decide.py, fart/engine/features.py,
+    fart/engine/meta.py; orchestration such as the watchlist mechanics is deliberately not part of it). The
+    engine records it next to its rules_version in kv (`engine.rules_fingerprint.<rv>`), the frozen value of
+    `150ca73cb354` lives in `config/measure.json` → `community_gate.frozen_rules`, and
+    `tests/test_m5_week_report.py::test_the_working_tree_still_runs_the_frozen_rules` fails as soon as a rule
+    file changes without that entry being updated on purpose. The week report pools rules_versions with the same
+    fingerprint into one segment and always lists them; a rules_version without a known fingerprint is a segment
+    of its own.
+73. **Week report = aggregation of daily reports** (`fart/measure/week.py` over `report.build_report(...,
+    method_version=mv)` per day and per method present in `outcomes`): no second implementation of the universe,
+    the coverage or the outcome logic. The daily report gained the blocks the week needs (decisions and
+    observations per rules_version, the earliest coin and theme decision per rules_version for every winner with
+    numeric event times, the peak-hour coverage, the day's budget pauses and estimated costs) and keeps every
+    field it had. The week report is always built fresh from the database, never from the daily JSON files (those
+    were written at 06:00 with the day's late graduations still `nog bezig`).
+74. **Hit-rate denominator**: decisions whose 24 h have elapsed (known + unknown outcome); unknown stays in the
+    denominator because an observation we could not measure is not a demonstrated hit, pending is excluded and
+    printed next to it (it joins once its 24 h have passed), and the rate over known outcomes is printed as well.
+    Counting pending as a miss would have called "not yet known" zero, which the honesty rules forbid; counting
+    unknown as a hit would invent successes. The gate uses this conservative statistic.
+75. **Recall and lead time use the earliest of coin and theme decision** of the segment's rules: the community
+    would receive both kinds, so "did we have it before graduation" counts either; coin-only and theme-only are
+    printed next to it. Lead time = event minus that earliest decision; the bins come from
+    `config/measure.json` → `report.lead_time_bins_s`.
+76. **Block bootstrap with days as blocks** (`week.bootstrap_ratio`): the covered days of the window are
+    resampled with replacement 9,999 times with `random.Random(20261026)`, the pooled ratio per draw, percentile
+    interval at alpha 0.05; a draw with an empty denominator is undefined and skipped (never zero). A NIET GEDEKT
+    day is not a block (its universe is unknown) and never counts as a day with zero winners; `test_not_covered_days_
+    are_no_blocks_and_never_count_as_zero_winners` pins both. Fewer than 3 covered days or fewer than 20 winners
+    prints "te weinig data" (`week.bootstrap`).
+77. **Complete day for the gate** = every peak hour (12:00-02:00 UTC as the hours 12..23 and 0..1 of the same UTC
+    day) covered; the 00:00-02:00 part of a calendar day belongs to the window that started the day before, but
+    a per-day block needs per-day hours, so the shift of two hours is accepted and documented.
+78. **Observations per day** counts coin and theme decisions together (both would become community messages).
+79. **Tracker coverage, not a method change** (`report.tracker_coverage`, `config/measure.json` → `tracker.
+    max_sample_gap_s` 600): a graduation is covered when its `mcap_samples` rows in [graduation, +24 h] are never
+    more than 10 minutes apart, the gaps to the window edges included. A stored `hit_100k = 0` of an uncovered
+    graduation is reported as "uitkomst onbekend" with reason `sparse_samples` (a peak between sparse samples may
+    have been missed); a winner stays a winner (sparse samples cannot invent a peak); `hit_100k = NULL` stays
+    unknown. The `outcomes` rows and `method_version` m1.0 are untouched: the report layer reclassifies, as the
+    brief asked; the rule applies to the universe (graduations), decisions keep their `data_quality` in the
+    outcome json. The daily report test moved its synthetic "no winner" coin to dense samples so the known answer
+    stays a known miss.
+80. **`measure.track.skipped`** (`Tracker.run`): mints beyond `max_mints_per_run` and mints whose DexScreener batch
+    was refused by the gate (the rest of the run) or failed are counted per run in kv (all time, per day, the
+    last reasons); `fart status` prints the line; the daily report shows the day's count. Nothing else in the
+    tracker changed.
+81. **Community channel off by default, enforced at the gate** (`fart/notify/service.py`): `Notifier.allowed_chats`
+    is the owner chat plus the community chat only while `settings.community_enabled` (chat id set, flag 1, owner
+    channel enabled, chat id not the owner's). `_enqueue()` refuses every other chat before the outbox and the
+    sender marks a pending row for a chat that is not allowed `gave_up` without calling the API, so switching the
+    channel off also stops what was already queued. `tests/test_m5_community.py` proves that with either name
+    missing nothing reaches another chat, and that a forged row is never sent.
+82. **Community format** (`format.community_message`): what was seen (coin, theme when the coin's name or ticker
+    carries a currently observed theme term, buyers in 5 minutes, net SOL inflow, market cap, age; for a theme:
+    coins, makers, inflow, buyers, burst), why it stands out (the decision's own numbers in words), the rules (the
+    decision's `rules_version` plus the thresholds of config/engine.json in plain Dutch), the fixed warning line
+    (`notify.community.warning`: no advice, high risk, everything measured and published afterwards), the footer.
+    The mint address as `<code>` text, no link, no button. No tier or advice words.
+83. **Preview** (`TELEGRAM_COMMUNITY_PREVIEW=1`): the same text with the header "VOORBEELD community-bericht" as
+    kind `community_preview` to the owner through the same outbox; previews count towards
+    `observe.max_batches_per_hour` (kinds observe + community_preview) and share the sender's 20 per minute; the
+    community rules apply to previews exactly as to real messages, so what Jim sees is what the community would
+    have received, no more. The weekly accountability message has a preview twin (`community_weekly_preview`).
+84. **Community rules** (`config/notify.json` → `community`): one message per coin and per theme per 24 h (kv
+    `notify.community.key.<coin|theme>:<key>`), at most 6 distinct decisions per hour (real and preview of one
+    decision count once), nothing during `quiet_hours` (02:00-08:00 Europe/Amsterdam by default; start == end
+    disables; may wrap midnight), skipped decisions are counted (`community_skipped_*` in the tick summary) and
+    never sent late. The weekly accountability message (Monday 06:45 UTC, after the 06:30 week report) summarizes
+    the go/no-go section in plain words, says how many community messages went out that week or that the channel
+    is off, and carries the warning line; it exists and is tested while the channel is off.
+85. **Watchlist trim** (`watch.trim`, engine step 1, schema v5): `meta_burst` rows above `meta_burst_max_total`
+    that are not in the frozen sets are closed oldest-first, never a row that traded in the last
+    `TRIM_RECENT_TRADE_S` 600 s (a module constant, not a config key: config/engine.json is a rule file and stays
+    byte-identical). The migration reads the frozen sets from kv `engine.meta_burst_sets`, uses the bound 40
+    (`SCHEMA_V5_META_BURST_MAX_TOTAL`, pinned to the config by a test) and records the counts in kv
+    `schema.v5.cleanup`; the trade stream unsubscribes the closed mints itself. The watchlist mechanics are not
+    part of the rules fingerprint on purpose (item 72): this is a repair of the M4 intent, not a change of what
+    becomes an observation.
+86. **Timer** `fart-measure-week.timer` runs daily at 06:30 UTC (after the 06:00 daily report); the Monday run is
+    the Monday-Sunday calendar week and the JSON says so (`calendar_week`). One timer instead of two: the same
+    command, the same file name `week-<end>`.

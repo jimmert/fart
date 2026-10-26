@@ -248,6 +248,10 @@ def test_daily_report_synthetic_day(settings, conn):
     from fart.util import day_key
 
     d_win, d_lose, d_unk = build_world(conn)
+    # milestone 5: a "no winner" only counts when the tracker sampled the whole window at least every 10 min;
+    # LOSE gets a sample every 5 min (its single +2 h sample from build_world stays), the others keep sparse samples
+    for k in range(0, 86400, 300):
+        add_sample(conn, "LOSE", T0 + 2600 + k + 7, 40000.0, 9000.0, vol1=2000.0, vol6=5000.0)
     budget = Budget(conn, load_source_configs(settings.config("budget"), {}), settings.lock_path, clock=Clock(T0))
     now = T0 + 95000  # every +24 h horizon of the day is due
     tr = oc.Tracker(conn, settings, budget, clock=Clock(now))
@@ -266,6 +270,9 @@ def test_daily_report_synthetic_day(settings, conn):
     assert u["graduations"] == 5 and u["measured"] == 5 and u["pending"] == 0
     assert u["winners"] == 2 and u["winners_organic"] == 1 and u["winners_bundled"] == 1
     assert u["not_winner"] == 1 and u["outcome_unknown"] == 2  # UNK and NOCR
+    assert u["outcome_unknown_sparse_samples"] == 0 and u["tracker_covered"] == 1 and u["tracker_not_covered"] == 4  # only LOSE is dense
+    assert u["tracker_coverage_share"] == 0.2 and rep["tracker"]["covered"] == 1 and rep["tracker"]["max_sample_gap_s"] == 600
+    assert [g["outcome"] for g in rep["graduations"]] == ["winner", "winner", "not_winner", "unknown", "unknown"]
     assert u["without_create"] == 1 and u["bundled_unknown_total"] == 2
     assert rc["with_decision"] == 1 and rc["decision_before_graduation"] == 1 and rc["decision_before_first_trade"] == 1
     assert rc["recall_before_graduation"] == 0.5 and rc["recall_organic_before_graduation"] == 1.0
@@ -279,11 +286,22 @@ def test_daily_report_synthetic_day(settings, conn):
     assert rep["complete"] is False  # one hour with a gap
     assert rep["unknowns"]["graduations_outcome_unknown"] == 2 and rep["unknowns"]["graduations_without_create"] == 1
     assert rep["method_version"] == "m1.0" and rep["rules_versions_in_decisions"] == ["r1"]
+    # milestone 5: the per-rules_version blocks the week report aggregates
+    assert rep["precision_by_rules_version"] == {"r1": {"decisions": 3, "known": 2, "hits": 1, "misses": 1, "unknown": 1, "pending": 0, "distinct_mints": 3, "elapsed": 3}}
+    assert rep["observations_by_rules_version"] == {"r1": {"observe": 3, "observe_meta": 1}}
+    assert win["earliest_by_rules_version"] == {"r1": {"coin": {"id": d_win, "as_of": T0 + 100}, "theme": {"id": win["decision_id"] + 3, "term": "goldberg", "as_of": T0 + 50}}}
+    assert win["theme_lead_s_vs_first_trade"] == 70 and win["first_trade_at"] is not None and win["decision_rules_version"] == "r1"
+    assert rc["any_before_graduation"] == 1 and rc["any_before_first_trade"] == 1 and rc["theme_before_first_trade"] == 1
+    assert rep["coverage"]["peak_hours_not_covered"] == 0 and len(rep["coverage"]["peak_hours_utc"]) == 14
+    assert rep["ops"]["cost"]["rpc_cu_estimate"] == 0 and rep["ops"]["cost"]["cu_calibrated"] is False and rep["ops"]["cost"]["x_usd"] is None
+    assert rep["ops"]["budget_pauses"] == {"rpc_cap_blocked_calls": 0, "x_cap_blocked_calls": 0, "budget_cap_gap_s": 0, "trade_stream_envelope_paused": 0}
     md = render_markdown(rep)
     assert md.startswith(f"# Dagrapport recall {day}")
     for heading in ("## Samenvatting", "## Dekking (coverage)", "## Winnaars", "## Lead time", "## Precisie van observaties", "## Paper trades", "## Onbekenden", "## Versies"):
         assert heading in md
     assert "NIET COMPLEET" in md and "Goldberg Winner" in md
+    assert "Dekking van de tracker: 1 van 5 gemeten graduaties had minstens elke 10 min een sample (20%)" in md
+    assert "## Budget en kosten" in md and "ijking met het Alchemy-dashboard staat open" in md
 
 
 def test_report_cli_writes_atomic_outputs(settings, conn, capsys):

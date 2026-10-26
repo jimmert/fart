@@ -91,15 +91,19 @@ chmod 0640 "$FART_ROOT/.env"
 # daemons restart, means every service starts on the new schema. Safe while the old daemons run (WAL).
 # Milestone 3 (user_version 3) also removes the rows the USDC/PUMP "migrations" caused and prints
 # the counts (kv schema.v3.cleanup); milestone 4 (user_version 4) closes the milestone-2 graduation
-# watchlist rows and flags migrations without a create (kv schema.v4.cleanup); a second run changes nothing.
+# watchlist rows and flags migrations without a create (kv schema.v4.cleanup); milestone 5 (user_version 5)
+# trims the meta_burst watchlist rows above the engine's bound of 40 (kv schema.v5.cleanup); a second run
+# changes nothing.
 if [ -f "$FART_ROOT/data/fart.db" ]; then
   if STATUS_JSON="$(sudo -u "$FART_USER" "$FART_ROOT/bin/fart" --quiet --json status 2>/dev/null)"; then
     log "database schema: $(printf '%s' "$STATUS_JSON" | "$VENV/bin/python" -c 'import json,sys
 d = json.load(sys.stdin)
 c = d.get("schema_v3_cleanup") or {}
 c4 = d.get("schema_v4_cleanup") or {}
+c5 = d.get("schema_v5_cleanup") or {}
 print("user_version", d.get("schema_version"), "| v3 cleanup of system-mint rows:", json.dumps(c.get("deleted")) if c else "not run",
-      "| v4 cleanup (graduation rows closed, migrations flagged):", json.dumps(c4.get("counts")) if c4 else "not run")')"
+      "| v4 cleanup (graduation rows closed, migrations flagged):", json.dumps(c4.get("counts")) if c4 else "not run",
+      "| v5 cleanup (meta_burst rows trimmed):", json.dumps(c5.get("counts")) if c5 else "not run")')"
   else
     log "WARNING: schema check failed (fart status); the daemons will retry the migration on start"
   fi
@@ -113,7 +117,7 @@ systemctl daemon-reload
 if command -v systemd-analyze >/dev/null 2>&1; then
   systemd-analyze verify /etc/systemd/system/fart-*.service /etc/systemd/system/fart-*.timer 2>&1 | grep -v -e 'is not loaded properly' || true
 fi
-systemctl enable fart-ingest.service fart-engine.service fart-measure-track.timer fart-measure-report.timer fart-backup.timer >/dev/null
+systemctl enable fart-ingest.service fart-engine.service fart-measure-track.timer fart-measure-report.timer fart-measure-week.timer fart-backup.timer >/dev/null
 OPTIONAL_SERVICES=""
 for u in fart-social.service fart-notify.service; do
   if [ -f "/etc/systemd/system/$u" ]; then
@@ -125,7 +129,7 @@ if [ "$START_SERVICES" = "1" ]; then
   systemctl restart fart-ingest.service
   systemctl restart fart-engine.service
   for u in $OPTIONAL_SERVICES; do systemctl restart "$u"; done
-  systemctl start fart-measure-track.timer fart-measure-report.timer fart-backup.timer
+  systemctl start fart-measure-track.timer fart-measure-report.timer fart-measure-week.timer fart-backup.timer
   log "services (re)started:$OPTIONAL_SERVICES fart-ingest fart-engine + timers"
 fi
 
@@ -140,4 +144,6 @@ echo "  sudo -u $FART_USER $FART_ROOT/bin/fart coverage --hours 3"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart chain global        # Global account vs config/pumpfun.json"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart events classify     # undecoded event discriminators"
 echo "  systemctl start fart-backup.service && systemctl show -p Result,ExecMainStatus fart-backup.service   # backup fix (M3)"
+echo "  sudo -u $FART_USER $FART_ROOT/bin/fart measure week --end $(date -u -d yesterday +%F 2>/dev/null || date -u +%F) --days 1   # week report smoke test (M5), sends nothing"
+echo "  systemctl list-timers 'fart-*' --no-pager                          # fart-measure-week.timer daily 06:30 UTC"
 echo "  tail -f $FART_ROOT/logs/ingest.log"

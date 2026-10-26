@@ -15,6 +15,13 @@ priority and re-added them one engine tick later with a fresh `since`):
 * `probation_reserve` slots of the cap can only be used by probation: the other reasons share
   `cap - probation_reserve` slots among themselves. Probation may use any free slot beyond its
   reserve; such an overflow slot is the first thing a higher-priority add reclaims.
+
+Milestone 5 (the M4 leftover on the VPS, 26 Oct 2026 12:18 UTC): the 195 `meta_burst` rows milestone 3
+had written stayed active after the upgrade (`add()` only limits new additions, rows expire by
+`dead_after_idle_s` or their 24 h TTL), so probation got 5 slots while `probation_reserve` is 100 and
+`meta_burst_max_total` 40. `trim()` closes, oldest first, the `meta_burst` rows above `max_total` that
+are not part of the engine's frozen choice and had no trade in the last `TRIM_RECENT_TRADE_S`; the
+engine runs it every tick and schema v5 runs it once at the upgrade.
 """
 from __future__ import annotations
 
@@ -22,6 +29,7 @@ import sqlite3
 from typing import Any, Iterable
 
 PRIORITY = {"probation": 0, "early_buyers": 1, "meta_burst": 2, "graduation": 3, "observe": 4}
+TRIM_RECENT_TRADE_S = 600.0  # a row that traded in the last 10 minutes is never trimmed
 _PRIORITY_SQL = ("CASE COALESCE(reason, 'probation') WHEN 'probation' THEN 0 WHEN 'early_buyers' THEN 1"
                  " WHEN 'meta_burst' THEN 2 WHEN 'graduation' THEN 3 WHEN 'observe' THEN 4 ELSE 0 END")
 
@@ -113,6 +121,31 @@ def expire(conn: sqlite3.Connection, now: float, dead_after_idle_s: float | None
             (now, now - dead_after_idle_s),
         )
         n += cur.rowcount
+    return n
+
+
+def trim(conn: sqlite3.Connection, reason: str, max_total: int, keep: Iterable[str], now: float,
+         recent_trade_s: float = TRIM_RECENT_TRADE_S) -> int:
+    """Deactivate active rows with `reason` above `max_total`, oldest `since` first, skipping the mints in
+    `keep` (the engine's frozen meta_burst sets) and rows with a trade in the last `recent_trade_s`.
+    Returns the number of rows closed. Call inside a write transaction."""
+    rows = conn.execute(
+        "SELECT mint, last_trade_at FROM watchlist WHERE active=1 AND reason=? ORDER BY since ASC, mint ASC", (reason,)
+    ).fetchall()
+    excess = len(rows) - max(0, int(max_total))
+    if excess <= 0:
+        return 0
+    keep_set = set(keep)
+    n = 0
+    for r in rows:
+        if n >= excess:
+            break
+        if r["mint"] in keep_set:
+            continue
+        if r["last_trade_at"] is not None and float(r["last_trade_at"]) > now - float(recent_trade_s):
+            continue
+        conn.execute("UPDATE watchlist SET active=0, until=? WHERE mint=? AND active=1 AND reason=?", (now, r["mint"], reason))
+        n += 1
     return n
 
 

@@ -24,6 +24,8 @@ ENV_KEYS = (
     # milestone 2
     "PUMPPORTAL_API_KEY", "X_BEARER_TOKEN", "X_DAILY_BUDGET_USD",
     "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_CHAT_ID", "TELEGRAM_NOTIFY_ENABLED",
+    # milestone 5: the community channel, off by default (both must be set explicitly to send anywhere else)
+    "TELEGRAM_COMMUNITY_CHAT_ID", "TELEGRAM_COMMUNITY_ENABLED", "TELEGRAM_COMMUNITY_PREVIEW",
 )
 
 
@@ -75,6 +77,9 @@ class Settings:
     telegram_bot_token: str = ""
     telegram_owner_chat_id: str = ""
     telegram_notify_enabled: bool = False
+    telegram_community_chat_id: str = ""
+    telegram_community_enabled: bool = False
+    telegram_community_preview: bool = False
     configs: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -132,6 +137,23 @@ class Settings:
     def telegram_enabled(self) -> bool:
         return self.telegram_notify_enabled and self.telegram_configured
 
+    # ----- milestone 5: the community channel ----------------------------------------------------
+    @property
+    def community_configured(self) -> bool:
+        """A community chat id exists and differs from the owner's."""
+        return bool(self.telegram_community_chat_id) and self.telegram_community_chat_id != self.telegram_owner_chat_id
+
+    @property
+    def community_enabled(self) -> bool:
+        """Only with TELEGRAM_COMMUNITY_CHAT_ID set AND TELEGRAM_COMMUNITY_ENABLED=1 AND the owner channel
+        enabled may anything be sent to another chat than the owner's. Default: off."""
+        return self.telegram_enabled and self.telegram_community_enabled and self.community_configured
+
+    @property
+    def community_preview(self) -> bool:
+        """TELEGRAM_COMMUNITY_PREVIEW=1: the community text goes to the OWNER as an extra message."""
+        return self.telegram_enabled and self.telegram_community_preview
+
     def config(self, name: str) -> Any:
         return self.configs[name]
 
@@ -154,6 +176,9 @@ class Settings:
             "x_daily_budget_usd": self.x_daily_budget_usd,
             "telegram": "configured" if self.telegram_configured else "not configured",
             "telegram_notify_enabled": self.telegram_notify_enabled,
+            "telegram_community": "configured" if self.community_configured else "not configured",
+            "telegram_community_enabled": self.community_enabled,
+            "telegram_community_preview": self.community_preview,
         }
 
 
@@ -196,5 +221,8 @@ def load_settings(root: str | os.PathLike | None = None, env: dict[str, str] | N
         telegram_bot_token=merged.get("TELEGRAM_BOT_TOKEN", "").strip(),
         telegram_owner_chat_id=merged.get("TELEGRAM_OWNER_CHAT_ID", "").strip(),
         telegram_notify_enabled=_flag(merged.get("TELEGRAM_NOTIFY_ENABLED")),
+        telegram_community_chat_id=merged.get("TELEGRAM_COMMUNITY_CHAT_ID", "").strip(),
+        telegram_community_enabled=_flag(merged.get("TELEGRAM_COMMUNITY_ENABLED")),
+        telegram_community_preview=_flag(merged.get("TELEGRAM_COMMUNITY_PREVIEW")),
         configs=load_configs(),
     )

@@ -136,7 +136,7 @@ def test_outbox_dedupe_and_sender_paths(tmp_path, monkeypatch):
     notifier = Notifier(conn, settings, budget, sender, clock=clock)
     assert notifier.enabled
     res = notifier.send_due(T0 + 2)
-    assert res == {"sent": 1, "retry": 1, "gave_up": 0, "blocked": 0}
+    assert res == {"sent": 1, "retry": 1, "gave_up": 0, "blocked": 0, "refused_chat": 0}
     assert calls[0]["url"] == "https://api.telegram.org/bot123:PLACEHOLDER-TG/sendMessage"
     assert calls[0]["body"] == {"chat_id": "4242", "text": "hallo", "parse_mode": "HTML", "disable_web_page_preview": True}
     r1, r2 = conn.execute("SELECT * FROM outbox ORDER BY id").fetchall()
@@ -144,17 +144,17 @@ def test_outbox_dedupe_and_sender_paths(tmp_path, monkeypatch):
     assert r2["status"] == "pending" and r2["attempts"] == 1 and r2["next_try_at"] == T0 + 9 and r2["error"].startswith("429")  # retry_after honored
     # the budget saw the 429 too: backoff until at least retry_after
     assert conn.execute("SELECT backoff_until FROM health WHERE source='telegram'").fetchone()[0] >= T0 + 9
-    assert notifier.send_due(T0 + 3) == {"sent": 0, "retry": 0, "gave_up": 0, "blocked": 0}  # not due yet
+    assert notifier.send_due(T0 + 3) == {"sent": 0, "retry": 0, "gave_up": 0, "blocked": 0, "refused_chat": 0}  # not due yet
     clock.t = T0 + 20
-    assert notifier.send_due(clock.t) == {"sent": 0, "retry": 1, "gave_up": 0, "blocked": 0}  # 503 -> second step of the ladder (60 s)
+    assert notifier.send_due(clock.t) == {"sent": 0, "retry": 1, "gave_up": 0, "blocked": 0, "refused_chat": 0}  # 503 -> second step of the ladder (60 s)
     r2 = conn.execute("SELECT * FROM outbox WHERE id=2").fetchone()
     assert r2["attempts"] == 2 and r2["next_try_at"] == clock.t + 60 and "503" in r2["error"]
     clock.t = T0 + 20 + 60 + 30  # also past the budget backoff of a 5xx (2 s base)
-    assert notifier.send_due(clock.t) == {"sent": 0, "retry": 1, "gave_up": 0, "blocked": 0}  # network error -> 300 s
+    assert notifier.send_due(clock.t) == {"sent": 0, "retry": 1, "gave_up": 0, "blocked": 0, "refused_chat": 0}  # network error -> 300 s
     r2 = conn.execute("SELECT * FROM outbox WHERE id=2").fetchone()
     assert r2["attempts"] == 3 and r2["next_try_at"] == clock.t + 300
     clock.t += 400
-    assert notifier.send_due(clock.t) == {"sent": 0, "retry": 0, "gave_up": 1, "blocked": 0}  # 400: retrying cannot help
+    assert notifier.send_due(clock.t) == {"sent": 0, "retry": 0, "gave_up": 1, "blocked": 0, "refused_chat": 0}  # 400: retrying cannot help
     r2 = conn.execute("SELECT * FROM outbox WHERE id=2").fetchone()
     assert r2["status"] == "gave_up" and "parse entities" in r2["error"] and not script
     assert "PLACEHOLDER-TG" not in json.dumps(outbox.last_rows(conn))
@@ -184,7 +184,7 @@ def test_retry_ladder_ends_in_gave_up_and_rate_limit(tmp_path, monkeypatch):
     assert conn.execute("SELECT status, attempts FROM outbox WHERE id=1").fetchone()[:] == ("gave_up", 6)
     # the gate is in backoff after six server errors: a round sends nothing and keeps the rows pending
     outbox.enqueue(conn, "observe", "blocked-probe", "4242", "p", clock.t)
-    assert notifier.send_due(clock.t) == {"sent": 0, "retry": 0, "gave_up": 0, "blocked": 1}
+    assert notifier.send_due(clock.t) == {"sent": 0, "retry": 0, "gave_up": 0, "blocked": 1, "refused_chat": 0}
     assert conn.execute("SELECT status, attempts FROM outbox WHERE dedupe_key='blocked-probe'").fetchone()[:] == ("pending", 0)
     clock.t += 3600
     install_fake_http(monkeypatch, [("ok", 999)])
@@ -220,17 +220,17 @@ def test_builders_observe_fast_digest_health(tmp_path, monkeypatch):
     add_decision(conn, "observe", T0 - 7200, mint="OLD", features={"name": "old"})
     add_decision(conn, "fast_post", T0 - 7200, term="x:1", features={"author": "a"})
     # (the service starts after 06:10 UTC: yesterday's digest goes out once, built from a fresh report)
-    assert notifier.build(T0) == {"observe": 0, "fast_post": 0, "digest": 1, "health": 0}
+    assert notifier.build(T0) == {"observe": 0, "fast_post": 0, "digest": 1, "health": 0, "community": 0, "community_weekly": 0}
     first_digest = conn.execute("SELECT * FROM outbox WHERE kind='digest'").fetchone()
     assert first_digest["dedupe_key"] == "digest:2026-10-25" and "Dagrapport 25 okt 2026" in first_digest["text"]
-    assert notifier.build(T0 + 1) == {"observe": 0, "fast_post": 0, "digest": 0, "health": 0}
+    assert notifier.build(T0 + 1) == {"observe": 0, "fast_post": 0, "digest": 0, "health": 0, "community": 0, "community_weekly": 0}
     # new decisions -> one batch after the interval, fast posts immediately
     f = {"name": "Zorblax", "symbol": "ZORB", "age_s": 100, "mcap_sol": 50, "unique_buyers_5m": 30, "net_sol_5m": 12, "bundled": None, "creator_prior_coins_24h": 0}
     d1 = add_decision(conn, "observe", T0 + 10, mint="M1", features=f)
     d2 = add_decision(conn, "observe_meta", T0 + 20, term="goldberg cat", features={"n_coins": 3, "distinct_creators": 3, "sol_inflow": 20, "unique_buyers": 25, "burst_ratio": 4.0, "burst_ratio_is_inf": False})
     d3 = add_decision(conn, "fast_post", T0 + 30, term="x:2", features={"author": "elonmusk", "likes_per_min": 200, "likes": 5000, "matched": [], "mints": [], "post_id": "2", "text": "hi"})
-    assert notifier.build(T0 + 60) == {"observe": 0, "fast_post": 1, "digest": 0, "health": 0}  # batch interval not over
-    assert notifier.build(T0 + 301) == {"observe": 1, "fast_post": 0, "digest": 0, "health": 0}
+    assert notifier.build(T0 + 60) == {"observe": 0, "fast_post": 1, "digest": 0, "health": 0, "community": 0, "community_weekly": 0}  # batch interval not over
+    assert notifier.build(T0 + 301) == {"observe": 1, "fast_post": 0, "digest": 0, "health": 0, "community": 0, "community_weekly": 0}
     rows = {r["kind"]: r for r in conn.execute("SELECT * FROM outbox")}
     assert rows["fast_post"]["dedupe_key"] == f"fast_post:{d3}" and "@elonmusk" in rows["fast_post"]["text"]
     assert rows["observe"]["dedupe_key"] == f"observe:{d1}-{d2}" and "Zorblax" in rows["observe"]["text"] and "goldberg cat" in rows["observe"]["text"]

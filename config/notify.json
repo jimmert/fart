@@ -1,5 +1,5 @@
 {
-  "_comment": "Telegram notifications to the owner chat only. Dutch plain language, Europe/Amsterdam times with UTC in brackets, no advice words. Every message ends with footer.",
+  "_comment": "Telegram notifications to the owner chat (milestone 2) and, prepared but OFF by default, to a community chat (milestone 5). Dutch plain language, Europe/Amsterdam times with UTC in brackets, no advice words. Every message ends with footer.",
   "loop_interval_s": 20,
   "timezone": "Europe/Amsterdam",
   "footer": "Observatie, geen advies. Alles wordt achteraf gemeten.",
@@ -26,5 +26,20 @@
     "cooldown_s": 3600,
     "stream_silent_s": 300,
     "budget_warn_fraction": 0.8
+  },
+  "community": {
+    "_comment": "Community channel (milestone 5), OFF by default: nothing is ever sent to another chat than the owner unless TELEGRAM_COMMUNITY_CHAT_ID is set AND TELEGRAM_COMMUNITY_ENABLED=1 in .env. TELEGRAM_COMMUNITY_PREVIEW=1 sends the community text to the OWNER as an extra message headed preview_header, within the owner limits (send.max_per_minute, observe.max_batches_per_hour). The rules below apply to the community channel and to the preview alike: at most one message per coin and per theme per per_key_cooldown_s, at most max_per_hour per hour, nothing during quiet_hours (local time of `timezone`; start == end disables), and a weekly accountability message (weekly: ISO weekday 1 = Monday, time_utc) that summarizes the go/no-go section of the week report in plain words. warning is the fixed line every community message carries.",
+    "max_per_hour": 6,
+    "per_key_cooldown_s": 86400,
+    "quiet_hours": {
+      "start": "02:00",
+      "end": "08:00"
+    },
+    "warning": "Geen advies. Hoog risico: de meeste van deze munten gaan naar nul. Alles wordt achteraf gemeten en gepubliceerd.",
+    "preview_header": "VOORBEELD community-bericht",
+    "weekly": {
+      "weekday": 1,
+      "time_utc": "06:45"
+    }
   }
 }

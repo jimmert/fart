@@ -1,5 +1,40 @@
 # fart
 
+## Voor Jim: wat milestone 5 toevoegt
+
+Mijlpaal 5 levert de stukken voor de meetweek en bereidt de community-stap voor zonder hem te zetten. Geen
+regel, winnaarsdefinitie of meetmethode verandert (de vingerafdruk van de regelbestanden is gelijk aan die van
+`150ca73cb354`; een test bewaakt dat). De beslissingen staan in `docs/DECISIONS.md`, de definities in
+`docs/METING.md`, de upgrade stap voor stap in `deploy/DEPLOY.md` ("Upgrade to milestone 5"):
+
+1. **Weekrapport** `fart measure week --end <dag> --days 7` (timer dagelijks 06:30 UTC, de maandagrun is de
+   hele kalenderweek) naar `out/recall/week-<einddag>.md|json`: per set gelijke regels × meetmethode het
+   universum per dag, de trefkans van munt-observaties (onbekend telt mee in de noemer, nog bezig apart),
+   recall vóór eerste trade en vóór graduatie (munt óf thema), lead time (mediaan, p25, p75, bins),
+   blokbootstrap-intervallen per dag (9.999 trekkingen, vaste seed; onder 3 dagen of 20 winnaars "te weinig
+   data"; een NIET GEDEKT-dag is nooit een nul), kosten per dag (CU-schatting, X) en de go/no-go-toets.
+2. **Go/no-go-criteria** vooraf bevroren (`config/measure.json` → `community_gate`): 5 complete dagen, 30
+   winnaars, trefkans-ondergrens ≥ 0,15, recall-ondergrens ≥ 0,25, mediane lead ≥ 10 min, hoogstens 12
+   observaties per dag. Startwaarden; bijstellen kan vóór het einde van de week, nooit erna. Het rapport toont
+   alleen voldaan / niet voldaan / te weinig data en beslist of verstuurt niets.
+3. **Community-kanaal, standaard uit.** Nieuwe namen in `.env` (`TELEGRAM_COMMUNITY_CHAT_ID` leeg,
+   `TELEGRAM_COMMUNITY_ENABLED=0`): zonder beide gaat er nooit iets naar een andere chat dan de jouwe, ook geen
+   rij die al in de outbox stond. `TELEGRAM_COMMUNITY_PREVIEW=1` stuurt je de community-tekst als extra
+   bericht met de kop "VOORBEELD community-bericht" (binnen je eigen limieten): wat gezien is, waarom het
+   opvalt, de bevroren regels, een vaste waarschuwing, het mint-adres als tekst, geen link of koopknop. De
+   community-regels (1 per munt en thema per 24 u, 6 per uur, stil 02:00-08:00) en het wekelijkse
+   verantwoordingsbericht (maandag 06:45 UTC) bestaan al.
+4. **Meetfidelity**: het aandeel graduaties met minstens elke 10 minuten een sample staat in dag- en
+   weekrapport; zonder voldoende samples telt een graduatie als "uitkomst onbekend", nooit als "geen
+   winnaar"; `measure.track.skipped` in `fart status` telt wat de tracker overslaat. `method_version` blijft m1.0.
+5. **M4-restpunt**: de 195 oude `meta_burst`-rijen die probation 5 plekken lieten, worden door de engine elke
+   tick en door schemamigratie v5 eenmalig teruggebracht tot hoogstens 40 (oudste eerst, nooit met een trade in
+   de laatste 10 minuten, nooit uit de bevroren sets).
+
+Na de upgrade: `fart status` toont `schema_version: 5`, `meta_burst <= 40`, de regel `telegram community:
+not configured, disabled` en `tracker: skipped mints total=0`; de rooktest op echte data is
+`fart measure week --end 2026-10-27 --days 1` (verstuurt niets).
+
 ## Voor Jim: wat milestone 4 repareert
 
 Mijlpaal 4 voegt niets toe; het lost de bevindingen van de M3-uitrol van 26 oktober 2026 op (de
@@ -126,6 +161,7 @@ python -m fart events classify   # undecoded event discriminators with best-gues
 python -m fart chain global      # pump.fun Global account vs config (exit 1 on mismatch)
 python -m fart measure track     # one tracker run
 python -m fart measure report --day 2026-10-25
+python -m fart measure week --end 2026-11-02 --days 7   # week report with bootstrap intervals and the frozen go/no-go test
 make live                        # opt-in 60 s PumpPortal smoke test (FART_LIVE=1), skips offline
 ```
 
@@ -135,16 +171,16 @@ Configuration: `config/*.json` (thresholds, cost tables, curve parameters) and
 Layout:
 
 ```
-fart/          package: config, db (schema v4, write_tx), log, util, version, cli
+fart/          package: config, db (schema v5, write_tx), log, util, version (rules_version + rules_fingerprint), cli
 fart/net/      budget gate (rate, daily caps, health, backoff) + urllib JSON client
 fart/chain/    base58, PDA derivation, Anchor event decoder (pump.fun + pump-amm), tx parsing, curve math, Global account, RPC client
 fart/ingest/   raw store, normalization, PumpPortal + RPC log + RPC per-mint trade clients, sweep, coverage, retention
 fart/engine/   meta clustering, as-of features (incl. X), decisions, RPC enrichment, daemon
 fart/social/   X budget (USD), X client (mega/KOL/refresh/confirmation/fast posts), daemon
-fart/notify/   outbox, Telegram sender, Dutch formatting, daemon
-fart/measure/  prices, outcomes, paper trades, daily report
+fart/notify/   outbox, Telegram sender, Dutch formatting (owner + community), daemon with the chat guard
+fart/measure/  prices, outcomes, paper trades, daily report, week report (bootstrap, go/no-go)
 config/        pumpfun, budget, ingest, engine, measure, stopwords, x, x_kols, notify
-deploy/        systemd units, slice, timers, install.sh (bin/fart wrapper), backup.sh, DEPLOY.md
+deploy/        systemd units, slice, timers (track 5 min, report 06:00, week 06:30, backup 05:30), install.sh, backup.sh, DEPLOY.md
 docs/          ARCHITECTURE (EN), METING (NL), PUMPFUN-EVENTS, UNVERIFIED, DECISIONS
 tests/         pytest suite with synthetic fixtures; opt-in live smoke test
 ```

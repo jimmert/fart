@@ -139,7 +139,7 @@ def test_schema_v3_cleanup_removes_the_bogus_rows_once(tmp_path):
     _v2_database(path, [(USDC, 2000), (PUMP, 729), ("RealCoin111111111111111111111111111111111111", 3)])
     conn = db.connect(path)
     try:
-        assert db.schema_version(conn) == 4
+        assert db.schema_version(conn) == db.SCHEMA_VERSION
         assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 3
         assert conn.execute("SELECT mint FROM trades LIMIT 1").fetchone()[0].startswith("RealCoin")
         assert conn.execute("SELECT COUNT(*) FROM migrations").fetchone()[0] == 1
@@ -156,7 +156,7 @@ def test_schema_v3_cleanup_removes_the_bogus_rows_once(tmp_path):
         # idempotent: running the cleanups again deletes nothing
         assert db._cleanup_system_mints(conn, db.SCHEMA_V3_SYSTEM_MINTS, 2.0) == {"trades": 0, "migrations": 0, "mcap_samples": 0, "coins": 0, "watchlist": 0, "ws_subscriptions": 0}
         assert db._cleanup_v4(conn, 3.0) == {"watchlist_graduation_closed": 0, "ws_subscriptions_closed": 0, "migrations_coin_unknown": 0, "watchlist_activated_at_filled": 0}
-        assert db.migrate(conn) == 4
+        assert db.migrate(conn) == db.SCHEMA_VERSION
     finally:
         conn.close()
 

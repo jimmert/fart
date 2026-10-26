@@ -11,6 +11,9 @@
   notify outbox          list the last 20 outbox rows
   measure track          one tracker run (systemd timer, every 5 min)
   measure report --day   daily recall report (systemd timer, 06:00 UTC)
+  measure week --end D --days N
+                         week report over N days ending at D (default: yesterday, 7): universe, hit rate, recall, lead time,
+                         bootstrap intervals, costs and the frozen go/no-go test (systemd timer, 06:30 UTC daily; Monday = calendar week)
   events classify        counts per undecoded event discriminator with the best-guess name and emitting program
   chain global           decode the pump.fun Global account, compare with config/pumpfun.json (exit 1 on mismatch)
   chain pda <mint>       derive the bonding-curve PDA (and the unverified pump-amm pool PDA) for a mint
@@ -54,6 +57,9 @@ def _parser() -> argparse.ArgumentParser:
     ms.add_parser("track")
     r = ms.add_parser("report")
     r.add_argument("--day", help="UTC day YYYY-MM-DD (default: yesterday)")
+    wk = ms.add_parser("week")
+    wk.add_argument("--end", help="last UTC day of the window, YYYY-MM-DD (default: yesterday)")
+    wk.add_argument("--days", type=int, help="number of days in the window (default: config/measure.json -> week.days = 7)")
     e = sub.add_parser("events")
     es = e.add_subparsers(dest="ecmd", required=True)
     ec = es.add_parser("classify")
@@ -109,7 +115,8 @@ def cmd_status(settings, as_json: bool) -> int:
                                      "rpc_trades.", "enrich.", "schema."))
             ages = {}
             for k in ("ingest.heartbeat", "ingest.pumpportal.last_msg_at", "ingest.rpc_logs.last_msg_at", "ingest.rpc_trades.last_msg_at",
-                      "engine.heartbeat", "measure.track.last_run", "measure.report.last_run", "social.heartbeat", "notify.heartbeat"):
+                      "engine.heartbeat", "measure.track.last_run", "measure.report.last_run", "measure.week.last_run", "social.heartbeat",
+                      "notify.heartbeat"):
                 v = kv.get(k)
                 ages[k] = None if v is None else round(t - float(v))
             out["age_seconds"] = ages
@@ -153,6 +160,14 @@ def cmd_status(settings, as_json: bool) -> int:
                 "total": conn.execute("SELECT COUNT(*) FROM migrations WHERE coin_unknown=1").fetchone()[0],
                 "today": conn.execute("SELECT COUNT(*) FROM migrations WHERE coin_unknown=1 AND received_at >= ?", (day_start(t),)).fetchone()[0]}
             out["schema_v4_cleanup"] = json.loads(kv["schema.v4.cleanup"]) if kv.get("schema.v4.cleanup") else None
+            out["schema_v5_cleanup"] = json.loads(kv["schema.v5.cleanup"]) if kv.get("schema.v5.cleanup") else None
+            # milestone 5: the tracker's skipped mints and the engine's rules fingerprint
+            out["tracker"] = {"skipped_total": int(kv.get("measure.track.skipped", "0") or 0),
+                              "skipped_today": int(kv.get(f"measure.track.skipped.{day_key(t)}", "0") or 0),
+                              "skipped_last": json.loads(kv["measure.track.skipped.last"]) if kv.get("measure.track.skipped.last") else None,
+                              "max_mints_per_run": settings.config("measure")["sampling"].get("max_mints_per_run")}
+            out["rules_fingerprints"] = {k[len("engine.rules_fingerprint."):]: v for k, v in kv.items() if k.startswith("engine.rules_fingerprint.")}
+            out["week_report_last_end_day"] = kv.get("measure.week.last_end_day")
             out["global_check"] = {"status": kv.get("chain.global.status"), "checked_at": utc_iso(float(kv["chain.global.checked_at"])) if kv.get("chain.global.checked_at") else None,
                                    "mismatches": json.loads(kv.get("chain.global.mismatches") or "[]")}
             out["x_spend_today"] = [dict(r) for r in conn.execute(
@@ -171,6 +186,9 @@ def cmd_status(settings, as_json: bool) -> int:
     print(f"  pumpportal: {s['pumpportal']}  api key: {s['pumpportal_api_key']}  trades: {s['pumpportal_trades']}")
     print(f"  x: bearer token {s['x_bearer_token']}, daily budget ${s['x_daily_budget_usd']:.2f}   telegram: {s['telegram']}, notify "
           f"{'enabled' if s['telegram_notify_enabled'] else 'disabled (TELEGRAM_NOTIFY_ENABLED)'}")
+    print(f"  telegram community: {s.get('telegram_community', 'not configured')}, "
+          f"{'ENABLED' if s.get('telegram_community_enabled') else 'disabled (TELEGRAM_COMMUNITY_ENABLED=0 or no chat id)'}, "
+          f"preview to owner {'on' if s.get('telegram_community_preview') else 'off'}")
     if "note" in out:
         print(f"  {out['note']}")
         return 0
@@ -221,6 +239,15 @@ def cmd_status(settings, as_json: bool) -> int:
         print(f"  schema v3 cleanup (system-mint rows removed at {utc_iso(out['schema_v3_cleanup'].get('at'))}): {json.dumps(out['schema_v3_cleanup'].get('deleted'))}")
     if out["schema_v4_cleanup"]:
         print(f"  schema v4 cleanup (graduation rows closed at {utc_iso(out['schema_v4_cleanup'].get('at'))}): {json.dumps(out['schema_v4_cleanup'].get('counts'))}")
+    if out.get("schema_v5_cleanup"):
+        print(f"  schema v5 cleanup (meta_burst rows trimmed at {utc_iso(out['schema_v5_cleanup'].get('at'))}): {json.dumps(out['schema_v5_cleanup'].get('counts'))}")
+    tr = out.get("tracker") or {}
+    print(f"  tracker: skipped mints total={tr.get('skipped_total', 0)} today={tr.get('skipped_today', 0)} (measure.track.skipped; max_mints_per_run {tr.get('max_mints_per_run')})"
+          + (f"  last={json.dumps(tr['skipped_last'])}" if tr.get("skipped_last") else ""))
+    if out.get("rules_fingerprints"):
+        print("  rules fingerprints (engine): " + ", ".join(f"{k}={str(v)[:19]}" for k, v in sorted(out["rules_fingerprints"].items())))
+    if out.get("week_report_last_end_day"):
+        print(f"  week report: last end day {out['week_report_last_end_day']}")
     mu = out["migrations_coin_unknown"]
     if mu["total"]:
         print(f"  graduations without a known create (coin_unknown, never watched): {mu['total']} total, {mu['today']} today")
@@ -485,6 +512,10 @@ def main(argv: list[str] | None = None) -> int:
             from .measure.outcomes import run_track
 
             return run_track(settings)
+        if args.mcmd == "week":
+            from .measure.week import run_week
+
+            return run_week(settings, args.end, args.days)
         day = args.day or day_key(now() - 86400)
         from .measure.report import run_report
 

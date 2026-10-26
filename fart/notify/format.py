@@ -193,3 +193,126 @@ def decision_to_dict(row: Any) -> dict[str, Any]:
     except json.JSONDecodeError:
         d["features"] = {}
     return d
+
+
+# ----- milestone 5: the community channel (off by default; preview to the owner) -----------------------------------
+COMMUNITY_PREVIEW_HEADER = "VOORBEELD community-bericht"
+
+
+def coin_rules_text(ccfg: dict[str, Any]) -> str:
+    """The frozen coin-observation thresholds in plain Dutch (config/engine.json -> coin)."""
+    parts = [f"minstens {n(ccfg.get('observe_min_unique_buyers_5m'))} unieke kopers en {n(ccfg.get('observe_min_net_sol_5m'), 1)} SOL netto instroom in 5 minuten"]
+    share = ccfg.get("observe_max_largest_buyer_share")
+    if share is not None:
+        parts.append(f"grootste koper hoogstens {round(100 * float(share))}% van de instroom")
+    if ccfg.get("observe_require_not_bundled", True):
+        parts.append("geen bundel (geen instant-graduatie, dev-buy onder de helft van de curve)")
+    return "; ".join(parts)
+
+
+def meta_rules_text(mcfg: dict[str, Any]) -> str:
+    """The frozen theme thresholds in plain Dutch (config/engine.json -> meta)."""
+    return (f"minstens {n(mcfg.get('min_coins'))} munten van {n(mcfg.get('min_distinct_creators'))} makers in {round(float(mcfg.get('window_s', 10800)) / 3600)} uur, "
+            f"{n(mcfg.get('burst_ratio'), 1)}× de eigen basislijn, {n(mcfg.get('observe_min_sol_inflow'), 1)} SOL instroom en "
+            f"{n(mcfg.get('observe_min_unique_buyers'))} unieke kopers")
+
+
+def _why_coin(f: dict[str, Any], ccfg: dict[str, Any]) -> str:
+    bits = [f"{n(f.get('unique_buyers_5m'))} verschillende kopers in 5 minuten",
+            f"{n(f.get('net_sol_5m'), 2)} SOL meer gekocht dan verkocht"]
+    share = f.get("largest_buyer_share_15m")
+    if share is not None:
+        bits.append(f"grootste koper {round(100 * float(share))}% van de instroom")
+    if f.get("bundled") is False:
+        bits.append("geen bundel gezien")
+    elif f.get("bundled") is None:
+        bits.append("bundeling onbekend")
+    xm = f.get("x_mentions_1h")
+    if xm:
+        bits.append(f"{n(xm)} vermeldingen op X in het laatste uur")
+    return ", ".join(bits)
+
+
+def community_message(dec: dict[str, Any], sol_usd: float | None, rules_version: str, engine_cfg: dict[str, Any], ccfg_notify: dict[str, Any],
+                      footer: str, theme: str | None = None, preview: bool = False) -> str:
+    """The community text for an observe (coin) or observe_meta (theme) decision. Dutch plain language:
+    what was seen (coin, theme, buyers, SOL inflow, age), why it stands out, the rules (frozen version),
+    a fixed warning line and the footer. No contract-address link, no buy button; the mint as text.
+    `preview=True` prepends the preview header (the copy that goes to the owner)."""
+    f = dec.get("features") or {}
+    warning = str(ccfg_notify.get("warning") or "Geen advies. Hoog risico. Alles wordt achteraf gemeten en gepubliceerd.")
+    header = str(ccfg_notify.get("preview_header") or COMMUNITY_PREVIEW_HEADER)
+    lines: list[str] = []
+    if preview:
+        lines += [f"<b>{esc(header)}</b>", ""]
+    if dec.get("kind") == "observe_meta":
+        term = dec.get("term") or f.get("term")
+        lines += [
+            f"<b>Gezien</b> · {fmt_time(dec.get('as_of'))}",
+            f"Thema “{esc(term)}”: {n(f.get('n_coins'))} nieuwe munten van {n(f.get('distinct_creators'))} verschillende makers in {round(float(engine_cfg.get('meta', {}).get('window_s', 10800)) / 3600)} uur",
+            f"Instroom {n(f.get('sol_inflow'), 1)} SOL · {n(f.get('unique_buyers'))} unieke kopers · "
+            + ("oneindig veel vaker dan normaal (dit thema was er niet)" if f.get("burst_ratio_is_inf") else f"{n(f.get('burst_ratio'), 1)}× zo vaak als normaal"),
+        ]
+        sample = [m for m in (f.get("sample_mints") or [])][:3]
+        if sample:
+            lines.append("Voorbeelden (mint-adres als tekst): " + ", ".join(f"<code>{esc(m)}</code>" for m in sample))
+        lines += [
+            "",
+            f"<b>Waarom dit opvalt</b>: een golf van munten rond één woord, met echt geld erachter.",
+            f"<b>Regels</b> (bevroren versie <code>{esc(rules_version)}</code>): {esc(meta_rules_text(engine_cfg.get('meta', {})))}.",
+        ]
+    else:
+        mcap_sol = f.get("mcap_sol")
+        mcap_usd = None if mcap_sol is None or sol_usd is None else float(mcap_sol) * float(sol_usd)
+        lines += [
+            f"<b>Gezien</b> · {fmt_time(dec.get('as_of'))}",
+            f"Munt <b>{esc(f.get('name') or '?')}</b> (${esc(f.get('symbol') or '?')}), leeftijd {age(f.get('age_s'))}"
+            + (f", thema “{esc(theme)}”" if theme else ", geen thema"),
+            f"Kopers in 5 minuten: {n(f.get('unique_buyers_5m'))} · instroom {n(f.get('net_sol_5m'), 2)} SOL netto · "
+            f"marktkapitalisatie {n(mcap_sol, 1)} SOL" + (f" (≈ ${n(mcap_usd)})" if mcap_usd is not None else ""),
+            f"Mint-adres (tekst, geen link): <code>{esc(dec.get('mint') or f.get('mint'))}</code>",
+            "",
+            f"<b>Waarom dit opvalt</b>: {esc(_why_coin(f, engine_cfg.get('coin', {})))}.",
+            f"<b>Regels</b> (bevroren versie <code>{esc(rules_version)}</code>): {esc(coin_rules_text(engine_cfg.get('coin', {})))}.",
+        ]
+    lines += ["", f"<b>Let op</b>: {esc(warning)}", f"data: beslissing #{dec.get('id')}"]
+    return with_footer(lines, footer)
+
+
+def community_weekly(rep: dict[str, Any], footer: str, ccfg_notify: dict[str, Any], sent_this_week: int | None, channel_enabled: bool,
+                     preview: bool = False) -> str:
+    """The weekly accountability message: the go/no-go section of the week report in plain words.
+    `rep` is the week report dict (out/recall/week-<end>.json); its first segment is the frozen rules."""
+    header = str(ccfg_notify.get("preview_header") or COMMUNITY_PREVIEW_HEADER)
+    seg = (rep.get("segments") or [{}])[0]
+    u, hit, rec, lt, g = seg.get("universe", {}), seg.get("hit_rate", {}), seg.get("recall", {}), seg.get("lead_time", {}), seg.get("gate", {})
+    status_nl = {"voldaan": "✓ voldaan", "niet voldaan": "✗ niet voldaan", "te weinig data": "? te weinig data"}
+
+    def pct(x: Any) -> str:
+        return "onbekend" if x is None else f"{100 * float(x):.0f}%"
+
+    lines: list[str] = []
+    if preview:
+        lines += [f"<b>{esc(header)}</b> (wekelijkse verantwoording)", ""]
+    lines += [
+        f"<b>Verantwoording week {fmt_day(str(rep.get('start_day')))} t/m {fmt_day(str(rep.get('end_day')))}</b>",
+        "",
+        f"Gemeten: {n(u.get('graduations'))} graduaties op {n(u.get('covered_days'))} gedekte dagen, {n(u.get('winners'))} winnaars "
+        f"(piek ≥ $100.000 én volume ≥ $20.000 binnen 24 uur); uitkomst onbekend bij {n(u.get('outcome_unknown'))}.",
+        f"Onze observaties: {n(hit.get('decisions'))} munten aangewezen; {n(hit.get('hits'))} daarvan werden winnaar ({pct(hit.get('rate'))} van de "
+        f"{n(hit.get('elapsed'))} met verstreken 24 uur; {n(hit.get('unknown'))} onbekend meegeteld, {n(hit.get('pending'))} nog bezig).",
+        f"Van de winnaars hadden we {n((rec.get('before_graduation') or {}).get('any', {}).get('n'))} vooraf gezien "
+        f"({pct((rec.get('before_graduation') or {}).get('any', {}).get('rate'))}), mediaan "
+        f"{'onbekend' if (lt.get('any_vs_graduation') or {}).get('median_s') is None else str(round(float(lt['any_vs_graduation']['median_s']) / 60)) + ' minuten'} vóór graduatie.",
+        "",
+        "<b>Toets voor community-berichten</b> (vooraf vastgelegd, niet achteraf aangepast):",
+    ]
+    for c in g.get("criteria") or []:
+        lines.append(f"• {esc(c.get('label'))}: {status_nl.get(c.get('status'), esc(c.get('status')))}")
+    lines += ["", f"<b>Uitkomst</b>: {esc(g.get('verdict') or 'onbekend')}. Dit bericht beslist niets; het laat zien hoe de meting ervoor staat."]
+    if channel_enabled:
+        lines.append(f"Community-berichten deze week: {n(sent_this_week)}.")
+    else:
+        lines.append("Community-berichten deze week: geen (het kanaal staat uit tot na de meetweek).")
+    lines.append(f"<b>Let op</b>: {esc(str(ccfg_notify.get('warning') or ''))}")
+    return with_footer(lines, footer)
