@@ -997,3 +997,84 @@ en de rooktest dat `/api/public/status` geen eigenaarsvelden bevat.
 145. **`www.kingdegen.dev` out of the Caddy site file**: the subdomain has no DNS record; Caddy would keep trying to obtain a
     certificate for it and log the failures (the deployer already removed it from the installed copy at the M8 rollout).
     The comment in the file says when to add it back; DEPLOY.md and UNVERIFIED.md carry the note.
+
+## Milestone 10 (26 oktober 2026)
+
+**Samenvatting (Nederlands).** Direct na de uitrol van M9 (26 oktober 2026, 21:50 tot 22:00 UTC; 174.305 trades, 34.635
+coins, 884 decisions) deed `GET /` op de VPS twee keer een time-out na 60 s; koud duurde `themes` meer dan 150 s en `status`,
+`live` en `coverage` zo'n 7 s. M10 maakt het dashboard snel en robuust zonder ontwerp of inhoud te veranderen, stdlib-only,
+webdienst alleen-lezen, regelbestanden ongewijzigd (vingerafdruk `sha256:e3bf4320c45c`). (1) **Thema's van de engine**: de
+engine schrijft elke tick de top 50 van `features.rank_metas` met de velden van de kaart als JSON in kv
+(`engine.metas_latest`, in dezelfde beslissingstransactie als `engine.meta_burst_sets`; `fart/engine/themes.py`); de kaart
+leest alleen die waarde en zegt bij een waarde ouder dan 5 minuten "Thema's worden nu niet berekend" met de leeftijd, nooit
+een verouderd cijfer zonder vermelding. (2) **Indexen voor tijdvensters**: schemamigratie v8 (`trades(received_at)`,
+`trades(block_time)`, idempotent); elk tijdvenster van de openbare views begrenst eerst op de geïndexeerde `received_at` (een
+minuut ruimer) en legt daarna `COALESCE(block_time, received_at)` over die rijen; geen `COALESCE` meer in een WHERE zonder
+indexbereik; een test bewijst met `EXPLAIN QUERY PLAN` dat geen tijdvensterquery een grote tabel scant. De dekking van de
+laatste 24 uur komt uit de `coverage`-tabel die de ingest elke minuut herberekent; de observaties halen namen en uitkomsten
+in batches op. (3) **Cache die nooit laat wachten**: één achtergrondthread in `fart web` (`server.ViewStore`) berekent de
+openbare views bij de start en daarna elke 15 s (live) en 30 s (de rest) met een eigen alleen-lezen verbinding en korte
+transacties; een verzoek leest alleen en wacht nergens op; nooit berekend = "wordt berekend" op de pagina en
+`{"state": "computing"}` (200, `Cache-Control: public, max-age=2`) in de JSON; een berekening langer dan 10 s wordt gelogd
+met naam en duur; de laatste duur per view staat op `/eigenaar` en, via `logs/web-views.json`, in `fart status`
+(`web views: themes 0.02 s, live 0.4 s, ...`). (4) **Tests**: een fixture-database van 200.000 trades, 40.000 coins, 2.000
+graduaties en 1.000 decisions waarop elke openbare view onder 300 ms blijft en elke tijdvensterquery een index gebruikt; een
+verzoek aan `/` binnen 1 s terwijl een view kunstmatig 30 s duurt; de thread stopt netjes bij SIGTERM; de M8/M9-tests en de
+vingerafdruktest blijven groen. (5) **Uitrol**: `deploy/DEPLOY.md`, "Milestone 10: performance": migratie v8, herstart van
+fart-engine en fart-web, de `curl`-controle koud en warm onder 1 s en de `fart status`-regel met de viewtijden.
+
+146. **The engine writes its themes, the website reads them** (`fart/engine/themes.py`, `Engine.tick` step 6,
+    `public.themes_view`): the ranked metas the engine computes every tick anyway (the top `max_terms` of
+    `features.rank_metas`, with the fields the card shows, three example names, whether the term is in the frozen
+    meta_burst choice and whether it had an observation today) go as one JSON document into kv `engine.metas_latest`,
+    inside the decision transaction (one row, overwritten each tick, about 20 KB). The website's card reads that value
+    and computes nothing: the clustering ran minutes per visit on the VPS (7,486 coins in the window, one baseline scan
+    per term) and belongs to the engine, which has the data in memory. A snapshot older than `MAX_AGE_S` (5 minutes) is
+    "Thema's worden nu niet berekend" with its age and no rows: an old figure is never shown as current. The rule files
+    are imported, not changed; the daily report and `fart engine explain` keep their own path.
+147. **Time windows as index ranges, the event time on the range** (`public._count_since`, `public._newest`, schema v8):
+    `trades(received_at)` and `trades(block_time)` are the two new indexes; every window of the public views is written
+    as `received_at >= t - ET_MARGIN_S AND COALESCE(block_time, received_at) >= t` (a row never reaches us more than a
+    minute before its chain time, so the range contains every row of the window and the event time keeps the exact
+    semantics), and "the newest N by event time" is "three times N newest by the indexed received_at, sorted by event
+    time" (the index walks them in order and stops). A test records every statement of every public view on the big
+    fixture database and runs `EXPLAIN QUERY PLAN` on the ones with a time predicate: none may scan `trades`, `coins`,
+    `migrations`, `decisions`, `outcomes`, `mcap_samples`, `coverage` or `social_posts`. The owner's live coverage view
+    and the daily report keep `compute_hour` (they must count, not read).
+148. **The public coverage comes from the `coverage` table** (`public.coverage_view`, `_hour_covered`, `_day_covered`):
+    the ingest recomputes the current and the last three hours every minute (`coverage.recompute_recent`), so every
+    hour of the last 24 was current once and has its row; the view reads 24 rows instead of counting 24 hours with
+    three table scans each (6.9 s on the VPS). An hour without a row was never counted: NIET GEDEKT, no number. In the
+    first minute of an hour, before its row exists, the previous hour's row says whether the counting was running a
+    moment ago (`computed_at` within `COVERAGE_RECENT_S`); an old row says nothing about now. The fixture world writes
+    the rows the way the ingest does, so the tests see the same 4 hours NIET GEDEKT as before.
+149. **A view store with one thread instead of a cache that waits** (`server.ViewStore`): the milestone-9 `Cache.get`
+    computed on a miss and made concurrent requests wait for one computation; with a 15 s TTL and computations of seconds
+    to minutes every request waited. The store keeps one entry per view (value, when it was made, the duration, errors);
+    one daemon thread computes the due views every second's poll (the live views every `live_refresh_s`, the rest every
+    30 s, the report pages riding along with the reports list, everything once at start) on one read-only connection per
+    cycle in autocommit (every statement its own short read, so the WAL checkpoint is never held back); the request
+    threads call `get()` and nothing else. A failed computation keeps the previous value and its timestamp, is counted
+    and retried at its next due time (never every second); a slow one is logged (`web.view_slow`); `stop()` interrupts
+    the running query (`Connection.interrupt`) and joins the thread, so SIGTERM ends the service within a second. The
+    request-triggered path survives only for the day filter of the observations (`request()`: an on-demand key the thread
+    computes next, refreshed while asked for, dropped after ten minutes of silence, bounded to 128 keys); its first
+    answer is "computing" too.
+150. **"Wordt berekend" is a state, not a number** (`public.computing`, `pages.computing_card`): until the thread's first
+    cycle finished a view, the page shows the same card with the pill "wordt berekend" and one sentence (every
+    `data-live` region exists, so the page script keeps swapping), the JSON answers `{"state": "computing", ...}` with
+    HTTP 200 and `Cache-Control: public, max-age=2` (never 503: the site is up, the figure is not there yet; never a
+    cached placeholder for 15 s). A report that exists on disk but has no entry yet is "computing", an unknown name 404.
+151. **The view times in `fart status` through a file, not the database** (`logs/web-views.json`, `cli.web_views_line`):
+    `fart status` runs in another process and the website must never write the database, so the store writes the last
+    duration per view (and the errors) atomically to the one file next to its log after every cycle; `fart status` prints
+    `web views: themes 0.02 s, live 0.4 s, ... [written N s ago]` with `FAILED` on a failing view, or says that no cycle
+    ran yet. `/eigenaar` shows the same table from the live store ("Weergaven van de website"). The unit's
+    `ReadWritePaths=/opt/fart/logs` already allows it; nothing else changes in the unit.
+152. **The big fixture database is built, not shipped** (`tests/test_m10_performance.py::build_big_world`): 200,000
+    trades, 40,000 coins, 2,000 graduations, 1,000 decisions, tracker samples, 200 watched coins with trades in the last
+    five minutes, the coverage rows and the engine's snapshot, deterministic from one seed, a few seconds to build; every
+    public view must stay under 300 ms on a fresh connection and the whole first cycle under 3 s. The 30 s view in the
+    "never waits" test is a computation blocked on an event, released by the test: the request must come back within a
+    second with the placeholder the first time and with the last value afterwards.
+153. **Branch and PR**: all work on the harness branch `claude/eloquent-mayer-acz0cg`; the PR targets `main`.

@@ -31,6 +31,10 @@ by a test), so the decisions of a shadow day are byte for byte the decisions of 
 files are untouched. (b) Every tick the engine records, per watched coin and per ranked meta, the highest
 threshold features of the day in `engine_candidates` (`fart/engine/candidates.py`), after the verdicts and
 inside the same short write; `fart engine explain --day` reads them.
+
+Milestone 10: the ranked metas of step 5 (the top `max_terms`, with the fields the website's themes card shows) are
+written as JSON in kv `engine.metas_latest` in the same decision transaction (`fart/engine/themes.py`), so the website
+reads the engine's themes instead of repeating the clustering per visit. Nothing else of the tick changes.
 """
 from __future__ import annotations
 
@@ -49,9 +53,9 @@ from ..log import get_logger
 from ..net.budget import Budget
 from ..util import now as wall_now
 from ..version import rules_fingerprint, rules_version
-from . import candidates, decide, features
+from . import candidates, decide, features, themes
 from .enrich import creator_activity, holder_concentration
-from .meta import cluster, load_stopwords
+from .meta import load_stopwords
 
 log = get_logger("engine")
 
@@ -175,14 +179,7 @@ class Engine:
 
         # 5. metas (read snapshot, no writes)
         with db.read_tx(self.conn):
-            recent = features.recent_coins(self.conn, as_of, float(mcfg.get("window_s", 10800)))
-            clusters = cluster(recent, self.stopwords, int(mcfg.get("min_token_len", 4)))
-            metas = []
-            for term, members in clusters.items():
-                if len(members) < int(mcfg.get("min_coins", 3)):
-                    continue
-                metas.append(features.meta_features(self.conn, term, members, as_of, mcfg, self.stopwords))
-            metas = features.rank_metas(metas)[: int(mcfg.get("max_terms", 50))]
+            recent, clusters, metas = themes.compute_metas(self.conn, as_of, mcfg, self.stopwords)
             bursting = [m for m in metas if decide.is_bursting(m, mcfg)]
             meta_records = [candidates.meta_row(m, decide.is_bursting(m, mcfg), decide.meta_verdict(m, mcfg)[0]) for m in metas]
             # the stable meta_burst choice (pure, computed here so the write below stays milliseconds)
@@ -219,6 +216,8 @@ class Engine:
                     n_meta += 1
             if new_sets != self.burst_sets or released:
                 db.kv_set(c, "engine.meta_burst_sets", json.dumps(new_sets, sort_keys=True), now)
+            # milestone 10: the ranked metas for the website (the same transaction, the same as_of)
+            themes.write(c, themes.snapshot(metas, clusters, as_of, mcfg, len(recent), set(new_sets), themes.observed_terms_today(c, as_of), self.rules_version), now)
             # milestone 6: the day's candidate maxima (after the verdicts; never read by the engine)
             summary["candidates_written"] = (candidates.write_coins(c, coin_records, as_of, self.rules_version)
                                              + candidates.write_metas(c, meta_records, as_of, self.rules_version))

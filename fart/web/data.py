@@ -633,7 +633,7 @@ def settings_view(settings: Settings) -> dict[str, Any]:
             {"label": "Sessie", "value": f"cookie {auth.SESSION_COOKIE}, HttpOnly, Secure, SameSite=Strict, verloopt na {auth.SESSION_TTL_S // 3600} uur"},
             {"label": "Loginbewaking", "value": f"hoogstens {auth.MAX_FAILED} mislukte pogingen per {auth.FAIL_WINDOW_S // 60} minuten per IP en per account, daarna {auth.LOCK_S // 60} minuten wachten"},
             {"label": "Verzoeken groter dan", "value": "64 KB worden geweigerd"},
-            {"label": "Schrijft", "value": "niets behalve logs/web.log; geen knoppen die iets veranderen, ook niet voor de eigenaar"},
+            {"label": "Schrijft", "value": "niets behalve logs/web.log en logs/web-views.json (de duur per onderdeel, milestone 10); geen knoppen die iets veranderen, ook niet voor de eigenaar"},
         ]},
     ]
     return {"sections": sections}

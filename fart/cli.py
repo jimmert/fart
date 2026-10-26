@@ -34,7 +34,8 @@
   events classify        counts per undecoded event discriminator with the best-guess name and emitting program
   chain global           decode the pump.fun Global account, compare with config/pumpfun.json (exit 1 on mismatch)
   chain pda <mint>       derive the bonding-curve PDA (and the unverified pump-amm pool PDA) for a mint
-  status                 health, budgets, counts (works on an empty database)
+  status                 health, budgets, counts (works on an empty database); since milestone 10 also the last duration per
+                         public view of the website (logs/web-views.json, written by fart web)
   coverage --hours N     per-hour creates/grads/gaps
   web                    daemon: the read-only website on FART_WEB_BIND (127.0.0.1:8792) behind the shared Caddy: the public
                          dashboard, observations, reports, method and tools pages plus /api/public/* (FART_WEB_PUBLIC=1, the
@@ -241,6 +242,8 @@ def cmd_status(settings, as_json: bool) -> int:
             out["backup_verify_last"] = json.loads(kv["backup.verify.last"]) if kv.get("backup.verify.last") else None
         finally:
             conn.close()
+    # milestone 10: the last duration per public view, as the website wrote it next to its log (never from the database)
+    out["web_views"] = web_views_status(settings, now())
     if as_json:
         print(json.dumps(out, indent=2, default=str))
         return 0
@@ -356,7 +359,59 @@ def cmd_status(settings, as_json: bool) -> int:
     if out["pumpportal_last_http_status"]:
         print(f"  pumpportal last HTTP refusal: {out['pumpportal_last_http_status']}")
     print(f"  last decision: {out['last_decision_at']}")
+    print("  " + web_views_line(out["web_views"]))
     return 0
+
+
+WEB_VIEWS_FILE = "web-views.json"
+WEB_VIEWS_ORDER = ("themes", "live", "hot", "new", "graduations", "social", "today", "status", "coverage", "observations", "reports", "week", "method")
+
+
+def web_views_status(settings, t: float) -> dict[str, Any]:
+    """`logs/web-views.json` (milestone 10): `fart web` writes the last duration per public view after every cycle of
+    its background thread; the website itself never writes the database. Missing: the website has not run since M10."""
+    p = settings.logs_dir / WEB_VIEWS_FILE
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        written = float(d.get("written_at") or 0.0)
+        views = d.get("views") or {}
+        if not isinstance(views, dict):
+            raise ValueError("views is not an object")
+    except (OSError, ValueError, TypeError) as e:
+        return {"file": str(p), "exists": p.exists(), "error": None if not p.exists() else f"{type(e).__name__}: {str(e)[:80]}", "age_s": None, "views": {}}
+    return {"file": str(p), "exists": True, "error": None, "written_at": utc_iso(written), "age_s": round(max(0.0, t - written)), "views": views}
+
+
+def _secs(s: Any) -> str:
+    """'0.02 s', '0.4 s', '12 s'; under five milliseconds '0.00 s' (the same figure /eigenaar shows)."""
+    try:
+        v = float(s)
+    except (TypeError, ValueError):
+        return "?"
+    if v < 0.005:
+        return "0.00 s"
+    return f"{v:.2g} s" if v < 10 else f"{v:.0f} s"
+
+
+def web_views_line(wv: dict[str, Any]) -> str:
+    """`web views: themes 0.02 s, live 0.4 s, ...` plus the age of the file, or why there is nothing."""
+    if not wv.get("exists"):
+        return "web views: no timings yet (fart web writes logs/web-views.json after its first cycle; milestone 10)"
+    if wv.get("error"):
+        return f"web views: unreadable ({wv['error']})"
+    views = wv.get("views") or {}
+    parts = []
+    for name in WEB_VIEWS_ORDER:
+        v = views.get(name)
+        if isinstance(v, dict):
+            parts.append(f"{name} {_secs(v.get('seconds'))}" + ("" if v.get("ok", True) and v.get("state") != "failed" else " (FAILED)"))
+    reports = [k for k, v in views.items() if k.startswith("report:") and isinstance(v, dict)]
+    if reports:
+        slowest = max(float(views[k].get("seconds") or 0.0) for k in reports)
+        parts.append(f"report pages {len(reports)} (slowest {_secs(slowest)})")
+    failed = sum(1 for v in views.values() if isinstance(v, dict) and (v.get("state") == "failed" or not v.get("ok", True)))
+    tail = f"  [written {wv.get('age_s')} s ago" + (f", {failed} failing" if failed else "") + "]"
+    return "web views: " + (", ".join(parts) if parts else "nothing computed yet") + tail
 
 
 def cmd_coverage(settings, hours: int, as_json: bool) -> int:

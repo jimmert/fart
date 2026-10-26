@@ -307,8 +307,14 @@ or a day NIET GEDEKT stays empty, an unknown outcome stays "onbekend", a decisio
   of no other), the newest coins, the themes the engine's own clustering finds right now (the same functions and thresholds,
   read-only), the latest graduations with the tracker's newest sample and the 24 h outcome under the reports' tracker rule,
   what the X layer sees (honest about its state: off, shadow, live), today's observations and one line of measurement; the
-  measurement itself (the frozen week, the coverage strip, the reports) lives on `/meting`. Every expensive view is computed
-  at most once per 15 s (live) or 30 s (the rest) in an in-memory cache shared by every visitor; public answers carry
+  measurement itself (the frozen week, the coverage strip, the reports) lives on `/meting`. Since milestone 10 every public
+  view is computed by one background thread (`server.ViewStore`: at start, then every 15 s for the live views and every
+  30 s for the rest, with its own read-only connection and short transactions) and a request only reads the last value,
+  never waits; a view that was never computed is "wordt berekend" on the page and `{"state": "computing"}` in the JSON.
+  The themes card reads the ranked metas the engine writes every tick (kv `engine.metas_latest`, `fart/engine/themes.py`)
+  instead of clustering again; every time window is an index range on `received_at` (schema v8) with the event time
+  applied to that range; the coverage of the last 24 hours comes from the `coverage` table the ingest keeps. The last
+  duration per view is on `/eigenaar` and, through `logs/web-views.json`, in `fart status`. Public answers carry
   `Cache-Control: public, max-age` and an `ETag` (304 on a match); a client without a session gets at most 120 requests per
   minute on the public routes (429). Charts are inline SVG rendered on the server (a hatched cell for NIET GEDEKT, never a
   zero bar; a band for a bootstrap interval only once it exists) with a text summary for screen readers; the stylesheet is

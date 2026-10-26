@@ -869,6 +869,77 @@ dependency, the daemons untouched, the service still read-only.
    rollback to M8 (`git checkout <M8 commit> && sudo deploy/install.sh`) brings back the M8 pages; its Caddy file carries
    `www.kingdegen.dev` again, so validate before reloading.
 
+## 5i. Milestone 10: performance (M10)
+
+M10 makes the public dashboard fast and robust without changing its design or its content. Measured on the VPS right
+after the M9 rollout (26 Oct 2026, 21:50 to 22:00 UTC; 174,305 trades, 34,635 coins, 66,229 mcap samples, 884 decisions):
+`GET /` timed out twice after 60 s and then answered with 35 KB; cold, `/api/public/themes` took more than 150 s, `status`,
+`live` and `coverage` about 7 s each. Three causes, three changes:
+
+* **The themes came from the website, not from the engine.** `themes_view` repeated the engine's whole clustering on every
+  cache miss (7,486 coins in the three-hour window, one baseline scan per term: minutes per visit). Now the engine writes
+  the ranked metas it computes every tick anyway as JSON in kv (`engine.metas_latest`, in the same short decision
+  transaction as `engine.meta_burst_sets`; `fart/engine/themes.py`), and the themes card reads only that value and computes
+  nothing. A snapshot older than 5 minutes is never shown as current: the card says "Thema’s worden nu niet berekend" with
+  the age of the last one and no figure. The daily report and `fart engine explain` keep their own path.
+* **No index for time windows.** Every window over all trades (`... FROM trades WHERE received_at >= ?`) scanned the table
+  through `trades_mint_received` (720 ms per query). Schema **v8** (`user_version 8`) adds `trades(received_at)` and
+  `trades(block_time)`; every time window of the public views is bounded on the indexed `received_at` first (a minute wider
+  than the window) and applies the event time `COALESCE(block_time, received_at)` to the rows in that range, so no window
+  scans a table (a test proves it with `EXPLAIN QUERY PLAN`). The coverage of the last 24 hours comes from the `coverage`
+  table the ingest already recomputes every minute, instead of being counted again per view.
+* **The cache made every request wait.** With a TTL of 15 s and computations of seconds to minutes the dashboard was
+  computing nearly all the time, and every request waited for it. Now one background thread in `fart web` computes the
+  public views on their schedule (at start, then every 15 s for the live views and every 30 s for the rest, with its own
+  read-only connection and short transactions) and a request only reads the last value: it never waits. A view that was
+  never computed shows "wordt berekend" on the page and `{"state": "computing"}` in the JSON (HTTP 200, `Cache-Control:
+  public, max-age=2`). A computation longer than 10 s is logged (`web.view_slow` with the view's name and its duration);
+  the last duration per view is on `/eigenaar` ("Weergaven van de website") and in `fart status` (`web views: themes
+  0.02 s, live 0.4 s, ...`) through `logs/web-views.json`, the one file the website writes next to its log. The database
+  stays read-only for the website.
+
+No rule file changes (the fingerprint stays `sha256:e3bf4320c45c`; the same test pins it), no new dependency, no change
+of design or content: every card shows what it showed, plus the state "wordt berekend" where a value does not exist yet.
+
+1. **Pull and install:**
+   ```bash
+   cd /opt/fart-src && git pull --ff-only && sudo deploy/install.sh
+   ```
+   The installer applies schema v8 before the daemons restart (`database schema: user_version 8 ...`): the two indexes on
+   174,000 trade rows take seconds, inside one short write transaction (the running daemons retry a busy write, as always).
+   It then restarts `fart-ingest`, `fart-engine` and the optional services, `fart-web` included. Both restarts matter: the
+   engine writes the kv metas only from this version on, the web service runs the new cache only after its restart. If the
+   installer ran with `START_SERVICES=0`, do it by hand:
+   ```bash
+   sudo systemctl restart fart-engine fart-web
+   ```
+2. **Check the schema and the engine:** `sudo -u fart /opt/fart/bin/fart status` shows `schema_version: 8`; after one engine
+   tick (15 s) the kv value exists and is fresh:
+   ```bash
+   sudo -u fart sqlite3 /opt/fart/data/fart.db "select length(value), datetime(updated_at, 'unixepoch') from kv where key='engine.metas_latest'"
+   journalctl -u fart-engine -n 5 --no-pager                  # engine.tick, no engine.tick_failed
+   ```
+3. **Check the dashboard from outside, cold and warm**, both under one second:
+   ```bash
+   curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' https://kingdegen.dev/      # 200 and a time under 1 s, right after the restart (cold)
+   curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' https://kingdegen.dev/      # 200 and a time under 1 s again (warm)
+   for ep in status live coverage themes hot new graduations observations; do
+     curl -s -o /dev/null -w "$ep %{http_code} %{time_total}s\n" "https://kingdegen.dev/api/public/$ep"
+   done                                                                                  # every line 200 and well under 1 s
+   curl -s https://kingdegen.dev/api/public/themes | head -c 300; echo                   # "state": "fresh" with rows, after the engine's first tick
+   ```
+   In the first seconds after the restart a card can say "wordt berekend" (the thread's first cycle) and the themes card
+   "Thema’s worden nu niet berekend" until the engine has ticked once; both disappear by themselves within a minute.
+4. **The view times:** `fart status` prints one line with the last duration per view, as the website wrote it:
+   ```
+   web views: themes 0.02 s, live 0.4 s, hot 0.1 s, new 0.05 s, ..., report pages 14 (slowest 0.01 s)  [written 7 s ago]
+   ```
+   `status`, `live` and `coverage` must stay under 0.3 s; a view above 10 s appears in `journalctl -u fart-web` as
+   `web.view_slow`; `/eigenaar` → "Weergaven van de website" has the same table with the errors per view. `no timings yet`
+   means `fart-web` has not completed a cycle since the restart (or is not running).
+5. **Rollback:** a code rollback to M9 (`git checkout <M9 commit> && sudo deploy/install.sh`) works on the v8 database: the
+   two indexes are harmless to M9, which never drops them, and M9 ignores the kv value `engine.metas_latest`.
+
 ## 6. First-day checklist (docs/UNVERIFIED.md)
 
 1. `fart chain global`: reserves, supply, `fee_basis_points` 95 and `creator_fee_basis_points` 5 must
@@ -999,6 +1070,9 @@ old rows stay, new rows get the old version string again.
 | the public pages answer `cache-control: no-store` (M9) | the request carried a session cookie (the owner's browser) | expected: only anonymous answers are shared-cacheable; `curl` without a cookie shows `public, max-age=15` or `30` |
 | the dashboard says `De X-laag staat uit` (M9) | no `X_BEARER_TOKEN` in `.env` | expected until the key goes in (section 5e); the card fills itself in shadow mode and says so |
 | the themes card says no word comes up (M9) | fewer than 3 coins of the last 3 hours share a word that is not a stopword | expected on a quiet hour; the card uses the engine's own clustering and thresholds |
+| the themes card says `Thema’s worden nu niet berekend` with an age (M10) | the engine has not written `engine.metas_latest` for more than 5 minutes: it is down, or it was not restarted since M10 | `systemctl status fart-engine`, `journalctl -u fart-engine -n 20`; after a restart the card fills within 15 s (the dashboard refreshes itself) |
+| a card says `wordt berekend` for longer than a minute (M10) | the background thread of `fart-web` has not finished the view's first computation, or the view fails every time | `journalctl -u fart-web | grep -E 'view_slow|view_failed'`; `fart status` → `web views:` (a `FAILED` view is named); `/eigenaar` → Weergaven shows the last error |
+| `fart status` → `web views: no timings yet` (M10) | `fart-web` has not completed a cycle since M10 (not running, or restarted a second ago) | `systemctl status fart-web`; the line appears after the first cycle (seconds); `logs/web-views.json` is its source |
 | `fart-web` inactive right after `install.sh` (M8) | both `.env` names are not set yet: the installer never starts the website without them | steps 2 and 3 of section 5g; then `systemctl enable --now fart-web` |
 | `journalctl -u fart-web` says `fart web: FART_WEB_PASSWORD_HASH is not a hash made by ...` or `... is too short` (M8) | a value in `.env` was pasted incompletely or edited | re-run `fart web hash-password` / `fart web new-secret`, paste the whole line; `systemctl restart fart-web` |
 | `https://kingdegen.dev` gives 502 (Caddy) while `curl -sI http://127.0.0.1:8792/login` works (M8) | Caddy cannot reach the loopback port: a different `FART_WEB_BIND`, or the unit is down | `systemctl status fart-web`; `FART_WEB_BIND` must be `127.0.0.1:8792` (the Caddy site file names that port) |

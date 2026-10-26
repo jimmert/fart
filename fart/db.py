@@ -36,7 +36,7 @@ from .util import day_key
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 BUSY_TIMEOUT_MS = 15000
 WRITE_RETRY_ATTEMPTS = 3
@@ -727,6 +727,28 @@ def _migrate_v7(conn: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[7] = _migrate_v7
+
+
+# ----- schema version 8 (milestone 10) -------------------------------------------------------------
+# Two indexes, no new table, no column, no cleanup; both statements are idempotent.
+# * `trades(received_at)` and `trades(block_time)`: every time-window query over all trades (the website's live views,
+#   `SELECT ... FROM trades WHERE received_at >= ?`) scanned the whole table through `trades_mint_received` (720 ms per
+#   query on the VPS with 174,305 rows; the public dashboard timed out). With the index a window is a range search; the
+#   website bounds every window on `received_at` first (the column with the index) and applies the event time
+#   `COALESCE(block_time, received_at)` on the rows in that range (`fart/web/public.py`). Building both on the VPS
+#   database takes seconds inside one short IMMEDIATE transaction (the daemons retry a busy write, as always).
+SCHEMA_V8_SQL = [
+    "CREATE INDEX IF NOT EXISTS trades_received_at ON trades(received_at)",
+    "CREATE INDEX IF NOT EXISTS trades_block_time ON trades(block_time)",
+]
+
+
+def _migrate_v8(conn: sqlite3.Connection) -> None:
+    for stmt in SCHEMA_V8_SQL:
+        conn.execute(stmt)
+
+
+MIGRATIONS[8] = _migrate_v8
 
 
 def _apply_pragmas(conn: sqlite3.Connection, readonly: bool) -> None:

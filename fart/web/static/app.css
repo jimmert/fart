@@ -179,10 +179,10 @@ abbr[title] { text-decoration: underline dotted; text-underline-offset: 0.16em; 
 .pill-fresh, .pill-ok, .pill-winner, .pill-go, .pill-complete { color: var(--ok); background: var(--ok-soft); border-color: transparent; }
 .pill-stale, .pill-incomplete { color: var(--accent-ink); background: var(--accent-soft); border-color: transparent; }
 .pill-fail, .pill-nogo { color: var(--bad); background: var(--bad-soft); border-color: transparent; }
-.pill-pending, .pill-none, .pill-soon, .pill-frozen, .pill-few { color: var(--info); background: var(--info-soft); border-color: transparent; }
+.pill-pending, .pill-none, .pill-soon, .pill-frozen, .pill-few, .pill-computing { color: var(--info); background: var(--info-soft); border-color: transparent; }
 .pill-unknown, .pill-not-winner { color: var(--fg-muted); background: var(--nc-soft); border-color: transparent; }
 .pill-nc { color: var(--nc); background: repeating-linear-gradient(45deg, var(--nc-soft) 0 4px, transparent 4px 8px); border-color: var(--line-strong); }
-.pill-nc::before, .pill-unknown::before, .pill-few::before { background: transparent; border: 1.5px solid currentColor; width: 6px; height: 6px; }
+.pill-nc::before, .pill-unknown::before, .pill-few::before, .pill-computing::before { background: transparent; border: 1.5px solid currentColor; width: 6px; height: 6px; }
 
 /* ----- tables ------------------------------------------------------------------------------------------------------- */
 .table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: var(--text-sm); }
