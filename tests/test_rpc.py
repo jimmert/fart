@@ -46,7 +46,7 @@ def test_get_transaction_records_cost(settings, conn, monkeypatch, fixtures_dir)
     assert calls[0]["method"] == "getTransaction"
     assert calls[0]["params"][1]["maxSupportedTransactionVersion"] == 0
     usage = budget.daily_usage("rpc")
-    assert usage["requests"] == 1 and usage["cost"] == 59  # cost table estimate
+    assert usage["requests"] == 1 and usage["cost"] == 40  # cost table: the published Alchemy figure (milestone 4)
 
 
 def test_rpc_error_is_raised_and_recorded_ok(settings, conn, monkeypatch):

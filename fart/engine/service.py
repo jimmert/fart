@@ -10,9 +10,17 @@ Transaction shape (milestone 3, after the VPS lock storm): every tick is
   6. one short IMMEDIATE write (decisions, meta_burst watchlist entries, heartbeat).
 A tick that still fails is counted in kv (`engine.tick_failed`, `engine.tick_failed.<day>`) so
 `fart status` and the daily report show it; the next tick runs 15 s later as before.
+
+Milestone 4: the meta_burst watchlist entries are a stable, bounded choice (`decide.meta_burst_sets`:
+the `meta_burst_per_meta` youngest coins of every bursting meta, at most `meta_burst_max_total` in
+all, frozen while the meta bursts, released `meta_burst_release_s` after it stopped bursting) that
+is persisted in kv `engine.meta_burst_sets`, so a restart continues with the same set. Before, every
+tick re-added up to 20 coins of every bursting meta, evicted the oldest equal-priority entries and
+made the trade stream re-subscribe the difference (5,298 subscriptions in 52 minutes on the VPS).
 """
 from __future__ import annotations
 
+import json
 import signal
 import sqlite3
 import time
@@ -45,9 +53,30 @@ class Engine:
         self.rpc = rpc
         self.rules_version = rules_version()
         self.stats: dict[str, int] = {}
+        self.burst_sets: dict[str, dict[str, Any]] = self._load_burst_sets()
 
     def _bump(self, k: str, n: int = 1) -> None:
         self.stats[k] = self.stats.get(k, 0) + n
+
+    def _load_burst_sets(self) -> dict[str, dict[str, Any]]:
+        """The meta_burst choice of the previous run (kv), so a restart keeps the same stable set."""
+        raw = db.kv_get(self.conn, "engine.meta_burst_sets")
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return {str(k): v for k, v in data.items() if isinstance(v, dict) and isinstance(v.get("mints"), list)} if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _graduated(conn: sqlite3.Connection, mints: list[str]) -> set[str]:
+        out: set[str] = set()
+        for i in range(0, len(mints), 500):
+            chunk = mints[i:i + 500]
+            marks = ",".join("?" for _ in chunk)
+            out.update(r[0] for r in conn.execute(f"SELECT mint FROM migrations WHERE mint IN ({marks})", chunk))
+        return out
 
     def tick(self, as_of: float) -> dict[str, Any]:
         """One loop iteration with as_of = our clock now. Returns a summary."""
@@ -59,7 +88,9 @@ class Engine:
         mcfg = self.cfg["meta"]
         cooldown = float(self.cfg.get("decision_cooldown_s", 1800))
         summary: dict[str, Any] = {"as_of": as_of, "coins": 0, "promoted": 0, "coin_decisions": 0, "meta_decisions": 0,
-                                   "bursting_metas": 0, "rpc_lookups": 0}
+                                   "bursting_metas": 0, "rpc_lookups": 0, "meta_burst_sets": 0, "meta_burst_mints": 0,
+                                   "meta_burst_released": 0}
+        cap, reserve = watch.limits(wcfg)
         t_start = time.monotonic()
 
         # 1. expire (short write)
@@ -116,29 +147,47 @@ class Engine:
                     continue
                 metas.append(features.meta_features(self.conn, term, members, as_of, mcfg, self.stopwords))
             metas = features.rank_metas(metas)[: int(mcfg.get("max_terms", 50))]
-        bursting = [m for m in metas if decide.is_bursting(m, mcfg)]
+            bursting = [m for m in metas if decide.is_bursting(m, mcfg)]
+            # the stable meta_burst choice (pure, computed here so the write below stays milliseconds)
+            burst_terms = [m["term"] for m in bursting] if wcfg.get("subscribe_bursting_meta", True) else []
+            members: dict[str, list[str]] = {}
+            for term in burst_terms:
+                # youngest first: the coins a burst is made of are the ones that just appeared
+                members[term] = [x["mint"] for x in sorted(clusters[term], key=lambda x: float(x.get("t") or 0.0), reverse=True)]
+            chosen_before = [m for s_ in self.burst_sets.values() for m in s_.get("mints", [])]
+            graduated = self._graduated(self.conn, sorted({m for ms in members.values() for m in ms} | set(chosen_before)))
+        new_sets, released = decide.meta_burst_sets(
+            self.burst_sets, burst_terms, lambda t: members.get(t, []), graduated, now,
+            int(wcfg.get("meta_burst_per_meta", 5)), int(wcfg.get("meta_burst_max_total", 40)), float(wcfg.get("meta_burst_release_s", 600)))
+        burst_mints = [m for s_ in new_sets.values() for m in s_["mints"]]
         summary["bursting_metas"] = len(bursting)
         summary["metas"] = len(metas)
         summary["top_metas"] = [(m["term"], m["sol_inflow"], m["unique_buyers"], m["n_coins"]) for m in metas[:5]]
+        summary["meta_burst_sets"], summary["meta_burst_mints"], summary["meta_burst_released"] = len(new_sets), len(burst_mints), len(released)
 
         # 6. decisions, meta_burst watchlist entries, heartbeat (short write)
-        def _write(c: sqlite3.Connection) -> tuple[int, int]:
-            n_coin = n_meta = 0
+        def _write(c: sqlite3.Connection) -> tuple[int, int, int]:
+            n_coin = n_meta = n_added = 0
             for f in candidates:
                 if decide.observe_coin(c, f, as_of, now, ccfg, cooldown, self.rules_version) is not None:
                     n_coin += 1
-            if wcfg.get("subscribe_bursting_meta", True):
-                for m in bursting:
-                    for mint in [x["mint"] for x in clusters[m["term"]]][:20]:
-                        watch.add(c, mint, "meta_burst", now, float(wcfg.get("ttl_s", 86400)), int(wcfg.get("cap", 200)))
+            if released:
+                watch.release(c, released, "meta_burst", now)
+            for mint in burst_mints:
+                # a no-op for an active row (keeps its `since`), a reactivation for an expired one
+                if watch.add(c, mint, "meta_burst", now, float(wcfg.get("ttl_s", 86400)), cap, reserve):
+                    n_added += 1
             for m in metas:
                 if decide.observe_meta(c, m, as_of, now, mcfg, cooldown, self.rules_version) is not None:
                     n_meta += 1
+            if new_sets != self.burst_sets or released:
+                db.kv_set(c, "engine.meta_burst_sets", json.dumps(new_sets, sort_keys=True), now)
             db.kv_set(c, "engine.heartbeat", str(now), now)
             db.kv_set(c, "engine.rules_version", self.rules_version, now)
-            return n_coin, n_meta
+            return n_coin, n_meta, n_added
 
-        summary["coin_decisions"], summary["meta_decisions"] = db.write_tx(self.conn, _write, what="engine.decisions")
+        summary["coin_decisions"], summary["meta_decisions"], summary["meta_burst_watched"] = db.write_tx(self.conn, _write, what="engine.decisions")
+        self.burst_sets = new_sets
         summary["tick_s"] = round(time.monotonic() - t_start, 3)
         return summary
 

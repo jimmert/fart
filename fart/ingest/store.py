@@ -4,10 +4,16 @@ Chain time (slot, block_time) and our clock (received_at) are always separate co
 seen by several sources are merged: details are filled where missing, `sources` is the union.
 
 Milestone 3 guards: a mint on the configurable system-mint list (USDC, USDT, WSOL, PUMP;
-config/pumpfun.json -> system_mints) is never a coin, a migration or a watchlist candidate, and a
-PumpPortal migration is only accepted for a coin we know (`coins`). A refused message is kept in
-`rejected_messages` with its reason. pump-amm swaps get their mint exclusively through the pool ->
-base-mint mapping (CreatePoolEvent in the same transaction or `migrations.pool_address`).
+config/pumpfun.json -> system_mints) is never a coin, a migration or a watchlist candidate. A refused
+message is kept in `rejected_messages` with its reason. pump-amm swaps get their mint exclusively
+through the pool -> base-mint mapping (CreatePoolEvent in the same transaction or
+`migrations.pool_address`).
+
+Milestone 4: a migration of a coin we never saw created (PumpPortal reports coins created before fart
+started; the RPC stream decodes migrations of missed creates) is stored with `coin_unknown=1` so the
+universe stays complete (`grads_without_create` in the coverage and the daily report), is never a
+watchlist candidate, and loses the flag when the create arrives later (sweep, backfill, replay).
+`rejected_messages` keeps only real refusals: system mints, messages without a mint, unknown pools.
 """
 from __future__ import annotations
 
@@ -74,17 +80,14 @@ def reject_message(conn: sqlite3.Connection, source: str, kind: str | None, reas
     return int(cur.lastrowid)
 
 
-def migration_rejection(conn: sqlite3.Connection, mint: str | None, pumpfun_cfg: dict[str, Any] | None,
-                        require_known_coin: bool) -> str | None:
-    """Why a migration / watchlist candidate must be refused: 'no_mint', 'system_mint:<label>' or
-    'unknown_coin' (only when `require_known_coin`); None when it is acceptable."""
+def migration_rejection(conn: sqlite3.Connection, mint: str | None, pumpfun_cfg: dict[str, Any] | None) -> str | None:
+    """Why a migration must be refused: 'no_mint' or 'system_mint:<label>'; None when it is acceptable.
+    An unknown coin is not a reason since milestone 4: its migration is stored with `coin_unknown=1`."""
     if not mint:
         return "no_mint"
     label = system_mint_label(mint, pumpfun_cfg)
     if label is not None:
         return f"system_mint:{label}"
-    if require_known_coin and not coin_known(conn, mint):
-        return "unknown_coin"
     return None
 
 
@@ -118,6 +121,8 @@ def upsert_coin(conn: sqlite3.Connection, rec: dict[str, Any], source: str, rece
                 json.dumps([source]), raw_ref,
             ),
         )
+        # a graduation stored before its create (milestone 4) is complete now
+        conn.execute("UPDATE migrations SET coin_unknown=0 WHERE mint=? AND coin_unknown=1", (mint,))
         return True
     # merge: keep the earliest received_at, fill blanks, union sources
     conn.execute(
@@ -135,23 +140,27 @@ def upsert_coin(conn: sqlite3.Connection, rec: dict[str, Any], source: str, rece
 
 
 def upsert_migration(conn: sqlite3.Connection, rec: dict[str, Any], source: str, received_at: float) -> bool:
+    """Insert or merge a graduation. `coin_unknown` is 1 while no create of the mint is known (the
+    universe stays complete, the coin is never watched); it clears as soon as a create arrives."""
     mint = rec.get("mint")
     if not mint:
         return False
+    known = coin_known(conn, mint)
     row = conn.execute("SELECT * FROM migrations WHERE mint=?", (mint,)).fetchone()
     if row is None:
         conn.execute(
-            "INSERT INTO migrations(mint, slot, block_time, received_at, signature, pool_address, dex, source, sources)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO migrations(mint, slot, block_time, received_at, signature, pool_address, dex, source, sources, coin_unknown)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
             (mint, rec.get("slot"), rec.get("block_time"), received_at, rec.get("signature"), rec.get("pool_address"),
-             rec.get("dex"), source, json.dumps([source])),
+             rec.get("dex"), source, json.dumps([source]), 0 if known else 1),
         )
         return True
     conn.execute(
         "UPDATE migrations SET slot=COALESCE(slot,?), block_time=COALESCE(block_time,?), signature=COALESCE(signature,?),"
-        " pool_address=COALESCE(pool_address,?), dex=COALESCE(dex,?), received_at=MIN(received_at,?), sources=? WHERE mint=?",
+        " pool_address=COALESCE(pool_address,?), dex=COALESCE(dex,?), received_at=MIN(received_at,?), sources=?,"
+        " coin_unknown=CASE WHEN ? THEN 0 ELSE coin_unknown END WHERE mint=?",
         (rec.get("slot"), rec.get("block_time"), rec.get("signature"), rec.get("pool_address"), rec.get("dex"),
-         received_at, _sources_union(row["sources"], source), mint),
+         received_at, _sources_union(row["sources"], source), 1 if known else 0, mint),
     )
     return False
 

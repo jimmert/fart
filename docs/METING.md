@@ -18,7 +18,9 @@ start; een periode waarin fart helemaal niet draaide is een `down`-gat voor elke
 **compleet** als het voorbij is en minstens één bron het hele uur actief was zonder onhersteld gat.
 Niet gedekt is nooit compleet. Gaten zijn intervallen waarin een stroom niet verbonden was (opstart,
 verbreking, watchdog, budgetplafond, afsluiten, down). `grads_without_create` hoort dicht bij nul te
-liggen; anders missen we creates.
+liggen; anders missen we creates. Uitzondering sinds mijlpaal 4: een graduatie die PumpPortal meldt van
+een munt die vóór de start van fart is aangemaakt, wordt bewaard met `coin_unknown=1` en telt hier ook
+mee (het universum blijft compleet, de munt wordt nooit gevolgd); het dagrapport noemt dat aantal apart.
 
 **Winnaar (hit_100k).** Piek-marktkapitalisatie ≥ $100.000 binnen 24 uur na het ankermoment
 **én** volume ≥ $20.000 in diezelfde 24 uur. Ankermoment = de graduatie (voor het universum) of

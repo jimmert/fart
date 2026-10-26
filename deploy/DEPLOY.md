@@ -85,13 +85,16 @@ strict rate limits, no key, **no per-mint trade stream**). The file is read by t
 `sudo systemctl restart fart-ingest fart-engine fart-social fart-notify`.
 
 `RPC_DAILY_BUDGET_CU` is a hard daily cap on *estimated* compute units (cost table in
-`config/budget.json`). Reconcile the estimate with the Alchemy dashboard after the first days and
-adjust the table or the cap (see `docs/UNVERIFIED.md`). The per-mint trade stream (milestone 3) may spend
-at most 1/24 of the cap per UTC hour on its own notifications (`config/ingest.json` →
-`rpc_trades.hourly_cu_fraction`; above it every trade subscription is dropped until the next hour) and
-drops any single subscription that passes 2,000 notifications in an hour; at 80% of the daily cap it also
-drops the probation subscriptions; at the cap the whole RPC side stops (log streams disconnect, enrichment
-pauses); PumpPortal keeps running; a warning is logged once per hour.
+`config/budget.json`: the HTTP methods at the figures of Alchemy's compute-unit page, websocket frames per
+byte at `cu_per_byte`). Reconcile the estimate with the Alchemy dashboard after the first days and adjust
+the table, `cu_per_byte` or the cap (the procedure is in `docs/UNVERIFIED.md`). The per-mint trade stream
+may spend at most `daily_cu_share` (0.35) of the cap over a day on its own frames, enforced as an hourly
+envelope of 0.35 / 24 = 1.46% of the cap (43,750 CU at 3,000,000; `config/ingest.json` → `rpc_trades`;
+above it every trade subscription is dropped until the next hour), so the log stream, the enrichment and
+the engine always keep the other 65%. It also drops any single subscription that passes 2,000
+notifications in an hour; at 80% of the daily cap it drops the probation subscriptions; at the cap the
+whole RPC side stops (log streams disconnect, enrichment pauses); PumpPortal keeps running; a warning is
+logged once per hour.
 
 ## 4. Verify
 
@@ -152,7 +155,7 @@ rule for the shared VPS IP (the test itself only holds a connection for 60 s).
    sudo -u fart /opt/fart/bin/fart notify outbox         # empty until TELEGRAM_NOTIFY_ENABLED=1
    ```
    After an hour: `trades today by source` shows `rpc_trades` (and `pump_amm` once a watched coin
-   graduated), `top subscriptions` lists the busiest mints, `rpc CU today by method` shows what the
+   graduated), `top open subscriptions` lists the busiest mints, `rpc CU today by method` shows what the
    trade stream costs - compare with the Alchemy dashboard and tune `config/budget.json`.
 5. Telegram: with the token, chat id and `TELEGRAM_NOTIFY_ENABLED=1` in `.env`,
    `sudo -u fart /opt/fart/bin/fart notify test` sends one test message to the owner chat.
@@ -211,7 +214,7 @@ not running. Step by step:
    sudo -u fart /opt/fart/bin/fart status
    #   schema_version: 3; freshness engine.heartbeat a few seconds; failures: none (engine.tick_failed must not appear or grow)
    #   rpc CU today by method: ws_trade_notification separate from ws_notification; stays under 125,000 per hour
-   #   top subscriptions: curve/probation|early_buyers|meta_burst only, never USDC/PUMP, never a pool
+   #   top open subscriptions: curve/probation|early_buyers|meta_burst only, never USDC/PUMP, never a pool
    #   rejected messages today: system_mint:USDC / system_mint:PUMP counting up is expected (PumpPortal keeps sending them)
    #   enrich (getTransaction): used/limit (7627 at the 3M cap), backlog migrations=... creates=...
    journalctl -u fart-engine --since -15min --no-pager | grep -c tick_failed      # 0
@@ -232,6 +235,92 @@ not running. Step by step:
 7. **Rollback** to M2 code is possible after the migration (M2 ignores the new table and columns; the
    deleted system-mint rows do not come back), the pre-upgrade `.db` from step 1 is the clean way back.
 
+## 5c. Upgrade to milestone 4 (M4)
+
+M4 changes nothing in the units and nothing in `.env` except the cap you temporarily raised. What it
+changes on the server: the watchlist no longer churns (an entry is only evicted by a *strictly* higher
+priority, `since` is never reset, 100 of the 200 slots are reserved for probation, the engine freezes a
+choice of at most 40 meta_burst coins), the trade stream subscribes with hysteresis (a mint must be wanted
+in two consecutive syncs, 10 s, before it is subscribed and unwanted for 60 s before it is dropped) and may
+spend 35% of the daily CU cap over a day (1.46% per hour: the `0.015` you ran with), websocket frames are
+booked per byte and the HTTP methods at Alchemy's published figures, a PumpPortal migration of a coin
+created before fart started is stored with `coin_unknown=1` instead of refused, the schema goes to
+`user_version` 4 and closes the milestone-2 `graduation` watchlist rows, and `fart status` shows the open
+subscriptions, what closed today and why, bytes next to CU. Step by step:
+
+1. **Back up first** (the migration is one-way):
+   ```bash
+   sudo systemctl start fart-backup.service; systemctl show -p Result fart-backup.service   # Result=success
+   ls -la /opt/fart/data/backup/
+   ```
+2. **Pull and install:**
+   ```bash
+   cd /opt/fart-src && git pull --ff-only && sudo deploy/install.sh
+   ```
+   * The rsync replaces `/opt/fart/app/config/ingest.json`: the temporary VPS overrides
+     `rpc_trades.enabled=false` and `rpc_trades.hourly_cu_fraction=0.015` disappear. The repository has
+     `enabled` `true`, `daily_cu_share` `0.35` (0.35 / 24 = 0.0146 per hour, the value you ran with),
+     `unsubscribe_after_s` 60, `subscribe_after_syncs` 2 and `log_interval_s` 60; `config/engine.json`
+     has `probation_reserve` 100, `meta_burst_per_meta` 5, `meta_burst_max_total` 40,
+     `meta_burst_release_s` 600; `config/budget.json` has the calibrated table and `cu_per_byte` 0.0002.
+     Nothing on the server needs to be edited by hand any more; a config change is a commit.
+   * The installer opens the database once as the `fart` user: schema migration 3 → 4 adds the columns
+     `watchlist.activated_at`, `migrations.coin_unknown`, `ws_subscriptions.close_reason`,
+     `api_ledger.bytes`, **closes every active `graduation` watchlist row** (and its open
+     `ws_subscriptions` row, `close_reason` `schema_v4`) and flags every migration without a coin row.
+     The installer prints `v4 cleanup (graduation rows closed, migrations flagged): {...}`; on the VPS
+     expect `watchlist_graduation_closed` close to 35 and `migrations_coin_unknown` a handful (the RPC
+     stream's migrations of coins created before the first start). A second run prints zeros. The counts
+     stay in kv (`fart status` → `schema v4 cleanup`).
+3. **Put the CU cap back** in `/opt/fart/.env`: `RPC_DAILY_BUDGET_CU=4500000` → `RPC_DAILY_BUDGET_CU=3000000`
+   (the stream is bounded to 43,750 CU per hour at this cap by its daily share; the engine, the log stream
+   and the enrichment keep the other 65%). Then
+   `sudo systemctl restart fart-ingest fart-engine fart-social fart-notify`.
+4. **Verify after 15 minutes:**
+   ```bash
+   sudo -u fart /opt/fart/bin/fart status
+   #   schema_version: 4
+   #   counts: ... watchlist_active=N (early_buyers a few, meta_burst <= 40, probation 20-60): the reserve keeps probation in
+   #   freshness (s): ingest.rpc_trades.last_msg_at a few seconds (a watched coin trades), engine.heartbeat a few seconds
+   #   rpc CU today by method: ws_notification ... CU = ... bytes (N batches), ws_trade_notification ... CU = ... bytes (...),
+   #     ws_trade_subscribe / ws_trade_unsubscribe small; getSignaturesForAddress 40 per call  [cu_per_byte 0.0002]
+   #   subscriptions open: N (meta_burst <= 40, probation present, early_buyers a few); closed today: unwatched ..., graduated ...
+   #     -> `envelope` and `capped` absent or low; no `address_changed`; the open count stable between two runs a minute apart
+   #   top open subscriptions (notifications): curve/probation|early_buyers|meta_burst only
+   #   failures: none  (no engine.tick_failed, no ingest.handle_failed.*; rpc_trades.envelope_paused and
+   #     rpc_trades.subscription_capped absent or a small number that does not grow every hour)
+   #   schema v4 cleanup (...): {"watchlist_graduation_closed": 35, ...}
+   journalctl -u fart-ingest --since -15min --no-pager | grep -c '"rpc_trades.subscriptions"'   # ~15: once a minute, not every 5 s
+   journalctl -u fart-ingest --since -15min --no-pager | grep 'rpc_trades.subscriptions' | tail -3   # sent=0 ... pending_unsubscribe small
+   journalctl -u fart-ingest --since -15min --no-pager | grep -c handle_failed    # 0
+   journalctl -u fart-engine --since -15min --no-pager | grep -c tick_failed      # 0
+   sudo -u fart sqlite3 /opt/fart/data/fart.db "select count(*), count(distinct mint) from ws_subscriptions where since > strftime('%s','now') - 900"
+   #   rows in the order of the new coins of the quarter hour plus <= 40, every mint once (26 Oct before M4: 5,298 rows / 238 mints in 52 min)
+   sudo -u fart sqlite3 /opt/fart/data/fart.db "select close_reason, count(*) from ws_subscriptions where until > strftime('%s','now') - 900 group by 1"
+   #   unwatched (probation expiries) and graduated; envelope/capped rare
+   ```
+   The `rpc_trades.limits` line at ingest start names `daily_cu_share` 0.35, `hourly_cu_allowance` 43750,
+   `unsubscribe_after_s` 60 and `subscribe_after_syncs` 2.
+5. **Calibrate the CU estimate with the Alchemy dashboard** the next day (docs/UNVERIFIED.md, "Solana RPC /
+   Alchemy", has the full procedure): for one whole UTC day compare the dashboard's compute units per method
+   with
+   ```bash
+   sudo -u fart sqlite3 /opt/fart/data/fart.db "select method, round(sum(cost)) as cu, sum(bytes) as bytes, count(*) as rows from api_ledger where source='rpc' and blocked_reason is null and ts >= strftime('%s','<day>') and ts < strftime('%s','<day>','+1 day') group by method order by 2 desc"
+   ```
+   The HTTP methods should match call for call (`getSignaturesForAddress` 40, `getTransaction` 40,
+   `getTokenLargestAccounts` 20, `getAccountInfo` 10). For the websocket lines the factor is
+   dashboard CU / our bytes: `0.0002` confirms the table; `0.04` means `config/budget.json` →
+   `rpc.cu_per_byte` must become `0.04` (the stream then gets 1/200 of the frames per hour; lower
+   `rpc_trades_cap` or raise the cap); no websocket CU at all on the dashboard means `0`. Change the value
+   in a commit, never on the server, and write the dashboard numbers and date into `docs/UNVERIFIED.md`.
+   Until then the CU figures of `fart status` and the daily report are estimates.
+6. **The daily report** of the first full M4 day (`out/recall/<day>.md`) carries the new line
+   "Graduaties zonder bekende create (coin_unknown, nooit gevolgd)" in "Verrijking en fouten"; those
+   graduations are in the universe (`grads_without_create`) and measured by the tracker like every other.
+7. **Rollback** to M3 code after the migration: M3 ignores the new columns, but it would re-add
+   `graduation` rows only with `subscribe_graduations` (false), so nothing comes back by itself; the
+   pre-upgrade `.db` from step 1 is the clean way back. The 35 closed graduation rows stay closed.
+
 ## 6. First-day checklist (docs/UNVERIFIED.md)
 
 1. `fart chain global`: reserves, supply, `fee_basis_points` 95 and `creator_fee_basis_points` 5 must
@@ -243,9 +332,10 @@ not running. Step by step:
 3. Compare one real create transaction and one pump-amm trade (`trades` with `source='pump_amm'`) with
    `docs/PUMPFUN-EVENTS.md`; `decode.pump_amm_pool_unknown` / `quote_not_wsol` in `fart status` should
    stay small (a swap on a pool we never saw created is expected now and then).
-4. Compare `fart status` → `rpc CU today by method` with the Alchemy dashboard, in particular whether
-   websocket notifications (`ws_notification`, `ws_trade_notification`) are billed at all; adjust
-   `config/budget.json` (docs/UNVERIFIED.md, "Solana RPC / Alchemy").
+4. Compare `fart status` → `rpc CU today by method` with the Alchemy dashboard, in particular the CU per
+   byte of the websocket frames (`ws_notification`, `ws_trade_notification`: 0.0002 or 0.04 per byte, or
+   not billed); adjust `config/budget.json` → `rpc.cu_per_byte` in a commit (docs/UNVERIFIED.md, "Solana
+   RPC / Alchemy", step by step in section 5c).
 5. Watch `coverage --hours 24` for a day: `grads_without_create` should be close to zero.
 6. X: compare the prices in `config/x.json` with the developer console; `fart status` → `x spend today`.
 7. Telegram: `fart notify test`, then watch `fart notify outbox` for `sent` rows.
@@ -285,8 +375,11 @@ old rows stay, new rows get the old version string again.
 | `pp.disconnected ... http_status=403/429` repeatedly, `pumpportal last HTTP refusal` | PumpPortal refusing the shared IP | stop other PumpPortal clients on the host (momentdesk also holds one); one connection only; the health alert fires once per hour |
 | `rpc_trades.disabled reason=public RPC fallback` | no keyed RPC URL | fill `RPC_HTTP_URL`/`RPC_WSS_URL`; the per-mint trade stream needs Alchemy |
 | `rpc_trades.cu_policy_dropping_probation` | the day's CU spend passed 80% of the cap | expected degradation; raise `RPC_DAILY_BUDGET_CU` or lower `rpc_trades_cap` in `config/engine.json` |
-| `rpc_trades.envelope_paused` / `status` → `rpc_trades.envelope_paused` counting up | the trade stream spent its hourly share (1/24 of the cap) | expected: subscriptions come back at the next UTC hour; lower `rpc_trades_cap` or raise `hourly_cu_fraction` in `config/ingest.json` only after reconciling the CU estimate with Alchemy |
+| `rpc_trades.envelope_paused` / `status` → `rpc_trades.envelope_paused` counting up every hour | the trade stream spent its hourly share (`daily_cu_share` / 24 of the cap) | expected now and then; every hour means the share is too small for the number of subscriptions: lower `rpc_trades_cap` or `meta_burst_max_total`, or raise `daily_cu_share` in `config/ingest.json` (a commit) only after reconciling `cu_per_byte` with Alchemy |
 | `rpc_trades.subscription_capped` (and `rpc_trades.last_capped` in `status --json`) | one coin produced more than 2,000 notifications in an hour | expected: that subscription is dropped for the rest of the hour; the trades it already delivered stay |
+| `subscriptions closed today:` shows `unwatched` in the thousands, or `ws_subscriptions` gets many rows per mint | the watchlist churns again (an eviction rule or the meta_burst choice changed) | `tests/test_m4_watchlist_stream.py` is the reproduction; `watch.add()` must evict strictly lower priority only and never reset `since` |
+| `subscriptions open:` shows no `probation` for a quarter of an hour while coins are created | probation starved: the shared slots are full and `probation_reserve` is 0 or too small | `config/engine.json` → `watchlist.probation_reserve` (100 of 200); check `counts: watchlist_active=... (probation N)` |
+| `rpc_trades.subscriptions` logged every 5 s with `sent>0` | the desired set really changes every sync (not a flicker: the hysteresis absorbs those) | look at `closed today:` reasons; `envelope` every hour = share too small, `stream_cap` = more eligible mints than `rpc_trades_cap` |
 | `pp.migration_rejected reason=system_mint:USDC` / `rejected messages today` | PumpPortal put a quote mint in a migration message's `mint` field | expected and harmless now; inspect `rejected_messages` (docs/PUMPFUN-EVENTS.md) |
 | `engine.tick_failed` in `failures:` growing | a tick still fails after 3 retries | read `engine.tick_failed.last` in `status --json` and `journalctl -u fart-engine`; a lock holder longer than 15 s is a bug, not expected |
 | `ingest.handle_failed.<source>` in `failures:` growing | a handler could not write after 3 retries | the message is in the raw store: `fart ingest replay --source <source> --since <time>` after fixing the cause |

@@ -59,6 +59,11 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
   messages whose `mint` field was the USDC or the PUMP mint (72,770 and 8,142 pool notifications in six
   minutes once they were on the watchlist). Since milestone 3 they are refused and kept:
   `sqlite3 /opt/fart/data/fart.db "select received_at, reason, raw_json from rejected_messages where reason like 'system_mint%' order by id desc limit 5"`.
+  A migration of a coin created before fart started (`Cv934yS1kxVtW3Y6vS8jhk6APKpdtWbzpMcs6VHHpump`,
+  26 Oct 2026, refused as `unknown_coin` by milestone 3) is stored since milestone 4 with
+  `migrations.coin_unknown=1`, never watched, counted under `grads_without_create`; `fart status` shows
+  the count. Open: whether such messages ever name a coin that is *not* older than fart (that would mean a
+  missed create, which the sweep + backfill should then recover and clear the flag).
   Open: which coin those messages were about (pump.fun now supports non-SOL quote mints: `quote_mint`
   in CreateEvent/CompletePumpAmmMigrationEvent/CreatePoolEvent, `whitelisted_quote_mints` in Global;
   PumpPortal may report the quote side of such migrations), and whether another field of the message
@@ -73,28 +78,64 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
 
 ## Solana RPC / Alchemy
 
-- [ ] **Compute-unit cost table** (`config/budget.json` → `rpc.cost_table`): getTransaction 59,
-  getSignaturesForAddress 50, getTokenLargestAccounts 50, ws_notification 10, … are estimates.
-  Reconcile `fart status` → `budget rpc cost` with the Alchemy dashboard after 24 h.
-- [ ] **Whether Alchemy bills websocket notifications at all, and how much** (`ws_notification`,
-  `ws_trade_notification`, `ws_subscribe`, `ws_unsubscribe` at 10 CU each are estimates; Alchemy's
-  public price list names subscription *methods*, not the notifications they deliver). This is the
-  single most important number for the trade stream: on 26 Oct 2026 `fart status` →
-  `rpc CU today by method` showed `ws_notification 2,399,130` estimated CU in 217 batches (one batch =
-  one minute of notifications) against a 3,000,000 cap. To settle it, Jim compares the Alchemy dashboard
-  ("Usage", 26 Oct 2026, compute units per method/app) with that line: if the dashboard shows nothing
-  near 2.4M CU for the websocket, notifications are not billed (or billed far lower) and
-  `config/budget.json` → `rpc.cost_table.ws_notification` / `ws_trade_notification` should become the
-  real figure (0 is allowed); the hourly envelope and the 80% rule scale with it automatically. If the
-  dashboard matches, 10 CU per notification stands and the stream stays envelope-bound (about 12,500
-  notifications per hour at the 3M cap). Milestone 3 books the trade stream under its own methods so the
-  two streams can be told apart in the next comparison.
+- [~] **Compute-unit cost table** (`config/budget.json` → `rpc.cost_table`). Milestone 4 set the HTTP
+  methods to the figures of Alchemy's compute-unit page (https://www.alchemy.com/docs/reference/compute-unit-costs,
+  read by Jim on 26 Oct 2026): `getTransaction` 40, `getSignaturesForAddress` 40, `getTokenLargestAccounts`
+  20, `getAccountInfo` 10 (they were 59 / 50 / 50 / 10). `getSlot` 10, `getBlockTime` 10 and
+  `getMultipleAccounts` 25 were not read from the page and stay estimates. Still open: the dashboard
+  comparison per method (procedure below). The enrich limit follows the table: 0.15 x 3,000,000 / 40 =
+  11,250 `getTransaction` calls per day (7,627 before).
+- [ ] **Websocket subscriptions are billed per byte, but at which rate.** The same page gives two
+  numbers (26 Oct 2026, not reconciled): the Solana section says **0.0002 CU per byte** for Solana
+  websocket subscriptions (`logsSubscribe` and the others), the section "Webhooks and Subscription APIs"
+  says **0.04 CU per byte** (a factor 200). Since milestone 4 every frame of the two subscription
+  connections is booked as bytes (the UTF-8 length of the frame received or sent) x `rpc.cu_per_byte`
+  (0.0002, the working value; the ledger keeps the bytes next to the CU): notifications under
+  `ws_notification` (creates/migrations stream) and `ws_trade_notification` (trade stream), the
+  subscribe/unsubscribe requests and their answers under `ws_subscribe`, `ws_unsubscribe`,
+  `ws_trade_subscribe`, `ws_trade_unsubscribe`. The flat 10 CU per notification of milestones 1-3 is gone;
+  it was never a published figure. At 0.0002 CU/byte the 26 Oct volume (about 243,000 notifications of
+  roughly 1 KB) is some 50,000 CU per day; at 0.04 it would be some 10,000,000 CU per day, far above the
+  cap. This is the single number that decides how much of the trade stream the envelope lets through,
+  and it stays unconfirmed until the dashboard says otherwise.
+
+  **Calibration procedure (one whole UTC day of M4 running, not a partial day):**
+  1. Our side, per method, with bytes:
+     ```
+     sudo -u fart sqlite3 /opt/fart/data/fart.db "select method, round(sum(cost)) as cu, sum(bytes) as bytes, count(*) as rows from api_ledger where source='rpc' and blocked_reason is null and ts >= strftime('%s','<day>') and ts < strftime('%s','<day>','+1 day') group by method order by 2 desc"
+     ```
+     (`fart status` → `rpc CU today by method` is the same for the running day; `rows` are one-minute
+     batches for the websocket methods and calls for the HTTP methods.)
+  2. Alchemy dashboard → Usage → the same UTC day → compute units per method for the app. Note every
+     HTTP method with its call count and CU, and the websocket / subscription line(s).
+  3. HTTP methods: dashboard CU / dashboard calls should equal our table value per method; our call
+     counts should match the dashboard's within the rows of the minute boundaries. A different CU per call
+     goes into `config/budget.json` → `rpc.cost_table` (one commit = a new `rules_version`).
+  4. Websocket: factor = dashboard CU of the subscription line(s) / our bytes of all six `ws_*` methods
+     together. Factor close to 0.0002: the table stands, tick this item with the dashboard numbers and the
+     date. Factor close to 0.04: set `rpc.cu_per_byte` to 0.04 in a commit; the hourly envelope then admits
+     1/200 of the frames (lower `rpc_trades_cap` / `meta_burst_max_total` or raise the cap) and the enrich
+     limit is unaffected. No websocket CU at all on the dashboard: set `cu_per_byte` to 0 (the envelope and
+     the 80% rule become moot for the streams) and write the date down. Anything in between: use the
+     measured factor rounded to two significant digits.
+  5. Record the dashboard figures here (day, CU per method, websocket CU, our bytes, the factor). Nothing
+     is "confirmed" without the dashboard numbers next to it.
 - [ ] **Milestone-1 estimate**: ~13,400 CU per 10 minutes (~2M CU/day) against the 3M cap before the
-  trade stream; the 80% rule drops probation subscriptions first when the cap comes near.
-- [ ] **EUR 50/month ≈ 3,000,000 CU/day** (`RPC_DAILY_BUDGET_CU` default). Depends on Alchemy's
-  pay-as-you-go price per million CU.
-- [ ] **Public RPC fallback limits** (`rpc_public`: 1 req/s, burst 4, 20k/day). The public
-  endpoint may refuse `logsSubscribe` or `getSignaturesForAddress` with large limits.
+  trade stream was built on the 10-CU-per-notification assumption; superseded by the per-byte booking.
+  `fart status` → `rpc CU today by method` is the current estimate; the 80% rule drops probation
+  subscriptions first when the cap comes near.
+- [ ] **The trade stream's daily share** (`config/ingest.json` → `rpc_trades.daily_cu_share` 0.35, hourly
+  envelope 0.35 / 24 = 1.46% of the cap = 43,750 CU at 3,000,000) comes from the VPS override of 26 Oct
+  2026 (`hourly_cu_fraction` 0.015 = 36% per day). Whether 35% is the right split between the trade
+  stream and the rest (log stream, sweep, enrichment, engine lookups) is a question for the first full
+  day with the calibrated `cu_per_byte`: the log stream's `ws_notification` bytes are the fixed cost of
+  completeness and come first.
+- [ ] **EUR 50/month ≈ 3,000,000 CU/day** (`RPC_DAILY_BUDGET_CU` default): Alchemy Pay As You Go is
+  $0.525 per 1M CU with 30M CU per month free (pricing page, 26 Oct 2026): 90M CU per month = 60M billable
+  = $31.50 plus any subscription fee of the plan. Check the invoice against the dashboard's monthly total.
+- [ ] **Public RPC fallback limits** (`rpc_public`: 1 req/s, burst 4, 20k/day, no per-byte price so
+  websocket frames count 1 each). The public endpoint may refuse `logsSubscribe` or
+  `getSignaturesForAddress` with large limits.
 - [ ] **`getSignaturesForAddress` on the mint authority** lists create transactions newest-first
   with `slot`/`blockTime`, and one transaction creates one coin (`fart/ingest/sweep.py`).
 

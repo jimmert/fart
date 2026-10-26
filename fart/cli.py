@@ -124,7 +124,7 @@ def cmd_status(settings, as_json: bool) -> int:
             bcfg = dict(icfg.get("backfill", {}))
             bcfg.update(icfg.get("enrich", {}))
             rpc_src_cfg = settings.config("budget")["sources"].get("rpc_public" if settings.rpc_is_public else "rpc", {})
-            tx_cost = float((rpc_src_cfg.get("cost_table") or {}).get("getTransaction", rpc_src_cfg.get("cost_default", 59)))
+            tx_cost = float((rpc_src_cfg.get("cost_table") or {}).get("getTransaction", rpc_src_cfg.get("cost_default", 40)))
             out["enrich"] = {"used_today": int(kv.get(f"enrich.tx.{day_key(t)}", "0") or 0),
                              "limit": enrich_daily_limit(bcfg, None if settings.rpc_is_public else float(settings.rpc_daily_budget_cu), tx_cost),
                              "skipped_today": int(kv.get(f"enrich.skipped_budget.{day_key(t)}", "0") or 0),
@@ -135,11 +135,24 @@ def cmd_status(settings, as_json: bool) -> int:
             out["budget"] = budget.snapshot()
             rpc_source = "rpc_public" if settings.rpc_is_public else "rpc"
             out["cu_by_method_today"] = [dict(r) for r in conn.execute(
-                "SELECT method, COUNT(*) AS requests, ROUND(SUM(cost)) AS cost FROM api_ledger WHERE source=? AND ts>=? AND blocked_reason IS NULL"
-                " GROUP BY method ORDER BY SUM(cost) DESC", (rpc_source, day_start(t)))]
+                "SELECT method, COUNT(*) AS requests, ROUND(SUM(cost)) AS cost, SUM(bytes) AS bytes FROM api_ledger"
+                " WHERE source=? AND ts>=? AND blocked_reason IS NULL GROUP BY method ORDER BY SUM(cost) DESC", (rpc_source, day_start(t)))]
+            out["cu_per_byte"] = rpc_src_cfg.get("cu_per_byte")
+            # milestone 4: only OPEN subscriptions here; what closed today is a separate line with its reasons
             out["top_subscriptions"] = [dict(r) for r in conn.execute(
-                "SELECT mint, kind, reason, notifications, trades, since, until FROM ws_subscriptions"
-                " WHERE until IS NULL OR until >= ? ORDER BY notifications DESC LIMIT 5", (day_start(t),))]
+                "SELECT mint, kind, reason, notifications, trades, since FROM ws_subscriptions"
+                " WHERE until IS NULL ORDER BY notifications DESC LIMIT 5")]
+            out["subscriptions_open"] = conn.execute("SELECT COUNT(*) FROM ws_subscriptions WHERE until IS NULL").fetchone()[0]
+            out["subscriptions_open_by_reason"] = {r[0]: r[1] for r in conn.execute(
+                "SELECT COALESCE(reason, 'probation'), COUNT(*) FROM ws_subscriptions WHERE until IS NULL GROUP BY 1")}
+            out["subscriptions_closed_today"] = {r[0]: r[1] for r in conn.execute(
+                "SELECT COALESCE(close_reason, 'unknown'), COUNT(*) FROM ws_subscriptions WHERE until >= ? GROUP BY 1 ORDER BY 2 DESC", (day_start(t),))}
+            out["watchlist_by_reason"] = {r[0]: r[1] for r in conn.execute(
+                "SELECT COALESCE(reason, 'probation'), COUNT(*) FROM watchlist WHERE active=1 GROUP BY 1")}
+            out["migrations_coin_unknown"] = {
+                "total": conn.execute("SELECT COUNT(*) FROM migrations WHERE coin_unknown=1").fetchone()[0],
+                "today": conn.execute("SELECT COUNT(*) FROM migrations WHERE coin_unknown=1 AND received_at >= ?", (day_start(t),)).fetchone()[0]}
+            out["schema_v4_cleanup"] = json.loads(kv["schema.v4.cleanup"]) if kv.get("schema.v4.cleanup") else None
             out["global_check"] = {"status": kv.get("chain.global.status"), "checked_at": utc_iso(float(kv["chain.global.checked_at"])) if kv.get("chain.global.checked_at") else None,
                                    "mismatches": json.loads(kv.get("chain.global.mismatches") or "[]")}
             out["x_spend_today"] = [dict(r) for r in conn.execute(
@@ -162,7 +175,8 @@ def cmd_status(settings, as_json: bool) -> int:
         print(f"  {out['note']}")
         return 0
     print(f"  schema_version: {out['schema_version']}")
-    print("  counts: " + ", ".join(f"{k}={v}" for k, v in out["counts"].items()) + f", watchlist_active={out['watchlist_active']}")
+    print("  counts: " + ", ".join(f"{k}={v}" for k, v in out["counts"].items()) + f", watchlist_active={out['watchlist_active']}"
+          + (" (" + ", ".join(f"{k} {v}" for k, v in sorted(out["watchlist_by_reason"].items())) + ")" if out["watchlist_by_reason"] else ""))
     if out["trades_by_source_today"]:
         print("  trades today by source: " + ", ".join(f"{k}={v}" for k, v in sorted(out["trades_by_source_today"].items())))
     print("  freshness (s): " + ", ".join(f"{k}={v}" for k, v in out["age_seconds"].items() if v is not None) or "  freshness (s): none")
@@ -176,9 +190,18 @@ def cmd_status(settings, as_json: bool) -> int:
               (f"; BACKOFF until {utc_iso(b['backoff_until'])}" if b["backoff_until"] and b["backoff_until"] > now() else "") +
               (f"; last_err: {str(b['last_err_msg'])[:60]}" if b["last_err_msg"] else ""))
     if out["cu_by_method_today"]:
-        print("  rpc CU today by method: " + ", ".join(f"{r['method']} {r['cost']:.0f} ({r['requests']} req)" for r in out["cu_by_method_today"]))
+        def _cu(r: dict[str, Any]) -> str:
+            if r.get("bytes") is not None:
+                return f"{r['method']} {r['cost']:.0f} CU = {int(r['bytes']):,} bytes ({r['requests']} batches)"
+            return f"{r['method']} {r['cost']:.0f} ({r['requests']} req)"
+
+        print("  rpc CU today by method: " + ", ".join(_cu(r) for r in out["cu_by_method_today"])
+              + (f"  [cu_per_byte {out['cu_per_byte']}]" if out.get("cu_per_byte") is not None else ""))
+    print(f"  subscriptions open: {out['subscriptions_open']}"
+          + (" (" + ", ".join(f"{k} {v}" for k, v in sorted(out["subscriptions_open_by_reason"].items())) + ")" if out["subscriptions_open_by_reason"] else "")
+          + "; closed today: " + (", ".join(f"{k} {v}" for k, v in out["subscriptions_closed_today"].items()) or "none"))
     if out["top_subscriptions"]:
-        print("  top subscriptions (notifications): " + "; ".join(
+        print("  top open subscriptions (notifications): " + "; ".join(
             f"{r['mint'][:8]}… {r['kind']}/{r['reason']} {r['notifications']} (trades {r['trades']})" for r in out["top_subscriptions"]))
     if out["x_spend_today"]:
         print("  x spend today: " + ", ".join(f"{r['kind']} ${r['usd']:.3f} ({r['n']})" for r in out["x_spend_today"]))
@@ -196,6 +219,11 @@ def cmd_status(settings, as_json: bool) -> int:
     print(f"  enrich (getTransaction): {e['used_today']}/{e['limit']} today, skipped {e['skipped_today']}, backlog migrations={e['backlog'].get('migrate_tx', 0)} creates={e['backlog'].get('create_tx', 0)}")
     if out["schema_v3_cleanup"]:
         print(f"  schema v3 cleanup (system-mint rows removed at {utc_iso(out['schema_v3_cleanup'].get('at'))}): {json.dumps(out['schema_v3_cleanup'].get('deleted'))}")
+    if out["schema_v4_cleanup"]:
+        print(f"  schema v4 cleanup (graduation rows closed at {utc_iso(out['schema_v4_cleanup'].get('at'))}): {json.dumps(out['schema_v4_cleanup'].get('counts'))}")
+    mu = out["migrations_coin_unknown"]
+    if mu["total"]:
+        print(f"  graduations without a known create (coin_unknown, never watched): {mu['total']} total, {mu['today']} today")
     if out["pumpportal_last_http_status"]:
         print(f"  pumpportal last HTTP refusal: {out['pumpportal_last_http_status']}")
     print(f"  last decision: {out['last_decision_at']}")

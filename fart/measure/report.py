@@ -112,7 +112,7 @@ def build_report(conn: sqlite3.Connection, settings: Settings, day: str, now: fl
     bcfg = dict(icfg.get("backfill", {}))
     bcfg.update(icfg.get("enrich", {}))
     rpc_src = settings.config("budget")["sources"].get("rpc_public" if settings.rpc_is_public else "rpc", {})
-    tx_cost = float((rpc_src.get("cost_table") or {}).get("getTransaction", rpc_src.get("cost_default", 59)))
+    tx_cost = float((rpc_src.get("cost_table") or {}).get("getTransaction", rpc_src.get("cost_default", 40)))
     cap = None if settings.rpc_is_public else float(settings.rpc_daily_budget_cu)
     limit_kv = db.kv_get(conn, f"enrich.limit.{day}")
     kvi = lambda key: int(db.kv_get(conn, key, "0") or 0)  # noqa: E731
@@ -125,6 +125,10 @@ def build_report(conn: sqlite3.Connection, settings: Settings, day: str, now: fl
         "handle_failed": {s: kvi(f"ingest.handle_failed.{s}.{day}") for s in ("pumpportal", "rpc_logs", "rpc_trades")},
         "rejected_messages": rejected,
         "rpc_trades": {"subscription_capped": kvi(f"rpc_trades.subscription_capped.{day}"), "envelope_paused": kvi(f"rpc_trades.envelope_paused.{day}")},
+        # graduations stored without a known create (milestone 4): part of the universe, never watched
+        "migrations_coin_unknown": int(conn.execute(
+            "SELECT COUNT(*) FROM migrations WHERE coin_unknown=1 AND COALESCE(block_time, received_at) >= ? AND COALESCE(block_time, received_at) < ?",
+            (start, end)).fetchone()[0]),
     }
 
     # ----- universe: graduations of the day --------------------------------------------------------
@@ -372,6 +376,7 @@ def render_markdown(r: dict[str, Any]) -> str:
             f"- Mislukte ingest-handlers: " + ", ".join(f"{k} {_n(v)}" for k, v in hf.items()),
             f"- Geweigerde berichten: " + (", ".join(f"{k} {_n(v)}" for k, v in rej.items()) if rej else "geen"),
             f"- Trade-stroom: {_n(rt.get('subscription_capped'))} abonnementen afgekapt, {_n(rt.get('envelope_paused'))} keer gepauzeerd door de uurenvelop",
+            f"- Graduaties zonder bekende create (coin_unknown, nooit gevolgd): {_n(ops.get('migrations_coin_unknown'))}",
         ]
     lines += [
         "",

@@ -1,5 +1,5 @@
 {
-  "_comment": "Per-source rate gates, daily budgets and cost tables. All numbers are estimates to reconcile with provider dashboards (docs/UNVERIFIED.md). rate_per_s * burst = token bucket. daily_cost 'env:RPC_DAILY_BUDGET_CU' is replaced by the env value.",
+  "_comment": "Per-source rate gates, daily budgets and cost tables. All numbers are estimates to reconcile with provider dashboards (docs/UNVERIFIED.md). rate_per_s * burst = token bucket. daily_cost 'env:RPC_DAILY_BUDGET_CU' is replaced by the env value. Milestone 4: the rpc table follows the published Alchemy compute-unit page as read on 26 Oct 2026; websocket frames (byte_priced methods) are booked as bytes x cu_per_byte, the ledger keeps the bytes.",
   "sources": {
     "rpc": {
       "rate_per_s": 8,
@@ -8,25 +8,28 @@
       "daily_cost": "env:RPC_DAILY_BUDGET_CU",
       "cost_default": 20,
       "cost_table": {
-        "getTransaction": 59,
-        "getSignaturesForAddress": 50,
-        "getTokenLargestAccounts": 50,
+        "getTransaction": 40,
+        "getSignaturesForAddress": 40,
+        "getTokenLargestAccounts": 20,
         "getAccountInfo": 10,
         "getSlot": 10,
         "getBlockTime": 10,
         "getHealth": 0,
         "getMultipleAccounts": 25,
-        "ws_connect": 10,
-        "ws_subscribe": 10,
-        "ws_notification": 10,
-        "ws_unsubscribe": 10,
-        "ws_trade_notification": 10,
-        "ws_trade_subscribe": 10,
-        "ws_trade_unsubscribe": 10
+        "ws_connect": 10
       },
       "backoff_base_s": 2,
       "backoff_max_s": 300,
-      "_comment": "ws_notification/ws_subscribe = the creates+migrations log stream (rpc_logs); ws_trade_* = the per-mint trade stream (rpc_trades), booked separately so `fart status` -> rpc CU today by method shows what each stream costs. Whether Alchemy bills websocket notifications at all is TO VERIFY (docs/UNVERIFIED.md)."
+      "_comment": "getTransaction 40, getSignaturesForAddress 40, getTokenLargestAccounts 20, getAccountInfo 10: the Alchemy compute-unit page (https://www.alchemy.com/docs/reference/compute-unit-costs, read 26 Oct 2026). getSlot, getBlockTime, getMultipleAccounts were not read from the page and stay estimates. Solana websocket subscriptions are billed per byte: 0.0002 CU per byte according to the Solana section of that page; its 'Webhooks and Subscription APIs' section says 0.04 CU per byte (a factor 200, not reconciled). cu_per_byte 0.0002 is the working value until the dashboard comparison in docs/UNVERIFIED.md settles it; set 0.04 to book the pessimistic reading. ws_notification/ws_subscribe = the creates+migrations log stream (rpc_logs), ws_trade_* = the per-mint trade stream (rpc_trades), booked separately so `fart status` -> rpc CU today by method shows bytes and CU per stream. ws_connect stays a flat estimate.",
+      "cu_per_byte": 0.0002,
+      "byte_priced": [
+        "ws_notification",
+        "ws_subscribe",
+        "ws_unsubscribe",
+        "ws_trade_notification",
+        "ws_trade_subscribe",
+        "ws_trade_unsubscribe"
+      ]
     },
     "rpc_public": {
       "rate_per_s": 1,

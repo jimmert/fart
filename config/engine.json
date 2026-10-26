@@ -24,13 +24,17 @@
   },
   "watchlist": {
     "cap": 200,
+    "probation_reserve": 100,
     "ttl_s": 86400,
     "dead_after_idle_s": 7200,
     "early_buyers_threshold": 10,
     "early_window_s": 300,
     "subscribe_graduations": false,
     "subscribe_bursting_meta": true,
-    "_comment": "probation = every new pump coin for early_window_s seconds (unique-buyer counts come from here). subscribe_graduations: a graduation puts the coin on the watchlist (reason graduation) only for a funded PumpPortal key; the RPC trade stream never subscribes after graduation (milestone 3), the tracker samples graduated coins. rpc_trades_cap caps the number of per-mint logsSubscribe subscriptions; above rpc_trades_cu_drop_fraction of the daily CU cap only the rpc_trades_keep_reasons_above_cu_fraction reasons keep a subscription (probation is dropped first). The per-subscription and per-hour limits of the stream live in config/ingest.json -> rpc_trades.",
+    "meta_burst_per_meta": 5,
+    "meta_burst_max_total": 40,
+    "meta_burst_release_s": 600,
+    "_comment": "probation = every new pump coin for early_window_s seconds (unique-buyer counts come from here); probation_reserve of the cap slots can only be used by probation, the other reasons share the rest (milestone 4: the watchlist used to fill up with meta_burst and starve probation). meta_burst_per_meta youngest, not yet graduated coins of every bursting meta, at most meta_burst_max_total in all (strongest metas first); a meta's set is frozen while it bursts and released meta_burst_release_s after it stopped bursting (sets persisted in kv engine.meta_burst_sets). subscribe_graduations: a graduation puts the coin on the watchlist (reason graduation) only for a funded PumpPortal key; the RPC trade stream never subscribes after graduation (milestone 3), the tracker samples graduated coins. rpc_trades_cap caps the number of per-mint logsSubscribe subscriptions; above rpc_trades_cu_drop_fraction of the daily CU cap only the rpc_trades_keep_reasons_above_cu_fraction reasons keep a subscription (probation is dropped first). The per-subscription cap, the daily CU share and the hysteresis of the stream live in config/ingest.json -> rpc_trades.",
     "rpc_trades_cap": 150,
     "rpc_trades_cu_drop_fraction": 0.8,
     "rpc_trades_keep_reasons_above_cu_fraction": [

@@ -158,9 +158,11 @@ async def _main(settings: Settings) -> None:
             rt_raw = RawWriter(settings.raw_dir, "rpc_trades", 5, 200)
             rt = RpcTradesClient(conn, budget, rt_raw, settings.rpc_wss_url, rpc_source, tcfg, wcfg, pf)
             tasks.append(asyncio.create_task(rt.run(stop), name="rpc_trades"))
-            log.info("rpc_trades.limits", reasons=tcfg.get("reasons"), hourly_cu_allowance=rt.hourly_allowance(),
+            log.info("rpc_trades.limits", reasons=tcfg.get("reasons"), daily_cu_share=rt.daily_cu_share(),
+                     hourly_cu_allowance=rt.hourly_allowance(),
                      max_notifications_per_subscription_per_hour=tcfg.get("max_notifications_per_subscription_per_hour"),
-                     cap=wcfg.get("rpc_trades_cap"))
+                     cap=wcfg.get("rpc_trades_cap"), unsubscribe_after_s=tcfg.get("unsubscribe_after_s"),
+                     subscribe_after_syncs=tcfg.get("subscribe_after_syncs"))
     else:
         log.info("rpc_trades.disabled", reason="config/ingest.json rpc_trades.enabled is false")
     tasks.append(asyncio.create_task(_periodic(settings, conn, stop, float(icfg["backfill"].get("sweep_interval_s", 300))), name="periodic"))
