@@ -5,8 +5,12 @@ notifications, and degrades (disconnects) when the daily compute-unit cap is rea
 Milestone 3: every write is one short `BEGIN IMMEDIATE` transaction with retries; a handler that
 still fails is counted (`ingest.handle_failed.rpc_logs`) and the raw hour file can be replayed
 (`fart ingest replay --source rpc_logs`). A migration of a system mint is refused; a migration of a
-coin we never saw created is stored (the universe must stay complete; `grads_without_create` shows
-it) but puts nothing on the watchlist.
+coin we never saw created is stored with `coin_unknown=1` (the universe must stay complete;
+`grads_without_create` shows it) but puts nothing on the watchlist.
+
+Milestone 4: the frames of this connection are booked per byte (`ws_notification` for the
+notifications, `ws_subscribe` for the two subscribe requests and their answers; config/budget.json
+`cu_per_byte`), aggregated per minute with the byte count kept in the ledger.
 """
 from __future__ import annotations
 
@@ -67,7 +71,7 @@ class RpcLogsClient:
         self.counts: dict[str, int] = {}
         self._gap_id: int | None = None
         self._connected = False
-        self._pending_cost_n = 0
+        self._pending: dict[str, list[int]] = {"ws_notification": [0, 0], "ws_subscribe": [0, 0]}  # method -> [frames, bytes]
 
     # ----- notification handling (sync, testable) ---------------------------------------------
     def handle_text(self, text: str, received_at: float) -> str:
@@ -80,6 +84,7 @@ class RpcLogsClient:
             self._bump("unparseable")
             return "unparseable"
         if msg.get("method") != "logsNotification":
+            self._book_frame("ws_subscribe", text)  # the answers to the two subscribe requests
             if "error" in msg:
                 log.warning("rpc_logs.error_message", error=str(msg.get("error"))[:200])
                 self._bump("error")
@@ -87,8 +92,7 @@ class RpcLogsClient:
             self._bump("other")
             return "other"
         self.notifications += 1
-        if not self.replay:
-            self._pending_cost_n += 1
+        self._book_frame("ws_notification", text)
         result = (msg.get("params") or {}).get("result") or {}
         value = result.get("value") or {}
         slot = (result.get("context") or {}).get("slot")
@@ -98,7 +102,7 @@ class RpcLogsClient:
             return "failed_tx"
         events, undecoded = decode_logs(value.get("logs"))
         recs = store.records_from_events(events, signature, slot)
-        cap = int(self.watch_cfg.get("cap", 200))
+        cap, reserve = watch.limits(self.watch_cfg)
         notes: dict[str, Any] = {}
 
         def _apply(c: sqlite3.Connection) -> None:
@@ -113,7 +117,7 @@ class RpcLogsClient:
                 cr = recs["create"]
                 new = store.upsert_coin(c, cr, SOURCE, received_at, pumpfun_cfg=self.pf)
                 if new and cr.get("mint") and self.watch_cfg.get("probation", True):
-                    watch.add(c, cr["mint"], "probation", received_at, float(self.watch_cfg.get("early_window_s", 300)), cap)
+                    watch.add(c, cr["mint"], "probation", received_at, float(self.watch_cfg.get("early_window_s", 300)), cap, reserve)
                 if signature and not self.replay:
                     kv_set(c, "ingest.rpc_logs.last_create_sig", signature, received_at)
                 for t in recs["trades"]:  # the dev buy; stored when the mint is watched (probation makes it so)
@@ -122,15 +126,19 @@ class RpcLogsClient:
             if recs["migration"]:
                 notes["kind"] = "migrate"
                 m = recs["migration"]
-                why = store.migration_rejection(c, m.get("mint"), self.pf, require_known_coin=False)
+                why = store.migration_rejection(c, m.get("mint"), self.pf)
                 if why is not None:
                     notes["rejected"] = why
                     if not self.replay:
                         store.reject_message(c, SOURCE, "migrate", why, m.get("mint"), msg, received_at, ref)
                 else:
-                    store.upsert_migration(c, m, SOURCE, received_at)
-                    if m.get("mint") and self.watch_cfg.get("subscribe_graduations", False) and store.coin_known(c, m["mint"]):
-                        watch.add(c, m["mint"], "graduation", received_at, float(self.watch_cfg.get("ttl_s", 86400)), cap)
+                    known = store.coin_known(c, m["mint"])
+                    store.upsert_migration(c, m, SOURCE, received_at)  # coin_unknown=1 while the create is missing
+                    if not known:
+                        notes["coin_unknown"] = 1
+                    # only a funded PumpPortal key follows graduated coins (subscribe_graduations); never an unknown coin
+                    elif self.watch_cfg.get("subscribe_graduations", False):
+                        watch.add(c, m["mint"], "graduation", received_at, float(self.watch_cfg.get("ttl_s", 86400)), cap, reserve)
                     if signature and not self.replay:
                         kv_set(c, "ingest.rpc_logs.last_migrate_sig", signature, received_at)
             if not self.replay:
@@ -148,6 +156,8 @@ class RpcLogsClient:
         if "rejected" in notes:
             self._bump("migrate_rejected")
             log.warning("rpc_logs.migration_rejected", reason=notes["rejected"], signature=signature)
+        if "coin_unknown" in notes:
+            self._bump("migrate_coin_unknown")
         kind = notes["kind"]
         self._bump(kind)
         return kind
@@ -162,15 +172,25 @@ class RpcLogsClient:
     def _bump(self, k: str) -> None:
         self.counts[k] = self.counts.get(k, 0) + 1
 
+    def _book_frame(self, method: str, text: str) -> None:
+        """Count one frame (sent or received) for the minute's cost flush: frames and bytes."""
+        if self.replay:
+            return
+        self._pending[method][0] += 1
+        self._pending[method][1] += len(text.encode("utf-8"))
+
     def flush_cost(self) -> None:
-        """Account notifications as estimated compute units (aggregated, about once a minute)."""
-        if self._pending_cost_n:
-            unit = self.budget.source(self.budget_source).cost_of("ws_notification")
-            self.budget.record(self.budget_source, "ws_notification", unit * self._pending_cost_n, True, None, None)
-            self._pending_cost_n = 0
+        """Book the frames of the last minute: bytes x cu_per_byte (the byte count stays in the ledger row),
+        or n x the table estimate when the method is not byte-priced."""
+        sc = self.budget.source(self.budget_source)
+        for method, (n, nbytes) in self._pending.items():
+            if n:
+                self.budget.record(self.budget_source, method, sc.cost_of_frames(method, nbytes, n), True, None, None, nbytes=nbytes)
+            self._pending[method] = [0, 0]
 
     def cap_reached(self) -> bool:
-        v = self.budget.peek(self.budget_source, "ws_notification")
+        """Within one CU of the daily cap (or past it: the streams book after the fact)."""
+        v = self.budget.peek(self.budget_source, "ws_notification", cost=1.0)
         return (not v.allowed) and v.reason in ("daily_cost_cap", "daily_requests_cap")
 
     # ----- connection loop ---------------------------------------------------------------------
@@ -229,12 +249,15 @@ class RpcLogsClient:
             self._connected = True
             log.info("rpc_logs.connected", connects=self.connects, source=self.budget_source)
             self._close_gap(self.clock())
+            sc = self.budget.source(self.budget_source)
             for req_id, kind in ((1, "create"), (2, "migrate")):
-                self.budget.acquire(self.budget_source, "ws_subscribe")
-                await ws.send(json.dumps({
+                text = json.dumps({
                     "jsonrpc": "2.0", "id": req_id, "method": "logsSubscribe",
                     "params": [{"mentions": [self.addresses[kind]]}, {"commitment": commitment}],
-                }))
+                })
+                self.budget.acquire(self.budget_source, "ws_subscribe", cost=sc.cost_of_frames("ws_subscribe", len(text), 1))
+                self._book_frame("ws_subscribe", text)
+                await ws.send(text)
             last_msg = time.monotonic()
             last_cost = time.monotonic()
             while not stop.is_set():

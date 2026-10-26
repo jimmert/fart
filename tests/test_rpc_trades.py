@@ -1,5 +1,7 @@
 """Per-mint RPC trade stream: subscription policy (pre-graduation only since milestone 3), protocol
-diffing, decoding (pump-amm swaps through the pool -> mint mapping), cost booking, reconnects."""
+diffing, decoding (pump-amm swaps through the pool -> mint mapping), cost booking, reconnects.
+The milestone-4 hysteresis of sync_messages() has its own tests (tests/test_m4_watchlist_stream.py);
+the protocol tests here switch it off (subscribe_after_syncs 1, unsubscribe_after_s 0)."""
 import asyncio
 import base64
 import hashlib
@@ -58,12 +60,15 @@ class FakeWS:
         pass
 
 
-def make_client(settings, conn, clock, cu_cap="100000", wcfg_over=None, cfg_over=None, connect=None):
+NO_HYSTERESIS = {"subscribe_after_syncs": 1, "unsubscribe_after_s": 0}
+
+
+def make_client(settings, conn, clock, cu_cap="100000", wcfg_over=None, cfg_over=None, connect=None, hysteresis=False):
     srcs = load_source_configs(settings.config("budget"), {"RPC_DAILY_BUDGET_CU": cu_cap})
     budget = Budget(conn, srcs, settings.lock_path, clock=clock)
     raw = RawWriter(settings.raw_dir, "rpc_trades", flush_interval_s=0)
     wcfg = dict(settings.config("engine")["watchlist"], **(wcfg_over or {}))
-    cfg = dict(settings.config("ingest")["rpc_trades"], **(cfg_over or {}))
+    cfg = dict(settings.config("ingest")["rpc_trades"], **({} if hysteresis else NO_HYSTERESIS), **(cfg_over or {}))
     rt = RpcTradesClient(conn, budget, raw, "wss://x", "rpc", cfg, wcfg, settings.config("pumpfun"),
                          connect=connect or (lambda *a, **k: None), clock=clock)
     return rt, budget
@@ -107,7 +112,9 @@ def test_desired_policy_addresses_priority_and_cap(settings, conn):
     assert all(v[1] in ("curve", "mint") for v in d.values())
     assert rt.policy["active_watchlist"] == 6 and rt.policy["eligible"] == 3 and rt.policy["subscribed"] == 2 and rt.policy["cap"] == 2
     assert rt.policy["graduated_excluded"] == 2 and rt.policy["envelope_paused"] is False and rt.policy["muted"] == 0
-    assert rt.policy["hourly_cu_allowance"] == round(100000 * settings.config("ingest")["rpc_trades"]["hourly_cu_fraction"])
+    share = settings.config("ingest")["rpc_trades"]["daily_cu_share"]
+    assert share == 0.35 and rt.policy["daily_cu_share"] == share and "hourly_cu_fraction" not in settings.config("ingest")["rpc_trades"]
+    assert rt.policy["hourly_cu_allowance"] == round(100000 * share / 24)  # the hourly envelope is the daily share spread over 24 hours
     # a graduation of a subscribed coin drops it at the next sync (nothing follows the coin onto the pool)
     conn.execute("INSERT INTO migrations(mint, received_at, pool_address, source, sources) VALUES(?,?,?,'rpc_logs','[]')", (mb, T0 + 1, pk("pool-mb")))
     assert set(rt.desired(T0 + 2)) == {p2, p1}
@@ -119,7 +126,7 @@ def test_desired_policy_addresses_priority_and_cap(settings, conn):
 
 
 def test_cu_policy_drops_probation_above_fraction(settings, conn):
-    rt, budget = make_client(settings, conn, Clock(), cu_cap="1000", cfg_over={"hourly_cu_fraction": 1.0})
+    rt, budget = make_client(settings, conn, Clock(), cu_cap="1000", cfg_over={"daily_cu_share": 1.0})
     for seed, reason in (("b", "probation"), ("d", "early_buyers"), ("e", "meta_burst")):
         add_coin(conn, pk(seed), pk("curve-" + seed))
         watch.add(conn, pk(seed), reason, T0 - 1, None, 200)
@@ -132,9 +139,9 @@ def test_cu_policy_drops_probation_above_fraction(settings, conn):
 
 
 def test_hourly_envelope_pauses_the_whole_stream(settings, conn):
-    """The stream's own CU per UTC hour (ws_trade_* ledger rows + pending) may not exceed hourly_cu_fraction x the daily cap."""
+    """The stream's own CU per UTC hour (ws_trade_* ledger rows + pending frames) may not exceed daily_cu_share / 24 x the daily cap."""
     clock = Clock(T0)  # 2025-10-26T12:00:00Z exactly
-    rt, budget = make_client(settings, conn, clock, cu_cap="24000", cfg_over={"hourly_cu_fraction": 1 / 24})
+    rt, budget = make_client(settings, conn, clock, cu_cap="24000", cfg_over={"daily_cu_share": 1.0})
     for seed in ("a", "b"):
         add_coin(conn, pk(seed), pk("curve-" + seed))
         watch.add(conn, pk(seed), "probation", T0 - 1, None, 200)
@@ -143,16 +150,17 @@ def test_hourly_envelope_pauses_the_whole_stream(settings, conn):
     # the log stream's notifications do not count against the trade stream's envelope
     budget.record("rpc", "ws_notification", 5000.0, True, None, None)
     assert len(rt.desired(T0 + 1)) == 2
-    # 100 pending (unflushed) trade notifications x 10 CU reach the allowance -> everything dropped
-    rt._pending_cost_n = 100
+    # 100 pending (unflushed) trade notifications of 50,000 bytes x 0.0002 CU/byte reach the allowance -> everything dropped
+    rt._pending_bytes["ws_trade_notification"], rt._pending_frames["ws_trade_notification"] = 5_000_000, 100
     assert rt.stream_cost_this_hour(T0 + 2) == pytest.approx(1000.0)
     assert rt.desired(T0 + 2) == {} and rt.policy["envelope_paused"] is True and rt.policy["stream_cu_this_hour"] == 1000
     assert conn.execute("SELECT value FROM kv WHERE key='rpc_trades.envelope_paused'").fetchone()[0] == "1"
     assert conn.execute("SELECT value FROM kv WHERE key='rpc_trades.envelope_paused.2025-10-26'").fetchone()[0] == "1"
-    rt.flush_cost()  # booked as ws_trade_notification at T0+2 (the current hour)
+    rt.flush_cost()  # booked as ws_trade_notification at T0+2 (the current hour), with the byte count
     assert rt.desired(T0 + 3) == {} and conn.execute("SELECT value FROM kv WHERE key='rpc_trades.envelope_paused'").fetchone()[0] == "1"  # counted once per episode
     ledger = {r[0]: r[1] for r in conn.execute("SELECT method, SUM(cost) FROM api_ledger WHERE source='rpc' GROUP BY method")}
     assert ledger["ws_trade_notification"] == 1000.0 and ledger["ws_notification"] == 5000.0
+    assert conn.execute("SELECT bytes FROM api_ledger WHERE method='ws_trade_notification'").fetchone()[0] == 5_000_000
     # the next UTC hour starts with an empty envelope: the subscriptions come back
     clock.t = T0 + 3600
     assert len(rt.desired(clock.t)) == 2 and rt.policy["envelope_paused"] is False
@@ -171,11 +179,16 @@ def test_sync_and_notifications_end_to_end(settings, conn, fixtures_dir, pp_msgs
     assert len(msgs) == 1 and msgs[0]["method"] == "logsSubscribe"
     assert msgs[0]["params"] == [{"mentions": [curve]}, {"commitment": "confirmed"}]
     rid = msgs[0]["id"]
+    sub_bytes = len(json.dumps(msgs[0]).encode())
+    notif_bytes = 0
     assert rt.sync_messages(T0 + 0.5) == []  # pending, nothing new
-    assert rt.handle_text(json.dumps({"jsonrpc": "2.0", "result": 11, "id": rid}), T0 + 1) == "subscribed"
+    sub_resp = json.dumps({"jsonrpc": "2.0", "result": 11, "id": rid})
+    assert rt.handle_text(sub_resp, T0 + 1) == "subscribed"
+    sub_bytes += len(sub_resp.encode())
     assert conn.execute("SELECT sub_id FROM ws_subscriptions WHERE mint=?", (mint,)).fetchone()[0] == 11  # for replays
     note = (fixtures_dir / "logs_notification_trade_curve.json").read_text()  # subscription 11
     assert rt.handle_text(note, T0 + 2) == "trade"
+    notif_bytes += 2 * len(note.encode())  # this one and the duplicate below
     row = conn.execute("SELECT * FROM trades WHERE source='rpc_trades'").fetchone()
     assert row["mint"] == mint and row["buyer"] == exp["buyer3"] and row["is_buy"] == 1
     assert row["sol"] == pytest.approx(0.7) and row["slot"] == 370_000_050 and row["block_time"] == TS + 30
@@ -184,21 +197,28 @@ def test_sync_and_notifications_end_to_end(settings, conn, fixtures_dir, pp_msgs
     assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 1
     other = json.loads(note)
     other["params"]["subscription"] = 99
-    assert rt.handle_text(json.dumps(other), T0 + 4) == "orphan"
+    other_text = json.dumps(other)
+    assert rt.handle_text(other_text, T0 + 4) == "orphan"
+    notif_bytes += len(other_text.encode())  # an orphan is still a frame Alchemy delivered
     assert rt.handle_text("garbage", T0 + 4.5) == "unparseable"
     # a pump-amm swap whose pool is unknown is rejected and counted, never attributed to the subscription's mint
     early_pool_buy = json.loads((fixtures_dir / "logs_notification_trade_pool.json").read_text())
     early_pool_buy["params"]["subscription"] = 11
     early_pool_buy["params"]["result"]["value"]["signature"] = "sig-early-pool-buy"
-    assert rt.handle_text(json.dumps(early_pool_buy), T0 + 4.7) == "notification"
+    early_text = json.dumps(early_pool_buy)
+    assert rt.handle_text(early_text, T0 + 4.7) == "notification"
+    notif_bytes += len(early_text.encode())
     assert rt.counts["amm_pool_unknown"] == 1 and conn.execute("SELECT value FROM kv WHERE key='decode.pump_amm_pool_unknown'").fetchone()[0] == "1"
     assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 1
     # the migration transaction arrives through the curve subscription: migrations gets the pool (CreatePoolEvent)
     mig = (fixtures_dir / "logs_notification_migration_with_pool.json").read_text()
     assert rt.handle_text(mig, T0 + 5) == "notification"
+    notif_bytes += len(mig.encode())
     assert conn.execute("SELECT pool_address, source FROM migrations WHERE mint=?", (mint,)).fetchone()["pool_address"] == pool
     # a swap on that pool, seen on the still-open curve subscription, resolves its mint through migrations.pool_address
-    assert rt.handle_text((fixtures_dir / "logs_notification_trade_pool.json").read_text().replace('"subscription": 12', '"subscription": 11'), T0 + 5.5) == "trade"
+    pool_trade = (fixtures_dir / "logs_notification_trade_pool.json").read_text().replace('"subscription": 12', '"subscription": 11')
+    assert rt.handle_text(pool_trade, T0 + 5.5) == "trade"
+    notif_bytes += len(pool_trade.encode())
     amm = conn.execute("SELECT * FROM trades WHERE source='pump_amm'").fetchall()
     assert len(amm) == 1 and amm[0]["mint"] == mint and amm[0]["is_buy"] == 1 and amm[0]["sol"] == pytest.approx(2.0)
     assert amm[0]["tokens"] == pytest.approx(10_000_000.0) and amm[0]["virtual_sol"] == 100_000_000_000 and amm[0]["block_time"] == TS + 600
@@ -207,17 +227,28 @@ def test_sync_and_notifications_end_to_end(settings, conn, fixtures_dir, pp_msgs
     msgs = rt.sync_messages(T0 + 6)
     assert [m["method"] for m in msgs] == ["logsUnsubscribe"] and msgs[0]["params"] == [11] and rt.subs == {}
     assert rt.policy["graduated_excluded"] == 1
-    assert rt.handle_text(json.dumps({"jsonrpc": "2.0", "result": True, "id": msgs[0]["id"]}), T0 + 7) == "unsubscribed"
-    assert rt.handle_text((fixtures_dir / "logs_notification_trade_pool_sell.json").read_text(), T0 + 8) == "orphan"  # subscription 12 never existed
-    # per-subscription bookkeeping
+    unsub_bytes = len(json.dumps(msgs[0]).encode())
+    unsub_resp = json.dumps({"jsonrpc": "2.0", "result": True, "id": msgs[0]["id"]})
+    assert rt.handle_text(unsub_resp, T0 + 7) == "unsubscribed"
+    unsub_bytes += len(unsub_resp.encode())
+    pool_sell = (fixtures_dir / "logs_notification_trade_pool_sell.json").read_text()
+    assert rt.handle_text(pool_sell, T0 + 8) == "orphan"  # subscription 12 never existed
+    notif_bytes += len(pool_sell.encode())
+    # per-subscription bookkeeping, with the milestone-4 close reason
     rows = conn.execute("SELECT * FROM ws_subscriptions ORDER BY since").fetchall()
     assert [r["kind"] for r in rows] == ["curve"]
     assert rows[0]["until"] is not None and rows[0]["notifications"] == 5 and rows[0]["trades"] == 2 and rows[0]["reason"] == "early_buyers"
-    # cost booking under the stream's own ledger methods: every notification (orphan included), subscribe, unsubscribe
+    assert rows[0]["close_reason"] == "graduated" and rt.counts["closed_graduated"] == 1
+    # cost booking under the stream's own ledger methods, per byte (milestone 4): every notification frame
+    # (orphan included), the subscribe request and its answer, the unsubscribe request and its answer
     rt.flush_cost()
-    ledger = {r[0]: r[1] for r in conn.execute("SELECT method, SUM(cost) FROM api_ledger WHERE source='rpc' GROUP BY method")}
-    assert ledger == {"ws_trade_notification": 70.0, "ws_trade_subscribe": 10.0, "ws_trade_unsubscribe": 10.0}  # 7 notifications ("garbage" is none)
-    assert rt.stats()["notifications"] == 7
+    rate = settings.config("budget")["sources"]["rpc"]["cu_per_byte"]
+    ledger = {r["method"]: r for r in conn.execute("SELECT method, SUM(cost) AS cost, SUM(bytes) AS bytes FROM api_ledger WHERE source='rpc' GROUP BY method")}
+    assert set(ledger) == {"ws_trade_notification", "ws_trade_subscribe", "ws_trade_unsubscribe"}
+    assert ledger["ws_trade_notification"]["bytes"] == notif_bytes and ledger["ws_trade_notification"]["cost"] == pytest.approx(notif_bytes * rate)
+    assert ledger["ws_trade_subscribe"]["bytes"] == sub_bytes and ledger["ws_trade_subscribe"]["cost"] == pytest.approx(sub_bytes * rate)
+    assert ledger["ws_trade_unsubscribe"]["bytes"] == unsub_bytes and ledger["ws_trade_unsubscribe"]["cost"] == pytest.approx(unsub_bytes * rate)
+    assert rt.stats()["notifications"] == 7  # 7 notification frames ("garbage" is none)
     # a fresh, not-graduated coin: an error on a pending subscribe drops it
     mint2 = pk("mint-2")
     add_coin(conn, mint2, pk("curve-2"))
@@ -243,7 +274,7 @@ def test_per_subscription_hourly_cap(settings, conn, fixtures_dir, pp_msgs, payl
     mint = exp["mint"]
     store.upsert_coin(conn, store.pumpportal_create_record(pp_msgs["new_token"]), "pumpportal", T0 - 100)
     watch.add(conn, mint, "early_buyers", T0 - 50, 86400, 200)
-    rt, _ = make_client(settings, conn, Clock(), cfg_over={"max_notifications_per_subscription_per_hour": 5, "hourly_cu_fraction": 1.0})
+    rt, _ = make_client(settings, conn, Clock(), cfg_over={"max_notifications_per_subscription_per_hour": 5, "daily_cu_share": 1.0})
     msgs = rt.sync_messages(T0)
     assert rt.handle_text(json.dumps({"jsonrpc": "2.0", "result": 11, "id": msgs[0]["id"]}), T0 + 1) == "subscribed"
     note = json.loads((fixtures_dir / "logs_notification_trade_curve.json").read_text())
@@ -256,7 +287,7 @@ def test_per_subscription_hourly_cap(settings, conn, fixtures_dir, pp_msgs, payl
     assert rt.subs == {} and 11 not in rt.by_sub and rt.muted_until[mint] == T0 + 3600  # the UTC hour of T0
     assert conn.execute("SELECT value FROM kv WHERE key='rpc_trades.subscription_capped'").fetchone()[0] == "1"
     assert json.loads(conn.execute("SELECT value FROM kv WHERE key='rpc_trades.last_capped'").fetchone()[0])["mint"] == mint
-    assert conn.execute("SELECT until FROM ws_subscriptions").fetchone()[0] == T0 + 10
+    assert conn.execute("SELECT until, close_reason FROM ws_subscriptions").fetchone()[:] == (T0 + 10, "capped")
     # not re-subscribed while muted; back next hour
     assert rt.sync_messages(T0 + 11) == [] and rt.policy["muted"] == 1
     msgs = rt.sync_messages(T0 + 3601)
@@ -290,8 +321,9 @@ def test_run_loop_resubscribes_after_disconnect(settings, conn, pp_msgs, payload
     assert opened[1].sent[0]["method"] == "logsSubscribe"  # re-subscribed after the reconnect
     reasons = [r[0] for r in conn.execute("SELECT reason FROM coverage_gaps WHERE source='rpc_trades' ORDER BY id")]
     assert reasons[0] == "startup" and "disconnect" in reasons and reasons[-1] == "shutdown"
-    rows = conn.execute("SELECT until FROM ws_subscriptions ORDER BY since").fetchall()
+    rows = conn.execute("SELECT until, close_reason FROM ws_subscriptions ORDER BY since").fetchall()
     assert len(rows) >= 2 and all(r["until"] is not None for r in rows)  # every session's row closed at shutdown
+    assert [r["close_reason"] for r in rows][:2] == ["disconnect", "disconnect"] or [r["close_reason"] for r in rows][-1] == "shutdown"
     assert budget.daily_usage("rpc")["requests"] >= rt.connects
 
 

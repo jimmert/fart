@@ -159,13 +159,21 @@ def test_rpc_logs_handle_text(settings, conn, fixtures_dir):
     assert conn.execute("SELECT value FROM kv WHERE key='decode.unknown_discriminator'").fetchone()[0] == "1"
     assert conn.execute("SELECT value FROM kv WHERE key='ingest.rpc_logs.last_create_sig'").fetchone()[0] == "othersig"
     rl.flush_cost()
-    assert budget.daily_usage("rpc")["cost"] == 4 * 10  # 4 notifications x ws_notification estimate
+    # milestone 4: frames are booked per byte (cu_per_byte 0.0002); the ledger keeps the bytes next to the CU
+    rate = settings.config("budget")["sources"]["rpc"]["cu_per_byte"]
+    frames = [json.dumps({"jsonrpc": "2.0", "result": 7, "id": 1}), create, migr, json.dumps(bad), json.dumps(mixed)]
+    rows = {r["method"]: r for r in conn.execute("SELECT method, SUM(bytes) AS bytes, SUM(cost) AS cost, COUNT(*) AS n FROM api_ledger WHERE source='rpc' GROUP BY method")}
+    assert rows["ws_notification"]["bytes"] == sum(len(f.encode()) for f in frames[1:]) and rows["ws_notification"]["n"] == 1
+    assert rows["ws_notification"]["cost"] == pytest.approx(rows["ws_notification"]["bytes"] * rate)
+    assert rows["ws_subscribe"]["bytes"] == len(frames[0].encode())  # the answer to a subscribe request counts for that request
+    assert budget.daily_usage("rpc")["cost"] == pytest.approx(sum(len(f.encode()) for f in frames) * rate)
+    assert budget.daily_usage("rpc")["cost"] < 1.0  # 4 notifications cost well under one CU at 0.0002 CU/byte
     assert not rl.cap_reached()
 
 
 def test_rpc_logs_pauses_at_daily_cap(settings, conn, fixtures_dir):
     clock = Clock()
-    srcs = load_source_configs(settings.config("budget"), {"RPC_DAILY_BUDGET_CU": "25"})
+    srcs = load_source_configs(settings.config("budget"), {"RPC_DAILY_BUDGET_CU": "1.2"})  # two create frames are ~0.6 CU at 0.0002 CU/byte
     budget = Budget(conn, srcs, settings.lock_path, clock=clock)
     raw = RawWriter(settings.raw_dir, "rpc_logs", flush_interval_s=0)
     rl = RpcLogsClient(conn, budget, raw, "wss://x", "rpc", settings.config("ingest")["rpc_logs"], settings.config("pumpfun"),
@@ -174,7 +182,7 @@ def test_rpc_logs_pauses_at_daily_cap(settings, conn, fixtures_dir):
     rl.handle_text(create, 1.0)
     rl.handle_text(create, 2.0)
     rl.flush_cost()
-    assert rl.cap_reached()
+    assert rl.cap_reached()  # "reached" = within one CU of the cap (the streams book after the fact)
 
 
 class FakeRpc:

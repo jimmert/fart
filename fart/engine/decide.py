@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from typing import Any
+from typing import Any, Callable
 
 from ..ingest import watch
 
@@ -104,6 +104,52 @@ def promote_watchlist(conn: sqlite3.Connection, f: dict[str, Any], now: float, w
     if row is None or row["reason"] != "probation":
         return None
     if wants_promotion(f, wcfg):
-        watch.add(conn, f["mint"], "early_buyers", now, float(wcfg.get("ttl_s", 86400)), int(wcfg.get("cap", 200)))
+        watch.add(conn, f["mint"], "early_buyers", now, float(wcfg.get("ttl_s", 86400)), *watch.limits(wcfg))
         return "early_buyers"
     return None
+
+
+def meta_burst_sets(sets: dict[str, dict[str, Any]], bursting: list[str], members_of: Callable[[str], list[str]],
+                    graduated: set[str], now: float, per_meta: int, max_total: int, release_s: float
+                    ) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """The stable, bounded choice of meta_burst watchlist entries (milestone 4).
+
+    `sets` is the current choice: term -> {"mints": [...], "chosen_at": t, "last_bursting": t}, persisted
+    in kv by the engine. `bursting` lists the bursting metas strongest first; `members_of(term)` gives a
+    meta's member mints youngest first. Rules: a meta that is bursting keeps the set it was given (the
+    set is frozen while the meta bursts, so a new coin in the meta never displaces a chosen one); a meta
+    that stopped bursting keeps its set for `release_s` (a meta flickering around the burst threshold
+    changes nothing) and is then released; a newly bursting meta gets its `per_meta` youngest members
+    that are not graduated and not chosen by another meta, as long as the total stays within
+    `max_total` (strongest metas first; nothing is taken from a frozen set). Graduated members leave a
+    set (the stream never follows them) and are not replaced; an empty set is dropped.
+
+    Returns (new sets, released mints): the mints that were chosen before and are not any more; the
+    engine deactivates their meta_burst rows."""
+    before = {m for s in sets.values() for m in s.get("mints", [])}
+    new: dict[str, dict[str, Any]] = {}
+    bursting_now = set(bursting)
+    for term, s in sets.items():
+        mints = [m for m in s.get("mints", []) if m not in graduated]
+        if not mints:
+            continue
+        if term in bursting_now:
+            new[term] = {"mints": mints, "chosen_at": s.get("chosen_at", now), "last_bursting": now}
+        elif now - float(s.get("last_bursting", now)) < release_s:
+            new[term] = {"mints": mints, "chosen_at": s.get("chosen_at", now), "last_bursting": float(s.get("last_bursting", now))}
+    taken = {m for s in new.values() for m in s["mints"]}
+    used = len(taken)
+    for term in bursting:
+        if term in new:
+            continue
+        room = max_total - used
+        if room <= 0:
+            break
+        picks = [m for m in members_of(term) if m not in taken and m not in graduated][: min(per_meta, room)]
+        if not picks:
+            continue
+        new[term] = {"mints": picks, "chosen_at": now, "last_bursting": now}
+        taken.update(picks)
+        used += len(picks)
+    released = sorted(before - taken)
+    return new, released

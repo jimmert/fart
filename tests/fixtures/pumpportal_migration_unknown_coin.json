@@ -1,0 +1,9 @@
+{
+ "_note": "The VPS case of 26 Oct 2026: PumpPortal's subscribeMigration delivered a migration for Cv934yS1kxVtW3Y6vS8jhk6APKpdtWbzpMcs6VHHpump, a coin created before fart started (no row in `coins`). Milestone 3 refused it (rejected_messages, reason unknown_coin, 2 such cases that day); milestone 4 stores it in `migrations` with coin_unknown=1 and never watches it. The signature is synthetic (the raw message stayed on the VPS); the field set is the PumpPortal migration shape of tests/fixtures/pumpportal_messages.json.",
+ "migration": {
+  "mint": "Cv934yS1kxVtW3Y6vS8jhk6APKpdtWbzpMcs6VHHpump",
+  "pool": "pump-amm",
+  "signature": "d68FHET18DEZQS73FK6LqzLp2eZMv6Zs1LC5zWX7zjXNriQF9AsxwTsopDzUqT46aJyDYvNPJBu5yEjApqH67JU",
+  "txType": "migrate"
+ }
+}

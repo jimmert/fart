@@ -34,7 +34,7 @@ from .util import day_key
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 BUSY_TIMEOUT_MS = 15000
 WRITE_RETRY_ATTEMPTS = 3
@@ -472,6 +472,57 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[3] = _migrate_v3
+
+
+# ----- schema version 4 (milestone 4) --------------------------------------------------------------
+# * `watchlist.activated_at`: the last (re)activation of a row. The idle expiry counts from it, while
+#   `since` keeps the original time so every ordering by `since` (eviction, the trade stream's cap)
+#   stays stable when a coin comes back (`fart/ingest/watch.py`).
+# * `migrations.coin_unknown`: a graduation stored without a known create (a PumpPortal migration of a
+#   coin created before fart started, or an RPC-decoded migration of a missed create). The universe
+#   stays complete and the coin is never watched; the flag clears when the create arrives later.
+# * `ws_subscriptions.close_reason`: why a trade subscription was closed (envelope, capped, unwatched,
+#   graduated, cu_policy, stream_cap, address_changed, error, disconnect, shutdown, schema_v4), so
+#   `fart status` can show what closed today instead of listing closed rows as if they were open.
+# * `api_ledger.bytes`: the bytes a per-byte priced row (websocket frames) was booked for.
+# * cleanup: the `graduation` watchlist rows milestone 2 wrote (TTL 24 h) belong to the PumpPortal trade
+#   subscription that only exists with a funded key; they are closed together with their open
+#   ws_subscriptions rows, and every migration without a coin row gets `coin_unknown=1`. The counts
+#   land in kv `schema.v4.cleanup` (printed by `install.sh`); a second run changes nothing.
+SCHEMA_V4_COLUMNS = [
+    ("watchlist", "activated_at", "REAL"),
+    ("migrations", "coin_unknown", "INTEGER NOT NULL DEFAULT 0"),
+    ("ws_subscriptions", "close_reason", "TEXT"),
+    ("api_ledger", "bytes", "INTEGER"),
+]
+
+
+def _cleanup_v4(conn: sqlite3.Connection, now: float) -> dict[str, int]:
+    out: dict[str, int] = {}
+    out["watchlist_graduation_closed"] = conn.execute(
+        "UPDATE watchlist SET active=0, until=? WHERE active=1 AND reason='graduation'", (now,)
+    ).rowcount
+    out["ws_subscriptions_closed"] = conn.execute(
+        "UPDATE ws_subscriptions SET until=?, close_reason='schema_v4' WHERE until IS NULL AND reason='graduation'", (now,)
+    ).rowcount
+    out["migrations_coin_unknown"] = conn.execute(
+        "UPDATE migrations SET coin_unknown=1 WHERE coin_unknown=0 AND NOT EXISTS (SELECT 1 FROM coins c WHERE c.mint = migrations.mint)"
+    ).rowcount
+    out["watchlist_activated_at_filled"] = conn.execute("UPDATE watchlist SET activated_at=since WHERE activated_at IS NULL").rowcount
+    return out
+
+
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    for table, column, ctype in SCHEMA_V4_COLUMNS:
+        if not _column_exists(conn, table, column):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ctype}")
+    conn.execute("CREATE INDEX IF NOT EXISTS ws_subscriptions_close ON ws_subscriptions(until, close_reason)")
+    now = time.time()
+    counts = _cleanup_v4(conn, now)
+    kv_set(conn, "schema.v4.cleanup", json.dumps({"at": now, "counts": counts}), now)
+
+
+MIGRATIONS[4] = _migrate_v4
 
 
 def _apply_pragmas(conn: sqlite3.Connection, readonly: bool) -> None:

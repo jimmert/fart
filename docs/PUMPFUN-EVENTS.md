@@ -196,11 +196,15 @@ and every transaction on Solana that mentions USDC or PUMP arrived as a notifica
 six minutes, 2,729 rows in `trades` with `source='pump_amm'` and those mints, because
 `pump_amm_trade_records` took the mint from the subscription.
 
-Since milestone 3: a migration is refused when its mint is on `config/pumpfun.json` → `system_mints` or,
-for PumpPortal, when the coin is not in `coins` (`store.migration_rejection`); the whole raw message is
-stored in `rejected_messages` (reason `system_mint:USDC`, `system_mint:PUMP`, `unknown_coin`) and counted
-(`ingest.rejected.pumpportal.<reason>`); pump-amm swaps map their mint through the pool only; schema v3
-deleted the rows. To see what PumpPortal actually sends in those messages (the open question is which
+Since milestone 3: a migration is refused when its mint is on `config/pumpfun.json` → `system_mints`
+(`store.migration_rejection`); the whole raw message is stored in `rejected_messages` (reason
+`system_mint:USDC`, `system_mint:PUMP`) and counted (`ingest.rejected.pumpportal.<reason>`); pump-amm swaps
+map their mint through the pool only; schema v3 deleted the rows. Milestone 3 also refused a PumpPortal
+migration of a coin not in `coins` (`unknown_coin`: `Cv934yS1kxVtW3Y6vS8jhk6APKpdtWbzpMcs6VHHpump` and one
+more on 26 Oct 2026, coins created before fart started); since milestone 4 such a migration is stored
+with `migrations.coin_unknown=1` (part of the universe, never watched, the flag clears when the create
+arrives; `tests/fixtures/pumpportal_migration_unknown_coin.json`). To see what PumpPortal actually sends
+in the system-mint messages (the open question is which
 coin they were about: pump.fun now has non-SOL quote mints, see the `quote_mint` fields below, so these may
 be the quote side of USDC- or PUMP-quoted migrations):
 

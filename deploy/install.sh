@@ -90,13 +90,16 @@ chmod 0640 "$FART_ROOT/.env"
 # Opening the database applies pending migrations (PRAGMA user_version). Doing it here, before the
 # daemons restart, means every service starts on the new schema. Safe while the old daemons run (WAL).
 # Milestone 3 (user_version 3) also removes the rows the USDC/PUMP "migrations" caused and prints
-# the counts (kv schema.v3.cleanup); a second run removes nothing.
+# the counts (kv schema.v3.cleanup); milestone 4 (user_version 4) closes the milestone-2 graduation
+# watchlist rows and flags migrations without a create (kv schema.v4.cleanup); a second run changes nothing.
 if [ -f "$FART_ROOT/data/fart.db" ]; then
   if STATUS_JSON="$(sudo -u "$FART_USER" "$FART_ROOT/bin/fart" --quiet --json status 2>/dev/null)"; then
     log "database schema: $(printf '%s' "$STATUS_JSON" | "$VENV/bin/python" -c 'import json,sys
 d = json.load(sys.stdin)
 c = d.get("schema_v3_cleanup") or {}
-print("user_version", d.get("schema_version"), "| v3 cleanup of system-mint rows:", json.dumps(c.get("deleted")) if c else "not run")')"
+c4 = d.get("schema_v4_cleanup") or {}
+print("user_version", d.get("schema_version"), "| v3 cleanup of system-mint rows:", json.dumps(c.get("deleted")) if c else "not run",
+      "| v4 cleanup (graduation rows closed, migrations flagged):", json.dumps(c4.get("counts")) if c4 else "not run")')"
   else
     log "WARNING: schema check failed (fart status); the daemons will retry the migration on start"
   fi

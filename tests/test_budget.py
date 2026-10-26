@@ -46,7 +46,7 @@ def test_rate_gate_blocks_with_reason_and_refills(settings, conn):
 def test_daily_cost_cap_blocks_with_reason(settings, conn):
     clock = Clock()
     b = make_budget(settings, conn, clock, {"rpc": {"rate_per_s": 1000, "burst": 1000}})
-    # RPC_DAILY_BUDGET_CU=1000; getTransaction costs 59 -> 16 calls fit, the 17th exceeds 1000
+    # RPC_DAILY_BUDGET_CU=1000; getTransaction costs 40 (Alchemy, milestone 4) -> 25 calls fit, the 26th exceeds 1000
     n = 0
     while True:
         v = b.acquire("rpc", "getTransaction")
@@ -55,10 +55,10 @@ def test_daily_cost_cap_blocks_with_reason(settings, conn):
         b.record("rpc", "getTransaction", v.cost, True, 200, 50.0)
         n += 1
         assert n < 100
-    assert n == 16
+    assert n == 25
     assert v.reason == "daily_cost_cap"
     usage = b.daily_usage("rpc")
-    assert usage["cost"] == 16 * 59
+    assert usage["cost"] == 25 * 40
     assert usage["blocked"] == 1
     with pytest.raises(Blocked) as ei:
         b.acquire_or_raise("rpc", "getTransaction")

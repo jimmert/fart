@@ -248,3 +248,109 @@ Global-layout is tegen de officiële IDL geverifieerd: creator-fee 5 bps, dus 95
     verified: `creator_fee_basis_points` at offset 154 is the 5 the VPS read. Fees in config: 95 + 5 = 100.
     The synthetic fixtures were left at the milestone-2 field counts on purpose (they are what an older
     program version emitted).
+
+## Milestone 4 (26 oktober 2026)
+
+**Samenvatting voor Jim.** Mijlpaal 4 repareert wat de uitrol van mijlpaal 3 op de VPS liet zien
+(10:33 tot 11:25 UTC) en voegt geen functies toe. (1) De trade-stroom wisselde zijn abonnementen elke
+engine-tick (5.298 abonnementen voor 238 munten in 52 minuten, mediane levensduur 15 s, 86 trades): de
+watchlist verdrong rijen van gelijke prioriteit en zette `since` opnieuw, en de engine bood per tick
+circa 840 meta_burst-kandidaten aan voor 200 plekken. Nu verdringt `watch.add()` alleen strikt lagere
+prioriteit, wordt `since` nooit meer gereset (een heractivering houdt de oorspronkelijke volgorde; de
+idle-verloop telt vanaf `activated_at`), zijn 100 van de 200 plekken gereserveerd voor probation (de
+nieuwe munten die de stroom juist moet meten; ze kregen 17 van de 5.298 abonnementen), en kiest de engine
+per burstende meta de 5 jongste niet-gegradueerde munten, hoogstens 40 in totaal, bevroren zolang de meta
+burst en pas 10 minuten na het einde van de burst vrijgegeven (bewaard in kv, dus ook na een herstart
+dezelfde set). De stroom zelf heeft hysterese: aanmelden pas na twee opeenvolgende syncs die de munt
+willen, afmelden pas na 60 s niet-gewenst, en de logregel `rpc_trades.subscriptions` komt alleen bij een
+wijziging of eens per minuut. De reproductie (cap 10, 30 kandidaten, drie ticks) geeft nul
+af-/aanmeldingen. (2) De uurenvelop van 1/24 liet de stroom het hele dagplafond opmaken; nu heeft de
+stroom een dagaandeel `daily_cu_share` 0,35 (uurenvelop 0,35/24 = 1,46%, de 0,015 van de VPS-override),
+zodat rpc_logs, verrijking en engine altijd 65% houden. De kostentabel volgt de gepubliceerde
+Alchemy-cijfers (getTransaction 40, getSignaturesForAddress 40, getTokenLargestAccounts 20, getAccountInfo
+10) en websocket-frames worden per byte geboekt (`cu_per_byte` 0,0002; het alternatief 0,04 uit de
+subscription-sectie staat als commentaar) met de bytes in het grootboek, apart zichtbaar in `fart
+status`; de ijkprocedure tegen het Alchemy-dashboard staat in UNVERIFIED en niets heet bevestigd zonder
+dashboardcijfers. `fart status` toont alleen nog open abonnementen, met een aparte regel voor wat vandaag
+sloot en waarom (`close_reason`). (3) Een PumpPortal-migratie van een munt van vóór de start van fart
+(`Cv934yS1kxVtW3Y6vS8jhk6APKpdtWbzpMcs6VHHpump`) wordt bewaard met `coin_unknown=1`, nooit gevolgd, en
+telt mee onder `grads_without_create`; `rejected_messages` houdt alleen echte afwijzingen. (4)
+Schemamigratie v4 sluit de 35 `graduation`-rijen uit mijlpaal 2 (die stroom bestaat zonder betaalde
+PumpPortal-sleutel niet) en `rpc_trades.enabled` staat weer op `true` in de repo; de VPS-overrides
+vervallen door de rsync. Deploy: `deploy/DEPLOY.md`, sectie "Upgrade to milestone 4"; na de upgrade
+`RPC_DAILY_BUDGET_CU` terug naar `3000000`.
+
+59. **Branch and PR**: all work on the harness branch `claude/zealous-pascal-yvm41x`; the PR targets `main`.
+60. **Strict eviction and an immutable `since`** (`fart/ingest/watch.py`): `add()` evicts only an entry of
+    strictly lower priority (the milestone-1 rule let equal priority through, which is what made every
+    tick's last candidates displace the previous tick's), a repeated add of an active mint only extends its
+    expiry, a reactivation keeps the original `since` and sets `activated_at` (schema v4). Every ordering
+    by `since` (eviction order, `rpc_trades.desired()`'s cap, `active_mints()`) is therefore stable across
+    ticks and restarts. A probation overflow beyond the free slots is refused (never evicts an older
+    probation entry): the reserve of 100 covers about 20 creates per minute over the 5-minute window,
+    the VPS saw 8.
+61. **Probation reserve** (`config/engine.json` → `watchlist.probation_reserve` 100 of `cap` 200): the
+    non-probation reasons share `cap - reserve` slots; probation may also use free shared slots, and such
+    an overflow slot is the first thing a higher priority reclaims. An active row that is upgraded in place
+    (probation → early_buyers → meta_burst) is never re-checked against the caps, so a promotion always
+    succeeds; the next non-probation add then needs a victim.
+62. **Stable, bounded meta_burst choice** (`decide.meta_burst_sets`, kv `engine.meta_burst_sets`):
+    `meta_burst_per_meta` 5 youngest (by event time) not yet graduated coins of every bursting meta,
+    strongest metas first, at most `meta_burst_max_total` 40 in all; a set is frozen while its meta bursts
+    (a newer coin never displaces a chosen one), kept for `meta_burst_release_s` 600 after the meta stopped
+    bursting (a meta flickering around the threshold changes nothing) and then released, which deactivates
+    the rows that are still `meta_burst`. A graduated member leaves its set and is not replaced; an emptied
+    set is chosen afresh. 40 is deliberately small: the stream has 150 subscriptions, probation needs most
+    of them, and a meta is observed through its strongest members, not all of them. Changing the numbers is
+    a commit.
+63. **Hysteresis in the stream** (`config/ingest.json` → `rpc_trades.unsubscribe_after_s` 60,
+    `subscribe_after_syncs` 2): a mint is subscribed only after it was desired in two consecutive 5-second
+    syncs and unsubscribed only after 60 s of not being desired, so a watchlist flicker of one engine tick
+    (15 s) never reaches the websocket. The counters survive a reconnect (an immediately re-subscribed set)
+    but a fresh start waits one sync. The envelope pause still empties the stream, 60 s later.
+64. **Close reasons** (`ws_subscriptions.close_reason`, schema v4): unwatched, graduated, capped, cu_policy,
+    envelope, stream_cap, address_changed, error, disconnect, shutdown, schema_v4; `desired()` names the
+    first filter that removed a subscribed mint. `fart status` lists only open subscriptions under "top
+    open subscriptions" and prints "closed today: <reason> N, ..." separately (the milestone-3 line showed
+    the morning's closed USDC/PUMP/pool rows as if they were live). The `rpc_trades.subscriptions` log line
+    is written on a change and otherwise once per `log_interval_s` 60 (123 lines in 40 minutes before).
+65. **Daily CU share instead of 1/24 per hour** (`rpc_trades.daily_cu_share` 0.35; `hourly_cu_fraction`
+    is still read as 24 x the fraction for an old config): the hourly envelope is share / 24 of the daily cap
+    (43,750 CU at 3,000,000), so the stream can never take more than 35% of a day and the log stream, the
+    sweep, the enrichment and the engine lookups always keep 65%. The value is the VPS override of 26 Oct
+    2026 (0.015 per hour = 36% per day) rounded; whether the split is right is an UNVERIFIED item for the
+    first calibrated day.
+66. **Cost table from the published page, websocket frames per byte** (`config/budget.json`):
+    getTransaction 40, getSignaturesForAddress 40, getTokenLargestAccounts 20, getAccountInfo 10 as Jim read
+    them on Alchemy's compute-unit page on 26 Oct 2026 (getSlot, getBlockTime, getMultipleAccounts not read:
+    estimates); the six `ws_*` methods are `byte_priced` at `cu_per_byte` 0.0002 (the page's Solana section)
+    with 0.04 (its "Webhooks and Subscription APIs" section, a factor 200) named in the comment as the
+    alternative; `cost_of()` of a byte-priced method is 0 and the streams book `len(frame.encode())` x the
+    rate, aggregated per minute, bytes kept in `api_ledger.bytes` and shown next to the CU. The flat 10 CU
+    per notification of milestones 1-3 was never published and is gone. Nothing is confirmed without the
+    dashboard: the procedure (one whole UTC day, dashboard CU per method against our CU and bytes, the
+    factor decides `cu_per_byte`) is in `docs/UNVERIFIED.md`. The enrich limit follows the table (11,250
+    getTransaction per day at 3M); `cap_reached()` of the streams means "within one CU of the cap" because
+    they book after the fact.
+67. **The universe stays complete without watching** (`migrations.coin_unknown`, schema v4): a PumpPortal
+    migration of a coin not in `coins` is stored with the flag instead of refused (milestone 3 refused it as
+    `unknown_coin`; two cases on 26 Oct 2026, coins created before fart started), the RPC stream's
+    migrations of missed creates get the same flag, nothing ever puts such a coin on the watchlist, the
+    flag clears when the create arrives (`upsert_coin`: sweep, backfill, replay), the coverage counts it
+    under `grads_without_create`, the daily report shows the day's count, `fart status` the totals.
+    `rejected_messages` keeps only real refusals (system mints, messages without a mint).
+68. **Schema v4** is idempotent like v2 and v3: four guarded columns (`watchlist.activated_at`,
+    `migrations.coin_unknown`, `ws_subscriptions.close_reason`, `api_ledger.bytes`), the index
+    `ws_subscriptions(until, close_reason)`, and a cleanup that closes every active `graduation` watchlist
+    row with its open subscription row (`close_reason` `schema_v4`; 35 on the VPS), flags migrations
+    without a coin row and fills `activated_at` from `since`; counts in kv `schema.v4.cleanup`, printed by
+    `install.sh` and `fart status`. `subscribe_graduations` (false) already guarded both the PumpPortal and
+    the RPC path since milestone 3; a test now pins it.
+69. **The idle expiry counts from the last activation** (`watch.expire`: `MAX(last_trade_at, activated_at)`
+    instead of `since`): a coin the engine re-adds after a stream pause gets a full `dead_after_idle_s`
+    (2 h) again instead of being expired on the next tick, so a stable set is never emptied tick by tick;
+    the engine simply re-adds (reactivates) what it still wants, at most once per idle window.
+70. **`rpc_trades.enabled` is `true` in the repository** and the VPS overrides (`enabled=false`,
+    `hourly_cu_fraction=0.015`, `RPC_DAILY_BUDGET_CU=4500000`) end with the upgrade: the rsync replaces the
+    config files, the deployer puts the cap back to 3,000,000 (DEPLOY.md, "Upgrade to milestone 4"). The
+    expected `fart status` lines after 15 minutes and the dashboard calibration step are written down there.

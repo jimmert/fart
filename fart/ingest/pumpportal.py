@@ -8,11 +8,16 @@ client is creates + migrations only and trades come from the RPC (`rpc_trades.py
 message is written to the hourly gzip store before normalization. Connects go through the budget
 gate (max 12 per hour). The connection URL may carry the key and is never logged.
 
-Milestone 3: a migration message is accepted only for a coin we know and never for a system mint
-(USDC, PUMP, ...: on 26 Oct 2026 PumpPortal put those in the `mint` field and they ended up on the
-watchlist); a refused message lands in `rejected_messages`. Every write is one short
-`BEGIN IMMEDIATE` transaction with retries; a handler that still fails is counted
-(`ingest.handle_failed.pumpportal`) and its raw hour file can be replayed (`fart ingest replay`).
+Milestone 3: a migration message is never accepted for a system mint (USDC, PUMP, ...: on 26 Oct
+2026 PumpPortal put those in the `mint` field and they ended up on the watchlist); a refused message
+lands in `rejected_messages`. Every write is one short `BEGIN IMMEDIATE` transaction with retries; a
+handler that still fails is counted (`ingest.handle_failed.pumpportal`) and its raw hour file can be
+replayed (`fart ingest replay`).
+
+Milestone 4: a migration of a coin we never saw created (created before fart started, e.g.
+Cv934yS1kxVtW3Y6vS8jhk6APKpdtWbzpMcs6VHHpump on 26 Oct 2026) is stored in `migrations` with
+`coin_unknown=1` instead of being refused, so the universe of the daily report stays complete
+(`grads_without_create`); such a coin is never put on the watchlist.
 """
 from __future__ import annotations
 
@@ -99,7 +104,7 @@ class PumpPortalClient:
         kind = store.classify_pumpportal(msg) if msg is not None else "unparseable"
         self.counts[kind] = self.counts.get(kind, 0) + 1
         self.messages += 1
-        cap = int(self.watch_cfg.get("cap", 200))
+        cap, reserve = watch.limits(self.watch_cfg)
         notes: dict[str, Any] = {}
 
         def _apply(c: sqlite3.Connection) -> None:
@@ -108,7 +113,7 @@ class PumpPortalClient:
                 rec = store.pumpportal_create_record(msg)
                 new = store.upsert_coin(c, rec, SOURCE, received_at, raw_ref=ref, pumpfun_cfg=self.pf)
                 if new and rec.get("mint") and (rec.get("platform") or "pump") == "pump" and self.watch_cfg.get("probation", True):
-                    watch.add(c, rec["mint"], "probation", received_at, float(self.watch_cfg.get("early_window_s", 300)), cap)
+                    watch.add(c, rec["mint"], "probation", received_at, float(self.watch_cfg.get("early_window_s", 300)), cap, reserve)
             elif kind == "trade":
                 rec = store.pumpportal_trade_record(msg)
                 if rec.get("mint") and watch.is_watched(c, rec["mint"]):
@@ -117,15 +122,21 @@ class PumpPortalClient:
                     notes["trade_unwatched"] = 1
             elif kind == "migrate":
                 rec = store.pumpportal_migration_record(msg)
-                why = store.migration_rejection(c, rec.get("mint"), self.pf, require_known_coin=True)
+                why = store.migration_rejection(c, rec.get("mint"), self.pf)
                 if why is not None:
                     notes["rejected"] = why
                     if not self.replay:
                         store.reject_message(c, SOURCE, "migrate", why, rec.get("mint"), msg, received_at, ref)
                 else:
-                    store.upsert_migration(c, rec, SOURCE, received_at)
-                    if self.watch_cfg.get("subscribe_graduations", False):
-                        watch.add(c, rec["mint"], "graduation", received_at, float(self.watch_cfg.get("ttl_s", 86400)), cap)
+                    known = store.coin_known(c, rec["mint"])
+                    store.upsert_migration(c, rec, SOURCE, received_at)  # coin_unknown=1 while the create is missing
+                    if not known:
+                        notes["coin_unknown"] = 1
+                        if not self.replay:
+                            store.counter_bump(c, "pp.migration_coin_unknown", 1, received_at)
+                    # only a funded key follows graduated coins (subscribe_graduations); never an unknown coin
+                    elif self.watch_cfg.get("subscribe_graduations", False):
+                        watch.add(c, rec["mint"], "graduation", received_at, float(self.watch_cfg.get("ttl_s", 86400)), cap, reserve)
             elif kind == "info":
                 text_l = str(msg)
                 if _REFUSAL_RE.search(text_l) and "trade" in text_l.lower():
@@ -157,6 +168,11 @@ class PumpPortalClient:
             if self._throttle.allow(f"rejected:{notes['rejected']}", received_at):
                 log.warning("pp.migration_rejected", reason=notes["rejected"], mint=(msg or {}).get("mint"), raw_ref=ref,
                             note="stored in rejected_messages; see docs/PUMPFUN-EVENTS.md")
+        if "coin_unknown" in notes:
+            self.counts["migrate_coin_unknown"] = self.counts.get("migrate_coin_unknown", 0) + 1
+            if self._throttle.allow("coin_unknown", received_at):
+                log.info("pp.migration_coin_unknown", mint=(msg or {}).get("mint"), raw_ref=ref,
+                         note="graduation of a coin created before fart saw it: stored with coin_unknown=1, never watched")
         if "refusal" in notes and self._throttle.allow("refusal", received_at):
             log.warning("pp.trade_subscription_refused", trades_enabled=self.trades_enabled, text=notes["refusal"])
         if "info" in notes:

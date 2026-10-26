@@ -61,27 +61,28 @@ def test_system_mint_list_is_configured_and_matches_the_cleanup(settings):
     assert store.system_mints({}) == store.DEFAULT_SYSTEM_MINTS  # fallback without config
 
 
-def test_pumpportal_migration_of_a_system_mint_or_unknown_coin_is_refused(settings, conn, pp_msgs):
+def test_pumpportal_migration_of_a_system_mint_is_refused_and_an_unknown_coin_is_flagged(settings, conn, pp_msgs):
     pp, raw = make_pp(settings, conn)
     # the VPS case of 26 Oct 2026: a migration message whose `mint` field carries USDC
     bad = dict(pp_msgs["migration"], mint=USDC, signature="sig-usdc")
     assert pp.handle_text(json.dumps(bad), T0) == "migrate"
     bad2 = dict(pp_msgs["migration"], mint=PUMP, signature="sig-pump")
     assert pp.handle_text(json.dumps(bad2), T0 + 1) == "migrate"
-    # a migration of a coin we never saw created is not accepted from PumpPortal either
+    # milestone 4: a migration of a coin we never saw created is stored with coin_unknown=1 (never watched),
+    # no longer refused (tests/test_m4_universe.py has the preserved VPS case)
     unknown = dict(pp_msgs["migration"], mint="UnknownMintxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", signature="sig-unk")
     assert pp.handle_text(json.dumps(unknown), T0 + 2) == "migrate"
-    assert conn.execute("SELECT COUNT(*) FROM migrations").fetchone()[0] == 0
+    assert conn.execute("SELECT mint, coin_unknown FROM migrations").fetchone()[:] == ("UnknownMintxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", 1)
     assert conn.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0] == 0
     rows = conn.execute("SELECT * FROM rejected_messages ORDER BY id").fetchall()
-    assert [r["reason"] for r in rows] == ["system_mint:USDC", "system_mint:PUMP", "unknown_coin"]
+    assert [r["reason"] for r in rows] == ["system_mint:USDC", "system_mint:PUMP"]
     assert rows[0]["mint"] == USDC and rows[0]["source"] == "pumpportal" and rows[0]["kind"] == "migrate"
     assert json.loads(rows[0]["raw_json"])["signature"] == "sig-usdc"  # the raw message is kept for inspection
     assert rows[0]["raw_ref"].startswith("pumpportal/")
-    assert pp.counts["migrate_rejected"] == 3
-    kv = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM kv WHERE key LIKE 'ingest.rejected.%'")}
+    assert pp.counts["migrate_rejected"] == 2 and pp.counts["migrate_coin_unknown"] == 1
+    kv = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM kv WHERE key LIKE 'ingest.rejected.%' OR key LIKE 'pp.migration%'")}
     assert kv == {"ingest.rejected.pumpportal.system_mint:USDC": "1", "ingest.rejected.pumpportal.system_mint:PUMP": "1",
-                  "ingest.rejected.pumpportal.unknown_coin": "1"}
+                  "pp.migration_coin_unknown": "1"}
     # a known coin's migration is accepted (and stays off the watchlist: subscribe_graduations is false)
     assert pp.handle_text(json.dumps(pp_msgs["new_token"]), T0 + 3) == "create"
     assert pp.handle_text(json.dumps(pp_msgs["migration"]), T0 + 4) == "migrate"
@@ -98,6 +99,7 @@ def test_rpc_logs_migration_of_unknown_coin_is_stored_but_not_watched(settings, 
     migr = (fixtures_dir / "logs_notification_migration.json").read_text()
     assert rl.handle_text(migr, T0) == "migrate"  # chain-decoded migration of a coin we never saw created
     assert conn.execute("SELECT COUNT(*) FROM migrations").fetchone()[0] == 1 and conn.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0] == 0
+    assert conn.execute("SELECT coin_unknown FROM migrations").fetchone()[0] == 1 and rl.counts["migrate_coin_unknown"] == 1  # milestone 4 flag
     # a chain event naming a system mint is refused anyway (never a coin)
     from fart.chain.events import event_discriminator
     from fart.chain.base58 import b58decode
@@ -137,19 +139,24 @@ def test_schema_v3_cleanup_removes_the_bogus_rows_once(tmp_path):
     _v2_database(path, [(USDC, 2000), (PUMP, 729), ("RealCoin111111111111111111111111111111111111", 3)])
     conn = db.connect(path)
     try:
-        assert db.schema_version(conn) == 3
+        assert db.schema_version(conn) == 4
         assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 3
         assert conn.execute("SELECT mint FROM trades LIMIT 1").fetchone()[0].startswith("RealCoin")
         assert conn.execute("SELECT COUNT(*) FROM migrations").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM watchlist WHERE active=1").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM ws_subscriptions WHERE until IS NULL").fetchone()[0] == 1
+        # the real coin's `graduation` watchlist row survives v3 but is closed by v4 (milestone 2 leftovers)
+        assert conn.execute("SELECT COUNT(*) FROM watchlist WHERE active=1").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM ws_subscriptions WHERE until IS NULL").fetchone()[0] == 0
+        assert conn.execute("SELECT close_reason FROM ws_subscriptions WHERE mint LIKE 'RealCoin%'").fetchone()[0] == "schema_v4"
         assert conn.execute("SELECT COUNT(*) FROM mcap_samples").fetchone()[0] == 1
         rec = json.loads(db.kv_get(conn, "schema.v3.cleanup"))
         assert rec["deleted"] == {"trades": 2729, "migrations": 2, "mcap_samples": 2, "coins": 0, "watchlist": 2, "ws_subscriptions": 2}
         assert set(rec["mints"]) == set(db.SCHEMA_V3_SYSTEM_MINTS)
-        # idempotent: running the cleanup again deletes nothing
+        rec4 = json.loads(db.kv_get(conn, "schema.v4.cleanup"))
+        assert rec4["counts"] == {"watchlist_graduation_closed": 1, "ws_subscriptions_closed": 1, "migrations_coin_unknown": 1, "watchlist_activated_at_filled": 3}
+        # idempotent: running the cleanups again deletes nothing
         assert db._cleanup_system_mints(conn, db.SCHEMA_V3_SYSTEM_MINTS, 2.0) == {"trades": 0, "migrations": 0, "mcap_samples": 0, "coins": 0, "watchlist": 0, "ws_subscriptions": 0}
-        assert db.migrate(conn) == 3
+        assert db._cleanup_v4(conn, 3.0) == {"watchlist_graduation_closed": 0, "ws_subscriptions_closed": 0, "migrations_coin_unknown": 0, "watchlist_activated_at_filled": 0}
+        assert db.migrate(conn) == 4
     finally:
         conn.close()
 
@@ -208,8 +215,8 @@ def test_rpc_trades_replay_maps_notifications_through_sub_id(settings, conn, fix
     srcs = load_source_configs(settings.config("budget"), {"RPC_DAILY_BUDGET_CU": "100000"})
     budget = Budget(conn, srcs, settings.lock_path, clock=Clock())
     raw = RawWriter(settings.raw_dir, "rpc_trades", flush_interval_s=0)
-    rt = RpcTradesClient(conn, budget, raw, "wss://x", "rpc", settings.config("ingest")["rpc_trades"], settings.config("engine")["watchlist"],
-                         settings.config("pumpfun"), connect=lambda *a, **k: None, clock=Clock())
+    rt = RpcTradesClient(conn, budget, raw, "wss://x", "rpc", dict(settings.config("ingest")["rpc_trades"], subscribe_after_syncs=1),
+                         settings.config("engine")["watchlist"], settings.config("pumpfun"), connect=lambda *a, **k: None, clock=Clock())
     msgs = rt.sync_messages(T0)
     rt.handle_text(json.dumps({"jsonrpc": "2.0", "result": 11, "id": msgs[0]["id"]}), T0 + 1)
     note = (fixtures_dir / "logs_notification_trade_curve.json").read_text()

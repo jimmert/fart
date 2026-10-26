@@ -1,5 +1,31 @@
 # fart
 
+## Voor Jim: wat milestone 4 repareert
+
+Mijlpaal 4 voegt niets toe; het lost de bevindingen van de M3-uitrol van 26 oktober 2026 op (de
+beslissingen in `docs/DECISIONS.md`, de upgrade stap voor stap in `deploy/DEPLOY.md`, "Upgrade to
+milestone 4"):
+
+1. **De watchlist en de trade-stroom zijn stabiel.** `watch.add()` verdringt alleen nog strikt lagere
+   prioriteit en reset `since` nooit; 100 van de 200 plekken zijn voor probation (de nieuwe munten); de
+   engine kiest per burstende meta de 5 jongste munten, hoogstens 40 in totaal, en houdt die keuze vast
+   zolang de meta burst. De stroom meldt pas aan na twee syncs die de munt willen en pas af na 60 s
+   niet-gewenst. De reproductie van de churn (5.298 abonnementen in 52 minuten) staat in
+   `tests/test_m4_watchlist_stream.py` en geeft nu nul af-/aanmeldingen.
+2. **De stroom krijgt een dagaandeel**: `daily_cu_share` 0,35 van het dagplafond (1,46% per uur, de
+   0,015 van de VPS-override); de rest blijft voor rpc_logs, verrijking en engine.
+3. **De kostentabel is geijkt** op de gepubliceerde Alchemy-cijfers en websocket-frames worden per byte
+   geboekt (`cu_per_byte` 0,0002; 0,04 als het dashboard dat zegt). `fart status` toont bytes én CU per
+   stroom, alleen open abonnementen, en apart wat vandaag sloot en waarom. De ijkstap tegen het dashboard
+   staat in `docs/UNVERIFIED.md`.
+4. **Het universum blijft compleet**: een PumpPortal-migratie van een munt van vóór de start van fart
+   wordt bewaard met `coin_unknown=1` (nooit gevolgd) en telt mee in `grads_without_create`.
+5. **Opruimen**: schemamigratie v4 sluit de 35 `graduation`-rijen uit mijlpaal 2; de VPS-overrides
+   vervallen door de rsync.
+
+Na de upgrade zet je in `/opt/fart/.env` `RPC_DAILY_BUDGET_CU` terug op `3000000` en vergelijk je de
+volgende ochtend `rpc CU today by method` met het Alchemy-dashboard.
+
 ## Voor Jim: wat milestone 3 repareert
 
 Mijlpaal 3 voegt niets toe; het repareert wat de VPS op 26 oktober 2026 liet zien (details en de
@@ -13,8 +39,9 @@ milestone 3"):
 2. **De trade-stroom kost niet meer de hele dag CU.** USDC en PUMP (en USDT, WSOL) kunnen nooit meer een
    munt, migratie of watchlist-item worden; geweigerde PumpPortal-berichten staan in `rejected_messages`;
    de valse `trades`-rijen worden bij de upgrade opgeruimd; `rpc_trades` volgt munten alleen nog vóór
-   graduatie, met maximaal 2.000 notificaties per abonnement per uur en 1/24 van het dagplafond per uur
-   voor de hele stroom (`rpc CU today by method` toont de stroom apart als `ws_trade_*`). Gegradueerde
+   graduatie, met maximaal 2.000 notificaties per abonnement per uur en (sinds mijlpaal 4) een dagaandeel
+   van 35% van het dagplafond voor de hele stroom (`rpc CU today by method` toont de stroom apart als
+   `ws_trade_*`). Gegradueerde
    munten meet de tracker via DexScreener.
 3. **De backup werkt weer** (`gzip -n -c` in plaats van `gzip -f`, plus `gzip -t`): controleer met
    `systemctl show -p Result fart-backup.service`.
@@ -108,7 +135,7 @@ Configuration: `config/*.json` (thresholds, cost tables, curve parameters) and
 Layout:
 
 ```
-fart/          package: config, db (schema v3, write_tx), log, util, version, cli
+fart/          package: config, db (schema v4, write_tx), log, util, version, cli
 fart/net/      budget gate (rate, daily caps, health, backoff) + urllib JSON client
 fart/chain/    base58, PDA derivation, Anchor event decoder (pump.fun + pump-amm), tx parsing, curve math, Global account, RPC client
 fart/ingest/   raw store, normalization, PumpPortal + RPC log + RPC per-mint trade clients, sweep, coverage, retention

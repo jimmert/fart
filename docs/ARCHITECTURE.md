@@ -1,4 +1,4 @@
-# Architecture (milestone 3)
+# Architecture (milestone 4)
 
 `fart` is a read-only consumer of public Solana / pump.fun data. It never signs, never trades.
 Milestone 1 delivered complete and redundant ingestion, an event-time data model in which hindsight
@@ -8,8 +8,12 @@ and Telegram notifications to the owner through a durable outbox. Milestone 3 re
 showed: one way to write to SQLite (short `BEGIN IMMEDIATE` transactions with retries), a trade stream
 that only follows coins before graduation under an hourly CU envelope, system mints that can never
 become coins, a backup script the syscall filter tolerates, and a daily report that says "not covered"
-for hours fart was not running. Still no ML, no web UI, no trading, and the only outbound write anywhere
-is `sendMessage` to the owner chat.
+for hours fart was not running. Milestone 4 made the watchlist and the trade stream stable (strict
+eviction, a reserve for probation, a frozen and bounded meta_burst choice, subscription hysteresis),
+gave the stream a daily CU share instead of 1/24 per hour, calibrated the cost table and books websocket
+frames per byte, and keeps the universe complete when PumpPortal reports the graduation of a coin fart
+never saw created. Still no ML, no web UI, no trading, and the only outbound write anywhere is
+`sendMessage` to the owner chat.
 
 ## Processes
 
@@ -28,8 +32,10 @@ is `sendMessage` to the owner chat.
   for a system mint), one RPC `logsSubscribe` connection on the pump.fun mint authority and migration
   account (`rpc_logs.py`), one RPC connection with a `logsSubscribe` per watched mint **before
   graduation** (`rpc_trades.py`: bonding curve; reasons probation / early_buyers / meta_burst; cap 150;
-  2,000 notifications per subscription per hour; the stream's own CU capped at 1/24 of the daily cap per
-  hour; probation dropped above 80% of the daily cap; graduated coins are measured by the tracker's
+  2,000 notifications per subscription per hour; the stream's own CU capped at `daily_cu_share` / 24 of
+  the daily cap per hour (0.35 / 24); probation dropped above 80% of the daily cap; a mint is subscribed
+  after two consecutive syncs that want it and unsubscribed 60 s after the last one that did, every closed
+  `ws_subscriptions` row carries its `close_reason`; graduated coins are measured by the tracker's
   samples), a periodic signature sweep + bounded transaction backfill (migrations first, CU-based daily
   limit) + `getBlockTime` fill over HTTP RPC (`sweep.py`, `rpc_trades.fill_block_times`), hourly coverage
   rows (`coverage.py`), weekly retention (`retention.py`), and a Global-account check at startup
@@ -49,10 +55,11 @@ is `sendMessage` to the owner chat.
   measurement, writes due `outcomes` rows (+1 h / +6 h / +24 h) and the paper trade per decision.
 * **fart-measure-report** (`fart/measure/report.py`): the daily recall report to `out/recall/`.
 
-All processes share `data/fart.db` (SQLite, WAL, 15 s busy timeout, schema `PRAGMA user_version` 3) and
+All processes share `data/fart.db` (SQLite, WAL, 15 s busy timeout, schema `PRAGMA user_version` 4) and
 the budget lock file. Cross-process coordination happens through tables only: the engine writes the
-`watchlist`, the ingest daemon diffs it against its subscriptions every 5 s; the social daemon writes
-`decisions`, the notify daemon reads them.
+`watchlist` (and its frozen meta_burst choice in kv `engine.meta_burst_sets`), the ingest daemon diffs
+the watchlist against its subscriptions every 5 s with hysteresis; the social daemon writes `decisions`,
+the notify daemon reads them.
 
 ## Writing to SQLite (milestone 3)
 
@@ -72,7 +79,8 @@ Every external call passes `Budget.acquire(source, method, cost)`:
 
 1. backoff check (`health.backoff_until`, set on 429/5xx/network errors, honoring Retry-After),
 2. daily caps per source: requests and cost units (for `rpc` the cost is estimated compute units
-   from the table in `config/budget.json`; the cap comes from `RPC_DAILY_BUDGET_CU`),
+   from the table in `config/budget.json`, since milestone 4 at the figures of Alchemy's compute-unit
+   page for the HTTP methods and per byte for websocket frames; the cap comes from `RPC_DAILY_BUDGET_CU`),
 3. token bucket (`rate_buckets`, persisted, consumed inside `BEGIN IMMEDIATE` under a file lock so
    several processes share one bucket).
 
@@ -80,14 +88,17 @@ A refused call is written to `api_ledger` with `blocked_reason` and logged; cap 
 throttled to once per hour. `Budget.record()` writes the ledger row and updates `health`
 (last_ok/last_err/counts/latency EWMA/consecutive errors). `fart status` prints all of it.
 
-Websocket connects go through the same gate (`pumpportal.connect` is limited to 12 per hour;
-RPC `ws_connect`/`ws_subscribe`/`ws_unsubscribe`/`ws_notification` for the log stream and
-`ws_trade_notification`/`ws_trade_subscribe`/`ws_trade_unsubscribe` for the trade stream are accounted as
-estimated CU, aggregated per minute, so `fart status` shows the two streams apart). The trade stream has
-its own hourly envelope (1/24 of the daily cap on its own methods, unflushed counts included) and a
-per-subscription cap; at 80% of the RPC daily cap it keeps only the early_buyers / meta_burst
-subscriptions; at the cap the log streams disconnect and the sweep pauses until the next UTC day;
-PumpPortal keeps running (graceful degradation).
+Websocket connects go through the same gate (`pumpportal.connect` is limited to 12 per hour; RPC
+`ws_connect` is a flat estimate). The frames of the two RPC subscription connections are booked per byte
+(`rpc.cu_per_byte`, 0.0002 by the Solana section of Alchemy's page, 0.04 by its subscription-API
+section: the open calibration item of `docs/UNVERIFIED.md`): `ws_notification`/`ws_subscribe`/
+`ws_unsubscribe` for the log stream and `ws_trade_notification`/`ws_trade_subscribe`/`ws_trade_unsubscribe`
+for the trade stream, aggregated per minute with the byte count kept in `api_ledger.bytes`, so
+`fart status` shows bytes and CU per stream. The trade stream has its own hourly envelope
+(`daily_cu_share` / 24 of the daily cap on its own methods, unflushed frames included, so the other RPC
+users always keep the remaining share of the day) and a per-subscription cap; at 80% of the RPC daily cap
+it keeps only the early_buyers / meta_burst subscriptions; at the cap the log streams disconnect and the
+sweep pauses until the next UTC day; PumpPortal keeps running (graceful degradation).
 
 The X source costs estimated USD per call (`X_DAILY_BUDGET_USD` hard cap, actual cost booked from the
 response: posts and author expansions billed once per UTC day) and adds a pacing policy on top
@@ -125,8 +136,8 @@ is a new row with a new version; nothing is ever updated in place.
 |---|---|---|
 | PumpPortal `subscribeNewToken` / `subscribeMigration` | creates and migrations in real time, names, dev buy, market cap in SOL, no chain time | free, one connection |
 | RPC `logsSubscribe mentions=[mint authority]` / `[migration account]` | the same events from chain logs with slot and event timestamps, decoded from `Program data:` lines | CU per notification |
-| RPC signature sweep (every 5 min) | chain time for everything known by signature; the list of signatures we never saw | ~50 CU per 1000 signatures |
-| RPC `getTransaction` backfill (bounded) | the missed creates/migrations themselves | 59 CU each, max 100 per run / 1500 per day |
+| RPC signature sweep (every 5 min) | chain time for everything known by signature; the list of signatures we never saw | 40 CU per `getSignaturesForAddress` call (up to 1000 signatures) |
+| RPC `getTransaction` backfill (bounded) | the missed creates/migrations themselves | 40 CU each, max 100 per run, 15% of the daily CU cap per day (11,250 at 3M) |
 
 `coins.sources` is the JSON list of sources that saw a mint; `coverage` counts `creates_pp`,
 `creates_rpc`, `creates_union`, `grads`, `grads_without_create` per UTC hour, and `coverage_gaps`
@@ -134,14 +145,25 @@ records every interval a stream was down (startup, disconnect, watchdog, budget 
 for a crash or host reboot, written at the next start from the previous heartbeat). A source counts from
 its first run; an hour is *covered* when a create source was active during part of it and *complete* only
 when a source ran through the whole hour without an unrecovered gap. A migration message naming a system
-mint (USDC, USDT, WSOL, PUMP) or, from PumpPortal, an unknown coin is refused into `rejected_messages`.
+mint (USDC, USDT, WSOL, PUMP) is refused into `rejected_messages`; a migration of a coin fart never saw
+created (from PumpPortal: a coin created before fart started; from the RPC stream: a missed create) is
+stored with `migrations.coin_unknown=1`, is part of the universe (`grads_without_create`), is never
+watched, and loses the flag when the create arrives later (sweep, backfill, replay).
 
 ## Watchlist and trades
 
-Trades are stored only for watched mints (watchlist cap 200). Reasons in eviction order:
+Trades are stored only for watched mints (watchlist cap 200). Reasons in priority order (lowest first):
 `probation` (every new pump coin for its first 5 minutes, so early-buyer counts exist for every coin),
 `early_buyers` (promoted by the engine), `meta_burst`, `graduation` (only with `subscribe_graduations`,
-off by default since milestone 3), `observe`. Entries expire by TTL or by idleness. Sources of trades:
+off by default since milestone 3), `observe`. Since milestone 4 (`fart/ingest/watch.py`): an entry is
+evicted only by a *strictly* higher priority (equal priority never displaces), `since` is written once
+(a repeated add and a reactivation keep it, so every ordering by `since` is stable; the idle expiry counts
+from `activated_at`), and `probation_reserve` (100 of the 200 slots) can only be used by probation while
+the other reasons share the rest. The engine's meta_burst entries are a frozen, bounded choice
+(`decide.meta_burst_sets`: the 5 youngest not yet graduated coins of every bursting meta, at most 40 in
+all, strongest metas first; a set is kept while its meta bursts and released 10 minutes after it stopped;
+persisted in kv so a restart continues with the same set). Entries expire by TTL or by idleness.
+Sources of trades:
 `rpc_trades` (TradeEvent on the bonding curve, decoded from the per-mint RPC subscription), `pump_amm`
 (BuyEvent/SellEvent whose pool maps to a known base mint, e.g. the first pool buy inside the migration
 transaction), `rpc_logs` (the dev buy inside the create transaction) and `pumpportal` (only with a funded
@@ -175,10 +197,11 @@ per horizon from own trades (curve math times SOL/USD) and/or samples. Unknown s
 `rules_version`. Secrets live only in `$FART_ROOT/.env` (names in `.env.example`); URLs are
 logged as host only.
 
-## What comes after milestone 3
+## What comes after milestone 4
 
 * A measured week with frozen rules (one `rules_version`) before anything reaches a community chat;
   the daily digest and `out/recall/` are the yardstick.
-* Reconcile every estimate in `docs/UNVERIFIED.md` on the VPS, first of all whether Alchemy bills
-  websocket notifications (that decides how much of the trade stream the envelope lets through), then
-  CU per method, X prices and the real recordings that prove the event layouts byte for byte.
+* Reconcile every estimate in `docs/UNVERIFIED.md` on the VPS, first of all the CU per byte of the
+  websocket frames against the Alchemy dashboard (0.0002 or 0.04: that decides how much of the trade
+  stream the daily share lets through), then the HTTP methods, X prices and the real recordings that
+  prove the event layouts byte for byte.

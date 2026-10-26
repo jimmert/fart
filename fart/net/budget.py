@@ -45,11 +45,26 @@ class SourceConfig:
     cost_table: dict[str, float]
     backoff_base_s: float
     backoff_max_s: float
+    cu_per_byte: float | None = None            # milestone 4: websocket frames are priced per byte
+    byte_priced: frozenset[str] = frozenset()   # the methods booked as bytes x cu_per_byte
 
     def cost_of(self, method: str, override: float | None = None) -> float:
+        """Cost of one call from the table (byte-priced methods have no per-call cost: 0)."""
         if override is not None:
             return float(override)
+        if self.is_byte_priced(method):
+            return 0.0
         return float(self.cost_table.get(method, self.cost_default))
+
+    def is_byte_priced(self, method: str) -> bool:
+        return self.cu_per_byte is not None and method in self.byte_priced
+
+    def cost_of_frames(self, method: str, nbytes: int, n: int) -> float:
+        """Cost of `n` websocket frames totalling `nbytes`: bytes x cu_per_byte when the method is
+        byte-priced, else n x the table cost (the milestone-3 per-notification estimate)."""
+        if self.is_byte_priced(method):
+            return float(nbytes) * float(self.cu_per_byte)
+        return float(self.cost_table.get(method, self.cost_default)) * float(n)
 
 
 @dataclass(frozen=True)
@@ -86,6 +101,8 @@ def load_source_configs(budget_cfg: dict[str, Any], env: dict[str, str] | None =
             cost_table={k: float(v) for k, v in (c.get("cost_table") or {}).items()},
             backoff_base_s=float(c.get("backoff_base_s", 2)),
             backoff_max_s=float(c.get("backoff_max_s", 300)),
+            cu_per_byte=(float(c["cu_per_byte"]) if c.get("cu_per_byte") is not None else None),
+            byte_priced=frozenset(str(m) for m in (c.get("byte_priced") or [])),
         )
     return out
 
@@ -172,16 +189,18 @@ class Budget:
         latency_ms: float | None,
         err: str | None = None,
         retry_after_s: float | None = None,
+        nbytes: int | None = None,
     ) -> None:
-        """Record the result of a call that was previously acquired."""
+        """Record the result of a call that was previously acquired. `nbytes` is the byte count a
+        per-byte priced row (websocket frames) was booked for; it is shown next to the CU in `fart status`."""
         sc = self.source(source)
         t = self.clock()
         with self._lock():
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 self.conn.execute(
-                    "INSERT INTO api_ledger(ts, source, method, cost, ok, status, latency_ms) VALUES(?,?,?,?,?,?,?)",
-                    (t, source, method, float(cost), 1 if ok else 0, status, latency_ms),
+                    "INSERT INTO api_ledger(ts, source, method, cost, ok, status, latency_ms, bytes) VALUES(?,?,?,?,?,?,?,?)",
+                    (t, source, method, float(cost), 1 if ok else 0, status, latency_ms, None if nbytes is None else int(nbytes)),
                 )
                 h = self._health_row(source)
                 if ok:
