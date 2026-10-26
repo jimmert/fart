@@ -29,7 +29,7 @@ systemd units (all in `deploy/`, installed to `/etc/systemd/system/`):
 | `fart-measure-report.timer` | daily recall report for the previous UTC day | 06:00 UTC |
 | `fart-measure-week.timer` | week report (rolling 7 days ending yesterday; the Monday run is the Monday-Sunday calendar week): universe, hit rate, recall, lead time, bootstrap intervals, costs, the frozen go/no-go test (milestone 5) | 06:30 UTC daily |
 | `fart-backup.timer` | SQLite online backup + quick_check, 14 days kept; since milestone 6 followed by `fart backup verify` (the newest archive unpacked, checked and compared with the live database; a failed check fails the unit) | 05:30 UTC |
-| `fart-web.service` | the website (milestone 8): dashboard, observations, reports, settings, in Dutch, behind a login, on `127.0.0.1:8792` only; the shared Caddy serves it as `https://kingdegen.dev`; the database is opened read-only (`mode=ro`, `PRAGMA query_only`), the unit may write only `logs/`; installed always, started only with `FART_WEB_PASSWORD_HASH` and `FART_WEB_SECRET` in `.env` | daemon |
+| `fart-web.service` | the website (milestones 8 and 9): the public live dashboard, observations, measurement, reports, method and tools pages plus `/api/public/*` (`FART_WEB_PUBLIC=1`, the default; `0` puts everything behind the login as in M8) and the owner section `/eigenaar` behind the login, in Dutch, on `127.0.0.1:8792` only; the shared Caddy serves it as `https://kingdegen.dev`; the database is opened read-only (`mode=ro`, `PRAGMA query_only`), the unit may write only `logs/`; installed always, started only with `FART_WEB_PASSWORD_HASH` and `FART_WEB_SECRET` in `.env` | daemon |
 
 Hardening on every service: `User=fart`, `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
 `PrivateTmp`, `PrivateDevices`, `ReadWritePaths=/opt/fart/data /opt/fart/out /opt/fart/logs`,
@@ -87,6 +87,7 @@ TELEGRAM_COMMUNITY_PREVIEW=0        # milestone 5: 1 = the community text to the
 FART_WEB_BIND=127.0.0.1:8792        # milestone 8: where fart-web listens (loopback only; Caddy proxies kingdegen.dev to it)
 FART_WEB_PASSWORD_HASH=             # milestone 8: the owner's password as an scrypt hash, printed by `fart web hash-password`
 FART_WEB_SECRET=                    # milestone 8: the cookie-signing secret, printed by `fart web new-secret`
+FART_WEB_PUBLIC=1                   # milestone 9: 1 = the public section needs no login (default, also without the line); 0 = everything behind the login as in M8
 FART_ROOT=/opt/fart
 ```
 
@@ -801,6 +802,73 @@ Notes for the owner, in Dutch, are in `README.md` ("wat milestone 8 toevoegt") a
 8); the design is in `docs/ARCHITECTURE.md` ("Website"); the assumptions about this Caddy to verify at the rollout are
 in `docs/UNVERIFIED.md` ("Website / Caddy").
 
+## 5h. Milestone 9: website v2 (M9)
+
+M9 rebuilds the website as a public product. Without a login `https://kingdegen.dev` shows a **live dashboard** of what the
+radar sees right now (where the money goes on the watched coins in the last five minutes, the newest coins and their tempo,
+the themes that come up in the coin names, the latest graduations with the tracker's newest sample, what goes round on X
+once that layer runs, today's observations, one line of measurement), the observations with their outcome (`/observaties`),
+the measurement (`/meting`: the frozen week with the go/no-go test, the coverage of the last 24 hours, the latest reports,
+how it works), every report as a page (`/rapporten`, `/rapporten/<day>`, `/rapporten/week-<day>`), the method with the
+glossary and the full disclaimer (`/methode`) and a placeholder for the tools (`/tools`); the same data as JSON under
+`/api/public/*`. The owner section moved to `/eigenaar` (health and freshness, budgets, the X planner, the settings, a log
+summary; the raw Markdown of every report under `/rapporten/<file>.md`; the milestone-8 JSON under `/api/*`) and stays
+behind the login exactly as in M8 (password, signed cookie, CSRF, lockout). `/instellingen` redirects to `/eigenaar`.
+
+New on the server: `config/web.json` (the brand: site name, product word, tagline, domain, accent colour `#rrggbb`; not a
+rule file; edit it in a commit, never on the server), the `.env` name `FART_WEB_PUBLIC` (1 = public, the default even
+without the line; 0 = everything behind the login as in M8), an in-memory cache per view (15 s for the live views, 30 s for
+the rest) so public traffic never multiplies the read-only queries, `Cache-Control` and `ETag` on every public answer (a
+matching `If-None-Match` is a 304), a limit of 120 requests per minute per client address on the public routes (then 429
+with `Retry-After`; the owner's session is never limited), and pages that refresh themselves every 15 s (the dashboard)
+or 30 s. The Caddy site file lost `www.kingdegen.dev` (no DNS record; add it back in a commit once the A record exists).
+No rule file changes (the fingerprint stays `sha256:e3bf4320c45c`; the same test pins it), no schema migration, no new
+dependency, the daemons untouched, the service still read-only.
+
+1. **Pull and install** (no migration):
+   ```bash
+   cd /opt/fart-src && git pull --ff-only && sudo deploy/install.sh
+   ```
+   The installer refreshes `/srv/fart/fart.caddy` (it prints a line saying so) and restarts `fart-web`. `config/web.json`
+   comes with the checkout.
+2. **`.env`** (optional): nothing is needed. `FART_WEB_PUBLIC=0` (Jim's helper: add the name to its allowed keys; only
+   `fart-web` needs a restart) puts everything behind the login again at once; `1` or no line is the public site.
+3. **Caddy**: the site file changed, so validate and reload exactly as in section 5g, steps 7 and 8 (`sudo -u nobody $CADDY
+   validate ...`, then `$CADDY reload ...`). `www.kingdegen.dev` is no longer served by the fart block; nothing else changes.
+4. **Check from outside:**
+   ```bash
+   curl -sI https://kingdegen.dev/ | head -12                 # HTTP/2 200, cache-control: public, max-age=15, etag, content-security-policy, no server line
+   curl -sI https://kingdegen.dev/meting | head -3            # HTTP/2 200
+   curl -sI https://kingdegen.dev/eigenaar | head -3          # HTTP/2 401 (the login page)
+   curl -s -o /dev/null -w '%{http_code}\n' https://kingdegen.dev/api/status          # 401
+   curl -s https://kingdegen.dev/api/public/status | head -c 600; echo              # the public JSON: site, live numbers, freshness, week
+   curl -s https://kingdegen.dev/api/public/live | head -c 400; echo                # the live hero: tempo, money on the watched coins, graduations
+   ```
+5. **Smoke test: no owner field in the public JSON** (the test suite proves it on the fixture world; this is the same check
+   on the real data):
+   ```bash
+   for ep in status live hot new themes graduations social coverage observations reports week; do
+     curl -s "https://kingdegen.dev/api/public/$ep" | grep -Eio 'budget|secret|password|token|planner|heartbeat|x_mode|/opt/|8792|daemon' \
+       && echo "LEAK in $ep" || echo "$ep clean"
+   done
+   ```
+   Every line must say `clean`. The `/api/public/status` document carries `site`, `day`, `refresh_s`, `warning`,
+   `banner`, `week`, `freshness`, `live`, `totals` and `headline`: nothing operational.
+6. **The rate limit** (from one address; wait a minute afterwards):
+   ```bash
+   for i in $(seq 1 125); do curl -s -o /dev/null -w '%{http_code}\n' https://kingdegen.dev/api/public/status; done | sort | uniq -c
+   #   120 200 and 5 429
+   ```
+   Behind Caddy the client address is the last `X-Forwarded-For` entry; if every visitor seems to share one address, check
+   that Caddy's `reverse_proxy` passes the header (it does by default) and that `fart-web` sees the loopback as its peer.
+7. **In the browser**: the dashboard with the live cards and the `live` pill, the numbers updating every 15 s (the footer
+   line says when), `/meting` with the week, the coverage strip and the reports, `/methode` with the glossary, and
+   `/eigenaar` after the login with everything operational. Dark by default, light with the system setting; everything
+   usable at 375 px wide without horizontal scrolling. `fart status` says `public section on`.
+8. **Rollback**: `FART_WEB_PUBLIC=0` plus `systemctl restart fart-web` hides the public site at once (no deploy). A code
+   rollback to M8 (`git checkout <M8 commit> && sudo deploy/install.sh`) brings back the M8 pages; its Caddy file carries
+   `www.kingdegen.dev` again, so validate before reloading.
+
 ## 6. First-day checklist (docs/UNVERIFIED.md)
 
 1. `fart chain global`: reserves, supply, `fee_basis_points` 95 and `creator_fee_basis_points` 5 must
@@ -927,6 +995,10 @@ old rows stay, new rows get the old version string again.
 | `x mode note: X_MODE=live refused` in `status` (M6) | `X_MODE=live` without `"x_live": true` in `config/engine.json` | expected during the measurement week: the watch runs in shadow; after the week the key is a commit (new fingerprint) |
 | `x shadow: ... daemons report social=shadow engine=off` (M6) | the two daemons read different `.env` states (one was not restarted) | `sudo systemctl restart fart-social fart-engine`; both must report the same mode |
 | `x planner: ... deferred today: ca_counts N` growing through the peak hours (M7) | the envelope paces more than the morning: the day's plan is bigger than the cap allows (many keys, or a cap under 10.00) | `fart social dryrun`: compare `total` and `full load` with the cap; raise `X_DAILY_BUDGET_USD` within 10.00 to 20.00, or lower `planner.max_active_keys` in a commit; a deferred count is done later, never lost until the key's window ends |
+| a visitor gets 429 on `https://kingdegen.dev` (M9) | more than 120 requests per minute from one address on the public routes | expected for a scraper; a page refreshes itself twice a minute at most; the owner's session is never limited; `journalctl -u fart-web | grep rate_limited` names the address (once a minute) |
+| the public pages answer `cache-control: no-store` (M9) | the request carried a session cookie (the owner's browser) | expected: only anonymous answers are shared-cacheable; `curl` without a cookie shows `public, max-age=15` or `30` |
+| the dashboard says `De X-laag staat uit` (M9) | no `X_BEARER_TOKEN` in `.env` | expected until the key goes in (section 5e); the card fills itself in shadow mode and says so |
+| the themes card says no word comes up (M9) | fewer than 3 coins of the last 3 hours share a word that is not a stopword | expected on a quiet hour; the card uses the engine's own clustering and thresholds |
 | `fart-web` inactive right after `install.sh` (M8) | both `.env` names are not set yet: the installer never starts the website without them | steps 2 and 3 of section 5g; then `systemctl enable --now fart-web` |
 | `journalctl -u fart-web` says `fart web: FART_WEB_PASSWORD_HASH is not a hash made by ...` or `... is too short` (M8) | a value in `.env` was pasted incompletely or edited | re-run `fart web hash-password` / `fart web new-secret`, paste the whole line; `systemctl restart fart-web` |
 | `https://kingdegen.dev` gives 502 (Caddy) while `curl -sI http://127.0.0.1:8792/login` works (M8) | Caddy cannot reach the loopback port: a different `FART_WEB_BIND`, or the unit is down | `systemctl status fart-web`; `FART_WEB_BIND` must be `127.0.0.1:8792` (the Caddy site file names that port) |

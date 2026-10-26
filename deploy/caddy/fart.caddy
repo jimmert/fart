@@ -1,4 +1,4 @@
-# fart website (milestone 8): kingdegen.dev -> fart-web.service on 127.0.0.1:8792 (loopback only).
+# fart website (milestones 8 and 9): kingdegen.dev -> fart-web.service on 127.0.0.1:8792 (loopback only).
 #
 # Site file for the VPS's shared Caddy 2.6.2 (larp-scanner-https.service), no plugins. Install it where that Caddy can
 # read it and import it from /srv/larp-scanner/https/Caddyfile (deploy/DEPLOY.md, "Milestone 8: website"):
@@ -13,8 +13,11 @@
 # Cache-Control on every response itself; Caddy adds HSTS, repeats the three simple ones as defaults (`?`: only when the
 # upstream did not send them, e.g. on its own error pages) and hides its Server header. The 64 KB request limit is
 # enforced twice: here (request_body) and in the application (431/413).
+#
+# Milestone 9: only kingdegen.dev. www.kingdegen.dev has no DNS record, so it is left out on purpose (Caddy would otherwise
+# keep trying to obtain a certificate for it and log the failures); add it back to the first line when the record exists.
 
-kingdegen.dev, www.kingdegen.dev {
+kingdegen.dev {
 	encode zstd gzip
 
 	request_body {

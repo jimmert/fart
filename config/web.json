@@ -1,0 +1,10 @@
+{
+  "_comment": "The public website (milestone 9). site_name and product are the brand on every page (the site is named after the domain; `fart` stays the name of the engine in the footer); tagline is the one line under the name; accent is the single accent colour of the design system as #rrggbb (a wrong value falls back to the stylesheet's default, nothing else changes); domain is shown in the footer and in the share text. Jim changes these without touching code. Not a rule file (fart/version.py RULE_FILES): the rules fingerprint never changes through this file. The public/private switch is not here but in .env (FART_WEB_PUBLIC, default 1).",
+  "site_name": "KingDegen",
+  "product": "radar",
+  "tagline": "Een radar voor nieuwe Solana-memecoins. Observatie, geen advies. Alles wordt achteraf gemeten.",
+  "domain": "kingdegen.dev",
+  "accent": "#F2B33D",
+  "public_observations_limit": 500,
+  "refresh_s": 30
+}

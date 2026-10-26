@@ -36,9 +36,11 @@
   chain pda <mint>       derive the bonding-curve PDA (and the unverified pump-amm pool PDA) for a mint
   status                 health, budgets, counts (works on an empty database)
   coverage --hours N     per-hour creates/grads/gaps
-  web                    daemon: the read-only website (dashboard, observations, reports, settings) on FART_WEB_BIND
-                         (127.0.0.1:8792) behind the shared Caddy; needs FART_WEB_PASSWORD_HASH and FART_WEB_SECRET in .env,
-                         opens the database read-only and writes nothing but logs/web.log (milestone 8)
+  web                    daemon: the read-only website on FART_WEB_BIND (127.0.0.1:8792) behind the shared Caddy: the public
+                         dashboard, observations, reports, method and tools pages plus /api/public/* (FART_WEB_PUBLIC=1, the
+                         default; 0 = everything behind the login) and the owner section /eigenaar behind the login; needs
+                         FART_WEB_PASSWORD_HASH and FART_WEB_SECRET in .env, opens the database read-only and writes nothing
+                         but logs/web.log (milestones 8 and 9; the brand is config/web.json)
   web hash-password      ask for the owner's password invisibly (twice) and print only its scrypt hash for .env
   web new-secret         print a fresh cookie-signing secret for .env (a new secret logs every browser out)
 """
@@ -256,7 +258,7 @@ def cmd_status(settings, as_json: bool) -> int:
           f"{'ENABLED' if s.get('telegram_community_enabled') else 'disabled (TELEGRAM_COMMUNITY_ENABLED=0 or no chat id)'}, "
           f"preview to owner {'on' if s.get('telegram_community_preview') else 'off'}")
     print(f"  web: password hash {s.get('web_password_hash', 'not configured')}, secret {s.get('web_secret', 'not configured')}, "
-          f"bind {s.get('web_bind')} (fart-web.service, read-only, behind Caddy)")
+          f"bind {s.get('web_bind')} (fart-web.service, read-only, behind Caddy), public section {'on' if s.get('web_public', True) else 'OFF (FART_WEB_PUBLIC=0)'}")
     if "note" in out:
         print(f"  {out['note']}")
         return 0

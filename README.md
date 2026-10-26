@@ -1,5 +1,38 @@
 # fart
 
+## Voor Jim: wat milestone 9 toevoegt
+
+Mijlpaal 9 maakt van de website een openbaar product: `https://kingdegen.dev` is nu het gezicht van de radar naar buiten, met
+het live dashboard als eerste pagina en een kleine eigenaarssectie achter de login. Geen regel verandert (de vingerafdruk
+blijft `sha256:e3bf4320c45c`; dezelfde test bewaakt dat), geen schema-migratie, geen nieuwe dependency, de daemons blijven
+zoals ze zijn en de site blijft alleen-lezen. De beslissingen staan in `docs/DECISIONS.md`, de uitrol stap voor stap in
+`deploy/DEPLOY.md` ("Milestone 9: website v2"):
+
+1. **Het dashboard is verwerkte data, live.** `/` laat zien wat de radar nú ziet: waar het geld heen gaat (de gevolgde munten
+   met de meeste netto SOL-instroom in de laatste 5 minuten, met kopers, trades, marktkapitalisatie en het aandeel van de
+   grootste koper), de nieuwste munten met hun tempo, de thema's die nu opkomen in de muntnamen (dezelfde clustering als de
+   engine), de laatste graduaties met de nieuwste prijssample, wat er rondgaat op X zodra die laag draait, de observaties van
+   vandaag en één regel meting. De pagina ververst zichzelf elke 15 seconden. Alles blijft observatie: geen koopknop, geen link
+   naar een handelsplaats, het mint-adres alleen als tekst.
+2. **De meting heeft een eigen pagina.** `/meting` toont de meetweek (dag x van 7, gedekte dagen, winnaars, trefkans en recall
+   met het bootstrapinterval zodra dat bestaat, de go/no-go-toets in gewone woorden), de dekking van de laatste 24 uur als
+   balk met de NIET GEDEKT-uren gearceerd, de laatste rapporten en "hoe dit werkt". `/observaties` heeft elke observatie met
+   uitkomst in gewone woorden, `/rapporten` elk dag- en weekrapport als nette pagina met grafieken, `/methode` de werkwijze, de
+   bevroren regels, de begrippenlijst en de volledige disclaimer, `/tools` een lege plek voor later.
+3. **Eén ontwerp.** Donker thema standaard, licht thema via de systeeminstelling, één accentkleur, kaarten met een kerncijfer,
+   één regel uitleg en een statuspil (vers, oud, NIET GEDEKT, onbekend, te weinig data), grafieken als inline SVG zonder
+   bibliotheek, bruikbaar op een telefoon. De naam en de accentkleur staan in `config/web.json` en veranderen zonder code.
+4. **Eigenaar achter de login.** `/eigenaar` heeft alles wat operationeel is (versheid van daemons en timers, budgetten,
+   X-planner, instellingen, logboeksamenvatting) en de ruwe Markdown van elk rapport; de M8-API onder `/api/*` blijft. Login,
+   CSRF en de lockout zijn ongewijzigd. Met `FART_WEB_PUBLIC=0` in `.env` staat alles weer achter de login zoals in M8.
+5. **Openbaar en toch veilig en snel.** Alleen de openbare velden onder `/api/public/*` (een test bewijst dat geen enkel
+   budget, sleutel, pad of adres erin voorkomt), een cache van 15 of 30 seconden per onderdeel zodat bezoekers de database
+   niet belasten, `Cache-Control` en `ETag` op elk openbaar antwoord, 120 verzoeken per minuut per adres en daarna 429, en
+   dezelfde strikte Content-Security-Policy als in M8.
+
+Na de uitrol: `curl -sI https://kingdegen.dev/` geeft 200 met `cache-control: public, max-age=15`, `/eigenaar` geeft 401, en
+`fart status` zegt `public section on`. Zie je op het dashboard "De X-laag staat uit": dat klopt tot de X-sleutel erin gaat.
+
 ## Voor Jim: wat milestone 8 toevoegt
 
 Mijlpaal 8 zet de website `https://kingdegen.dev` neer, met het dashboard als eerste pagina. Alles erop is alleen-lezen,
@@ -271,7 +304,7 @@ python -m fart measure report --day 2026-10-25
 python -m fart measure week --end 2026-11-02 --days 7   # week report with bootstrap intervals and the frozen go/no-go test
 python -m fart web hash-password # the owner's password as an scrypt hash for .env (asked invisibly; prints the hash only)
 python -m fart web new-secret    # the cookie-signing secret for .env
-python -m fart web               # the website on 127.0.0.1:8792 (read-only; needs both .env values)
+python -m fart web               # the website on 127.0.0.1:8792 (read-only; needs both .env values; FART_WEB_PUBLIC=0 puts it behind the login)
 make live                        # opt-in 60 s PumpPortal smoke test (FART_LIVE=1), skips offline
 ```
 
@@ -289,7 +322,7 @@ fart/engine/   meta clustering, as-of features (incl. X), decisions, RPC enrichm
 fart/social/   X budget planner (USD), confirmation planner (keys, schedule, stop reasons), X client (mega/KOL/refresh/confirmation/fast posts), dry run, console calibration, daemon
 fart/notify/   outbox, Telegram sender, Dutch formatting (owner + community), daemon with the chat guard
 fart/measure/  prices, outcomes, paper trades, daily report, week report (bootstrap, go/no-go)
-fart/web/      the website (milestone 8): auth (scrypt, signed cookies, CSRF, login guard), read-only data views, Markdown subset, pages, server, static/
+fart/web/      the website (milestones 8 and 9): auth (scrypt, signed cookies, CSRF, login guard), owner data views (data), public views (public), SVG charts, theme, Markdown subset, pages, server with cache/ETag/rate limit, static/
 config/        pumpfun, budget, ingest, engine, measure, stopwords, x, x_kols, notify
 deploy/        systemd units (incl. fart-web), slice, timers (track 5 min, report 06:00, week 06:30, backup 05:30), install.sh, backup.sh, caddy/fart.caddy, DEPLOY.md
 docs/          ARCHITECTURE (EN), METING (NL), PUMPFUN-EVENTS, UNVERIFIED, DECISIONS
