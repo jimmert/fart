@@ -239,13 +239,14 @@ MIGRATIONS: dict[int, str] = {
     );
 
     CREATE TABLE IF NOT EXISTS enrich_queue(
-        mint         TEXT NOT NULL,
+        key          TEXT NOT NULL,
         kind         TEXT NOT NULL,
         requested_at REAL NOT NULL,
         attempts     INTEGER NOT NULL DEFAULT 0,
         last_attempt REAL,
         done         INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY(mint, kind)
+        last_error   TEXT,
+        PRIMARY KEY(key, kind)
     );
     """,
 }
