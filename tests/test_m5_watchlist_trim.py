@@ -111,7 +111,7 @@ def test_schema_v5_trims_the_meta_burst_rows_once_and_is_idempotent(tmp_path):
     _v4_database(path, 195, frozen=frozen, traded=["MB002"])
     conn = db.connect(path)
     try:
-        assert db.schema_version(conn) == 5 == db.SCHEMA_VERSION
+        assert db.schema_version(conn) == db.SCHEMA_VERSION >= 5  # v5 ran (milestone 6 adds v6 on top)
         assert watch.active_counts(conn) == {"meta_burst": 40, "probation": 5}
         act = {r[0] for r in conn.execute("SELECT mint FROM watchlist WHERE active=1 AND reason='meta_burst'")}
         assert {"MB000", "MB001", "MB002"} <= act  # frozen set and the recently traded row kept
@@ -119,7 +119,7 @@ def test_schema_v5_trims_the_meta_burst_rows_once_and_is_idempotent(tmp_path):
         assert rec["counts"] == {"meta_burst_active_before": 195, "meta_burst_closed": 155, "meta_burst_active_after": 40,
                                  "frozen_mints_kept": 2, "max_total": 40}
         # a second run changes nothing
-        assert db.migrate(conn) == 5
+        assert db.migrate(conn) == db.SCHEMA_VERSION
         assert db._cleanup_v5(conn, T0)["meta_burst_closed"] == 0
         assert watch.active_counts(conn) == {"meta_burst": 40, "probation": 5}
     finally:

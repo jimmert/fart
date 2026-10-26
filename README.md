@@ -1,5 +1,37 @@
 # fart
 
+## Voor Jim: wat milestone 6 toevoegt
+
+Mijlpaal 6 maakt de X-laag veilig in gebruik te nemen zonder de meetweek te raken, laat zien waarom de munt-tak
+weinig observaties geeft, en sluit twee operationele gaten. Geen regel verandert (de vingerafdruk blijft
+`sha256:e3bf4320c45c`; dezelfde test bewaakt dat). De beslissingen staan in `docs/DECISIONS.md`, de definities in
+`docs/METING.md`, de upgrade stap voor stap in `deploy/DEPLOY.md` ("Upgrade to milestone 6"):
+
+1. **X in schaduwstand.** Nieuwe naam in `.env`: `X_MODE` (`off` zonder sleutel, `shadow` zodra je
+   `X_BEARER_TOKEN` zet, `live`). In `shadow` draait `fart-social` helemaal (mega-accounts, KOL's, verversing,
+   bevestigingstellingen, snelle posts) binnen het dagbudget, maar niets ervan bereikt de beslissingen: snelle
+   posts gaan naar `shadow_decisions`, tellingen naar `shadow_confirmations`, en de engine ziet geen X. Een test
+   bewijst dat de beslissingen van een schaduwdag byte voor byte gelijk zijn aan die van een dag zonder X. `live`
+   kan pas met `"x_live": true` in `config/engine.json` (een regelwijziging, nieuwe vingerafdruk): ná de meetweek.
+   Dag- en weekrapport krijgen een sectie "X-schaduw": wat X zou hebben toegevoegd, hoeveel observaties het binnen
+   1 u / 24 u bevestigde, en de uitkomst van die schaduwbeslissingen met dezelfde noemerregels als de echte.
+2. **Droogloop zonder netwerk:** `fart social dryrun` toont per soort aanroep de verzoeken en dollars per dag,
+   het totaal tegenover `X_DAILY_BUDGET_USD`, en de uren waarin de envelop, de reserve of het KOL-plafond
+   aanroepen zou weigeren. De prijzen in `config/x.json` controleer je zelf tegen de X-developer-console
+   (`docs/UNVERIFIED.md` zegt hoe).
+3. **Waarom wel of geen observaties:** `fart engine explain --day 2026-10-27` (en dezelfde tabel in het dagrapport)
+   toont per drempel hoeveel kandidaten eraan voldeden, de verdeling per feature, het aandeel probation-munten
+   met trades per uur naast de stroompauzes, en hetzelfde voor thema's. Alleen lezen, geen advies over drempels.
+4. **Backupcontrole:** `fart backup verify` zet het nieuwste archief terug onder `data/`, controleert het en
+   vergelijkt de rijaantallen met de live database; `deploy/backup.sh` doet dat na elke backup en de unit faalt
+   als het misgaat. In DEPLOY.md staan de offsite-kopie (`scp`) en een hersteloefening stap voor stap.
+5. **Kostenijking:** `fart budget calibrate --day <dag> --dashboard-cu <N>` rekent uit het Alchemy-dashboardtotaal
+   de CU per byte van de websocketframes terug en zegt welke `cu_per_byte` daarbij hoort; het schrijft niets.
+
+Na de upgrade: `fart status` toont `schema_version: 6`, de regel `x: ... mode off` (of `shadow` met sleutel), de
+schaduwtellers en de laatste backupcontrole; de rooktests zijn `fart social dryrun`, `fart engine explain --day
+2026-10-27` en `fart backup verify`.
+
 ## Voor Jim: wat milestone 5 toevoegt
 
 Mijlpaal 5 levert de stukken voor de meetweek en bereidt de community-stap voor zonder hem te zetten. Geen

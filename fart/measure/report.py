@@ -23,6 +23,20 @@ Milestone 5 (the measurement week):
   per `rules_version`, the earliest coin and theme decision per `rules_version` for every winner, the
   coverage of the peak hours of the community gate, the day's budget pauses and estimated costs.
   `build_report()` takes an explicit `method_version` so the week report can build a day per method.
+
+Milestone 6:
+
+* "X-schaduw" (`x_shadow_section`): what the X layer would have added while it runs in shadow mode: the
+  `shadow_decisions` of the day (by `would_kind`), how many existing observations a shadow confirmation count
+  of the day confirmed within the last hour / the last 24 h (count >= `confirm.search_when_count_1h` at the
+  time), and the outcome of the shadow decisions (winner / no winner / unknown) under the same denominator
+  rules as the real hit rate: a shadow `fast_post` decision is a winner when one of its matched coins
+  graduated within 24 h of the decision and that graduation's 24 h outcome is a winner; no winner when every
+  matched coin either did not graduate within those 24 h or was measured "no winner" with tracker coverage;
+  unknown otherwise (unknown stays in the denominator); pending while the 24 h, or the 24 h of such a
+  graduation, have not elapsed. Nothing here is a real decision: `decisions` and `outcomes` are untouched.
+* "Waarom wel of geen observaties" (`fart/engine/explain.py`): the day's candidate maxima per threshold and the
+  distribution per feature, the data availability of probation coins per hour next to the trade-stream gaps.
 """
 from __future__ import annotations
 
@@ -33,6 +47,7 @@ from typing import Any
 
 from .. import db
 from ..config import Settings
+from ..engine import explain as explain_mod
 from ..engine.meta import load_stopwords, tokenize
 from ..ingest import coverage as cov
 from ..ingest.sweep import enrich_backlog, enrich_daily_limit
@@ -105,6 +120,101 @@ def tracker_coverage(conn: sqlite3.Connection, mint: str, start: float, end: flo
     pts = [float(start), *ts, float(end)]
     max_gap = max(b - a for a, b in zip(pts, pts[1:]))
     return {"samples_n": len(ts), "max_gap_s": round(max_gap), "covered": bool(ts) and max_gap <= float(max_gap_s)}
+
+
+def _grad_time(conn: sqlite3.Connection, mint: str) -> float | None:
+    r = conn.execute(f"SELECT {ET} FROM migrations WHERE mint=?", (mint,)).fetchone()
+    return None if r is None or r[0] is None else float(r[0])
+
+
+def shadow_decision_outcome(conn: sqlite3.Connection, as_of: float, mints: list[str], now: float, h24: int, method_version: str,
+                            max_gap_s: float) -> dict[str, Any]:
+    """Outcome of one shadow decision from the graduation outcomes of its matched coins (see the module docstring)."""
+    per_mint = []
+    pending = as_of + h24 > now
+    any_winner = any_unknown = False
+    for mint in mints:
+        t = _grad_time(conn, mint)
+        if t is None or t < as_of or t > as_of + h24:
+            per_mint.append({"mint": mint, "graduated_in_window": False, "outcome": "not_winner"})  # a winner is a graduation by definition
+            continue
+        o = _latest_outcome(conn, "graduation", mint, h24, method_version)
+        if o is None:
+            if t + h24 > now:
+                pending = True
+                per_mint.append({"mint": mint, "graduated_in_window": True, "outcome": "pending"})
+            else:
+                any_unknown = True
+                per_mint.append({"mint": mint, "graduated_in_window": True, "outcome": "unknown", "unknown_reason": "missing_outcome"})
+            continue
+        hit = _tri(o["hit_100k"])
+        if hit is True:
+            any_winner = True
+            per_mint.append({"mint": mint, "graduated_in_window": True, "outcome": "winner"})
+        elif hit is False and tracker_coverage(conn, mint, t, t + h24, max_gap_s)["covered"]:
+            per_mint.append({"mint": mint, "graduated_in_window": True, "outcome": "not_winner"})
+        else:
+            any_unknown = True
+            per_mint.append({"mint": mint, "graduated_in_window": True, "outcome": "unknown", "unknown_reason": "sparse_samples" if hit is False else "unmeasured"})
+    if pending:
+        status = "pending"
+    elif any_winner:
+        status = "winner"
+    elif any_unknown:
+        status = "unknown"
+    else:
+        status = "not_winner"
+    return {"status": status, "mints": per_mint}
+
+
+def x_shadow_section(conn: sqlite3.Connection, start: float, end: float, now: float, h24: int, method_version: str, max_gap_s: float,
+                     x_mode: str) -> dict[str, Any]:
+    """The 'X-schaduw' block of the daily report (milestone 6). Reads only the shadow tables and the universe."""
+    decs = conn.execute("SELECT * FROM shadow_decisions WHERE as_of >= ? AND as_of < ? ORDER BY as_of, id", (start, end)).fetchall()
+    by_kind: dict[str, int] = {}
+    outcomes = {"elapsed": 0, "winner": 0, "not_winner": 0, "unknown": 0, "pending": 0}
+    items = []
+    for d in decs:
+        by_kind[str(d["would_kind"])] = by_kind.get(str(d["would_kind"]), 0) + 1
+        try:
+            feats = json.loads(d["features_json"]) if d["features_json"] else {}
+        except json.JSONDecodeError:
+            feats = {}
+        mints = [str(m) for m in (feats.get("mints") or [])] if isinstance(feats, dict) else []
+        if d["mint"]:
+            mints = [str(d["mint"]), *[m for m in mints if m != d["mint"]]]
+        o = shadow_decision_outcome(conn, float(d["as_of"]), mints, now, h24, method_version, max_gap_s)
+        if o["status"] == "pending":
+            outcomes["pending"] += 1
+        else:
+            outcomes["elapsed"] += 1
+            outcomes[o["status"]] += 1
+        items.append({"id": int(d["id"]), "as_of": utc_iso(d["as_of"]), "would_kind": d["would_kind"], "term": d["term"], "mint": d["mint"],
+                      "mints": len(mints), "outcome": o["status"], "rules_version": d["rules_version"]})
+    outcomes["rate"] = (outcomes["winner"] / outcomes["elapsed"]) if outcomes["elapsed"] else None
+    outcomes["rate_known"] = (outcomes["winner"] / (outcomes["winner"] + outcomes["not_winner"])) if (outcomes["winner"] + outcomes["not_winner"]) else None
+    conf = conn.execute(
+        "SELECT COUNT(*) AS n, COUNT(DISTINCT key) AS keys, COUNT(DISTINCT decision_id) AS decisions,"
+        " COUNT(DISTINCT CASE WHEN confirmed_1h=1 THEN decision_id END) AS c1h, COUNT(DISTINCT CASE WHEN confirmed_24h=1 THEN decision_id END) AS c24h,"
+        " MIN(threshold) AS t_min, MAX(threshold) AS t_max FROM shadow_confirmations WHERE ts >= ? AND ts < ?", (start, end)).fetchone()
+    obs = conn.execute(
+        "SELECT COUNT(*) FROM decisions WHERE kind IN ('observe', 'observe_meta') AND verdict='observe' AND as_of >= ? AND as_of < ?", (start, end)).fetchone()[0]
+    active = bool(decs) or int(conf["n"]) > 0
+    return {
+        "x_mode_now": x_mode,
+        "active": active,
+        "decisions": {"total": len(decs), "by_would_kind": dict(sorted(by_kind.items()))},
+        "confirmations": {"counts_taken": int(conf["n"]), "keys": int(conf["keys"]), "decisions_with_counts": int(conf["decisions"]),
+                          "confirmed_1h": int(conf["c1h"]), "confirmed_24h": int(conf["c24h"]),
+                          "threshold": None if conf["t_min"] is None else (int(conf["t_min"]) if conf["t_min"] == conf["t_max"] else f"{int(conf['t_min'])}-{int(conf['t_max'])}"),
+                          "observations_of_day": int(obs)},
+        "outcomes": outcomes,
+        "items": items,
+        "definition": ("schaduwbeslissing = wat X zou hebben toegevoegd (nooit in decisions); uitkomst = winnaar als een van de gematchte munten "
+                       "binnen 24 u na de beslissing gradueerde en die graduatie een winnaar werd, geen winnaar als geen enkele gematchte munt "
+                       "binnen 24 u gradueerde of elke graduatie met tracker-dekking geen winnaar was, anders onbekend (telt mee in de noemer); "
+                       "nog bezig apart"),
+    }
 
 
 def _summ(values: list[float]) -> dict[str, Any]:
@@ -402,6 +512,8 @@ def build_report(conn: sqlite3.Connection, settings: Settings, day: str, now: fl
              "bundled_only": paper_summary([r for r in paper_rows if r["bundled"] is True])}
 
     complete = covered and coverage_summary["hours_complete"] == 24 and counts["pending"] == 0 and counts["missing"] == 0
+    x_shadow = x_shadow_section(conn, start, end, now, h24, mv, max_gap, settings.x_mode)
+    explain = explain_mod.build_explain(conn, settings, day, now)
     return {
         "day": day,
         "generated_at": utc_iso(now),
@@ -425,6 +537,8 @@ def build_report(conn: sqlite3.Connection, settings: Settings, day: str, now: fl
         "precision_by_rules_version": precision_by_rv,
         "observations_by_rules_version": observations_by_rv,
         "paper": paper,
+        "x_shadow": x_shadow,
+        "explain": explain,
         "unknowns": {
             "graduations_outcome_unknown": counts["outcome_unknown"],
             "graduations_outcome_unknown_sparse_samples": counts["outcome_unknown_sparse_samples"],
@@ -592,6 +706,13 @@ def render_markdown(r: dict[str, Any]) -> str:
         f"Inzet per trade: {pa['all']['size_sol']} SOL, instap {r['paper_cfg']['entry_delay_s']} s na de beslissing, trailing stop "
         f"{round(100 * r['paper_cfg']['trailing_stop_frac'])}%, max. {round(r['paper_cfg']['max_hold_s'] / 3600)} u (config/measure.json).",
         "",
+    ]
+    if r.get("explain"):
+        lines += explain_mod.markdown_lines(r["explain"])
+    xs = r.get("x_shadow")
+    if xs is not None:
+        lines += x_shadow_markdown(xs)
+    lines += [
         "## Onbekenden",
         "",
     ]
@@ -609,6 +730,27 @@ def render_markdown(r: dict[str, Any]) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def x_shadow_markdown(xs: dict[str, Any]) -> list[str]:
+    """The 'X-schaduw' section of the daily report (shared with the week report's per-day lines)."""
+    d, c, o = xs["decisions"], xs["confirmations"], xs["outcomes"]
+    lines = ["## X-schaduw", "", f"X-stand nu: `{xs.get('x_mode_now')}`."]
+    if not xs.get("active"):
+        lines += ["Geen schaduwgegevens op deze dag (X uit, of nog geen schaduwbeslissing of -telling).", ""]
+        return lines
+    lines += [
+        f"- Beslissingen die X zou hebben toegevoegd: **{d['total']}**"
+        + (" (" + ", ".join(f"{k} {v}" for k, v in d["by_would_kind"].items()) + ")" if d["by_would_kind"] else ""),
+        f"- Bevestigingstellingen: {c['counts_taken']} tellingen op {c['keys']} sleutels bij {c['decisions_with_counts']} bestaande observaties; "
+        f"bevestigd binnen 1 u (telling ≥ {_n(c['threshold'])}): **{c['confirmed_1h']}**, binnen 24 u: **{c['confirmed_24h']}** "
+        f"(observaties van deze dag: {c['observations_of_day']})",
+        f"- Uitkomst schaduwbeslissingen: verstreken {o['elapsed']} (winnaar {o['winner']}, geen winnaar {o['not_winner']}, onbekend {o['unknown']}), "
+        f"nog bezig {o['pending']}; trefkans {_pct(o['rate'])}, over bekende uitkomsten {_pct(o['rate_known'])}",
+        f"- Definitie: {xs['definition']}.",
+        "",
+    ]
+    return lines
 
 
 def run_report(settings: Settings, day: str) -> int:

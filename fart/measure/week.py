@@ -219,8 +219,16 @@ def day_block(rep: dict[str, Any], rvs: list[str]) -> dict[str, Any]:
                     rec[f"{key}_before_first_trade"] += 1
     bp = ops.get("budget_pauses") or {}
     cost = ops.get("cost") or {}
+    xs = rep.get("x_shadow") or {}
+    xo = xs.get("outcomes") or {}
+    xc = xs.get("confirmations") or {}
     return {
         "day": rep.get("day"),
+        "x_shadow": {"active": bool(xs.get("active")), "decisions": int((xs.get("decisions") or {}).get("total", 0)),
+                     "confirmed_1h": int(xc.get("confirmed_1h", 0)), "confirmed_24h": int(xc.get("confirmed_24h", 0)),
+                     "counts_taken": int(xc.get("counts_taken", 0)), "observations": int(xc.get("observations_of_day", 0)),
+                     "elapsed": int(xo.get("elapsed", 0)), "winner": int(xo.get("winner", 0)), "not_winner": int(xo.get("not_winner", 0)),
+                     "unknown": int(xo.get("unknown", 0)), "pending": int(xo.get("pending", 0))},
         "synthetic": bool(rep.get("synthetic", False)),
         "covered": covered,
         "coverage_status": rep.get("coverage_status") or ("incomplete" if covered else "not_covered"),
@@ -421,9 +429,19 @@ def aggregate(day_reports_by_mv: dict[str, list[dict[str, Any]]], fp_map: dict[s
     for r in any_reps:
         b = day_block(r, [])
         costs.append({"day": b["day"], "covered": b["covered"], **b["cost"], "budget_pauses": b["budget_pauses"]})
+    shadow_days = [{"day": b["day"], "covered": b["covered"], **b["x_shadow"]} for b in (day_block(r, []) for r in any_reps)]
+    x_shadow = {"per_day": shadow_days, "active_days": sum(1 for d in shadow_days if d["active"]),
+                "decisions": sum(d["decisions"] for d in shadow_days), "confirmed_1h": sum(d["confirmed_1h"] for d in shadow_days),
+                "confirmed_24h": sum(d["confirmed_24h"] for d in shadow_days), "observations": sum(d["observations"] for d in shadow_days),
+                "elapsed": sum(d["elapsed"] for d in shadow_days), "winner": sum(d["winner"] for d in shadow_days),
+                "not_winner": sum(d["not_winner"] for d in shadow_days), "unknown": sum(d["unknown"] for d in shadow_days),
+                "pending": sum(d["pending"] for d in shadow_days)}
+    x_shadow["rate"] = _ratio(x_shadow["winner"], x_shadow["elapsed"])
+    x_shadow["rate_known"] = _ratio(x_shadow["winner"], x_shadow["winner"] + x_shadow["not_winner"])
     day_list = window_days(end_day, days)
     return {
         "kind": "week",
+        "x_shadow": x_shadow,
         "synthetic": synthetic,
         "start_day": day_list[0],
         "end_day": end_day,
@@ -643,6 +661,23 @@ def render_markdown(r: dict[str, Any]) -> str:
         lines.append(f"| {c['day']} | {'ja' if c.get('covered') else 'NEE'} | {_n(c.get('rpc_cu_estimate'))} | {_n(c.get('rpc_cu_cap'))} | "
                      f"{_usd(c.get('x_usd'))} | "
                      f"{_usd(c.get('x_usd_cap'))} | {_n(c.get('dexscreener_requests'))} | {_n(bp.get('rpc_cap_blocked_calls'))} | {_n(bp.get('trade_stream_envelope_paused'))} |")
+    xs = r.get("x_shadow") or {}
+    lines += ["", "## X-schaduw", ""]
+    if not xs.get("active_days"):
+        lines.append("Geen schaduwgegevens in dit venster (X uit, of nog geen schaduwbeslissing of -telling).")
+    else:
+        lines += [
+            f"- Beslissingen die X zou hebben toegevoegd: **{xs['decisions']}** op {xs['active_days']} dagen; bestaande observaties bevestigd binnen 1 u: "
+            f"**{xs['confirmed_1h']}**, binnen 24 u: **{xs['confirmed_24h']}** (observaties in het venster: {xs['observations']})",
+            f"- Uitkomst schaduwbeslissingen: verstreken {xs['elapsed']} (winnaar {xs['winner']}, geen winnaar {xs['not_winner']}, onbekend {xs['unknown']}), "
+            f"nog bezig {xs['pending']}; trefkans {_pct(xs['rate'])}, over bekende uitkomsten {_pct(xs['rate_known'])}: dezelfde noemerregels als de echte trefkans",
+            "",
+            "| dag | schaduwbeslissingen | tellingen | bevestigd 1 u | bevestigd 24 u | observaties | verstreken | winnaar | geen winnaar | onbekend | bezig |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for d in xs.get("per_day") or []:
+            lines.append(f"| {d['day']} | {d['decisions']} | {d['counts_taken']} | {d['confirmed_1h']} | {d['confirmed_24h']} | {d['observations']} | "
+                         f"{d['elapsed']} | {d['winner']} | {d['not_winner']} | {d['unknown']} | {d['pending']} |")
     lines += [
         "",
         "## Versies",

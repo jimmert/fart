@@ -154,3 +154,29 @@ het wekelijkse verantwoordingsbericht van `fart-notify` zet deze sectie in gewon
 onder dekking, de sectie "Budget en kosten", "Tracker: N munten overgeslagen" onder verrijking en fouten, en
 "Observaties per rules_version" onder versies. `geen winnaar` en `uitkomst onbekend` volgen de
 tracker-dekkingsregel.
+
+## Mijlpaal 6: X-schaduw en "Waarom wel of geen observaties"
+
+**X-schaduw.** Zolang `X_MODE` niet `live` is (en `live` is pas mogelijk met `"x_live": true` in
+`config/engine.json`, een regelwijziging met een nieuwe vingerafdruk, dus niet in de meetweek), bereikt niets van
+de X-laag de beslissingen: een snelle post die bij een burst van muntnamen past wordt een rij in
+`shadow_decisions` (de kolommen van `decisions` plus `would_kind`, de soort die hij gehad zou hebben), een
+bevestigingstelling een rij in `shadow_confirmations`, gekoppeld aan de observatie die ze bevestigd zou hebben,
+en de engine krijgt geen mega-post-feature en neutrale X-velden. Het dag- en weekrapport tonen daarom een sectie
+**X-schaduw**: hoeveel beslissingen X zou hebben toegevoegd, hoeveel bestaande observaties een telling van die
+dag bevestigde (telling in het laatste uur, respectievelijk de laatste 24 uur, ≥ `search_when_count_1h`, 10), en
+de uitkomst van de schaduwbeslissingen met dezelfde noemerregels als de trefkans: een schaduwbeslissing is
+**winnaar** als een van haar gematchte munten binnen 24 uur na de beslissing gradueerde en die graduatie een
+winnaar werd (de 24-uursmeting van de graduatie); **geen winnaar** als geen enkele gematchte munt binnen die 24
+uur gradueerde (een winnaar is per definitie een graduatie) of elke graduatie met tracker-dekking geen winnaar
+was; anders **onbekend**, en onbekend telt mee in de noemer; **nog bezig** zolang de 24 uur (of de 24 uur van zo'n
+graduatie) niet om zijn. De echte tabellen `decisions` en `outcomes` worden hierdoor nooit geraakt; de
+go/no-go-toets gebruikt de schaduwcijfers niet.
+
+**Waarom wel of geen observaties.** De engine schrijft sinds mijlpaal 6 per UTC-dag één rij per gevolgde munt
+en per gerangschikt thema (`engine_candidates`) met de hoogste waarde van elke drempel-feature die hij in een
+tick zag. Het dagrapport (en `fart engine explain --day`) toont per drempel uit `config/engine.json` hoeveel
+kandidaten er op hun beste moment aan voldeden, de verdeling (p50, p90, max) per feature over die maxima, het
+aandeel probation-munten dat überhaupt een trade in onze data had (per uur, naast de gaten van de trade-stroom
+in dat uur en de pauzes van de uurenvelop), en hetzelfde voor thema's (`burst_ratio`, `sol_inflow`,
+`unique_buyers`). Het is een verdeling, geen advies: de drempels blijven wat ze zijn.

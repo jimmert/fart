@@ -305,9 +305,10 @@ def test_tick_schedules_jobs_and_cli_once(settings, conn, fx, capsys):
     req = FakeRequest({"/tweets/search/recent": fx["search"], "/tweets?": fx["lookup"], "/tweets/counts/recent": fx["counts"]})
     c = make_client(settings, conn, clock, req)
     s = c.tick(T0)
-    assert set(s) == {"mega", "refresh", "kol", "confirm", "fast_post_decisions", "spend_today_usd"}
+    assert set(s) == {"mega", "refresh", "kol", "confirm", "fast_post_decisions", "spend_today_usd", "x_mode"}
     n_calls = len(req.calls)
-    assert c.tick(T0 + 15) == {"confirm": {"counts": 0, "searches": 0, "posts": 0}, "fast_post_decisions": 0, "spend_today_usd": s["spend_today_usd"]}
+    assert c.tick(T0 + 15) == {"confirm": {"counts": 0, "searches": 0, "posts": 0}, "fast_post_decisions": 0, "spend_today_usd": s["spend_today_usd"],
+                               "x_mode": "live"}
     assert len(req.calls) == n_calls  # nothing due 15 s later (no confirmation keys)
     s3 = c.tick(T0 + 61)
     assert "mega" in s3 and "kol" not in s3 and "refresh" not in s3
@@ -319,7 +320,7 @@ def test_tick_schedules_jobs_and_cli_once(settings, conn, fx, capsys):
 
     assert main(["--root", str(settings.root), "--quiet", "social", "--once"]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out == {"disabled": "X_BEARER_TOKEN not configured"}
+    assert out == {"disabled": "X_BEARER_TOKEN not configured", "x_mode": "off"}
     c2 = db.connect(settings.db_path)
     assert db.kv_get(c2, "social.heartbeat") is not None
     c2.close()

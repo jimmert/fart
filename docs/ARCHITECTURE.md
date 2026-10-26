@@ -1,4 +1,4 @@
-# Architecture (milestone 5)
+# Architecture (milestone 6)
 
 `fart` is a read-only consumer of public Solana / pump.fun data. It never signs, never trades.
 Milestone 1 delivered complete and redundant ingestion, an event-time data model in which hindsight
@@ -15,8 +15,15 @@ frames per byte, and keeps the universe complete when PumpPortal reports the gra
 never saw created. Milestone 5 delivers the measurement week's instruments without changing a rule: a week
 report with block-bootstrap intervals and the frozen go/no-go test, a tracker-coverage rule in the reports, a
 community channel that is off unless two `.env` names are set (with a preview to the owner), and the trim of
-the leftover `meta_burst` rows (schema v5). Still no ML, no web UI, no trading, and the only outbound write
-anywhere is `sendMessage` to the owner chat (and, once Jim switches it on after the week, to the community chat).
+the leftover `meta_burst` rows (schema v5). Milestone 6 lets the X layer run during the week without touching
+it: with a token the social daemon runs in **shadow mode** (`X_MODE`): the same calls and money, but fast posts
+land in `shadow_decisions`, confirmation counts in `shadow_confirmations`, and the engine passes neutral X
+features and no mega post to every decision until `live` is allowed by the `x_live` rules key (a new
+fingerprint). It also records per day what the engine saw of every candidate (`engine_candidates`, read by
+`fart engine explain` and the daily report), verifies every backup by restoring it (`fart backup verify`), and
+adds two read-only tools (`fart social dryrun`, `fart budget calibrate`). Still no ML, no web UI, no trading, and
+the only outbound write anywhere is `sendMessage` to the owner chat (and, once Jim switches it on after the
+week, to the community chat).
 
 ## Processes
 
@@ -46,11 +53,17 @@ anywhere is `sendMessage` to the owner chat (and, once Jim switches it on after 
   `data/raw/<source>/YYYYMMDD/HH.jsonl.gz` before normalization (`raw.py`); `fart ingest replay` feeds
   those files back to the handlers after a failure.
 * **fart-engine** (`fart/engine/service.py`): computes as-of features for watched mints and meta
-  clusters (now including the X features and the latest fast mega post), promotes watchlist entries,
-  writes `features_asof` and `decisions` (kind `observe` / `observe_meta`). Observations only.
+  clusters (the X features and the latest fast mega post only in `live` mode; otherwise the neutral values of
+  empty social tables, so a shadow day's decisions equal a day's without X), promotes watchlist entries,
+  writes `features_asof` and `decisions` (kind `observe` / `observe_meta`), and since milestone 6 the per-day
+  candidate maxima (`engine_candidates`, `fart/engine/candidates.py`) that `fart engine explain --day` and the
+  daily report's "Waarom wel of geen observaties" read. Observations only.
 * **fart-social** (`fart/social/service.py`): X mega-account watch (60 s), velocity refresh (120 s),
   KOL watch (180 s), contract-address / ticker confirmation counts (15 min per key) and `fast_post`
-  decisions; idles without `X_BEARER_TOKEN`. Money: `fart/social/xbudget.py`.
+  decisions; idles without `X_BEARER_TOKEN` or with `X_MODE=off`. Since milestone 6 the default with a token
+  is shadow mode (`fart/social/shadow.py`): `shadow_decisions` instead of `decisions`, `shadow_confirmations`
+  instead of `social_counts`; `live` needs `X_MODE=live` and `"x_live": true` in config/engine.json. Money:
+  `fart/social/xbudget.py`; `fart social dryrun` estimates it without HTTP (`fart/social/dryrun.py`).
 * **fart-notify** (`fart/notify/service.py`): builds Dutch messages into the `outbox` (observation
   batches, fast posts, the daily digest, health alerts) and sends what is due to the owner chat
   (`notify/telegram.py`); idles unless `TELEGRAM_NOTIFY_ENABLED=1`.
@@ -67,7 +80,7 @@ anywhere is `sendMessage` to the owner chat (and, once Jim switches it on after 
   go/no-go criteria of `config/measure.json` → `community_gate` printed as voldaan / niet voldaan / te weinig
   data. It decides nothing and sends nothing.
 
-All processes share `data/fart.db` (SQLite, WAL, 15 s busy timeout, schema `PRAGMA user_version` 5) and
+All processes share `data/fart.db` (SQLite, WAL, 15 s busy timeout, schema `PRAGMA user_version` 6) and
 the budget lock file. Cross-process coordination happens through tables only: the engine writes the
 `watchlist` (and its frozen meta_burst choice in kv `engine.meta_burst_sets`), the ingest daemon diffs
 the watchlist against its subscriptions every 5 s with hysteresis; the social daemon writes `decisions`,
@@ -223,13 +236,28 @@ per horizon from own trades (curve math times SOL/USD) and/or samples. Unknown s
 `rules_version`. Secrets live only in `$FART_ROOT/.env` (names in `.env.example`); URLs are
 logged as host only.
 
-## What comes after milestone 5
+## Backups (milestone 6)
+
+`deploy/backup.sh` (timer 05:30 UTC) writes the online backup, compresses it, and then runs `fart backup verify`
+(`fart/backup.py`): the newest archive is unpacked under `data/backup/.verify-<pid>/`, `quick_check`ed, its row
+counts of `coins`, `migrations`, `decisions` and `outcomes` compared with the live database (live >= archive),
+the copy removed; a failure exits 1 and fails the unit; the result lands in kv `backup.verify.last` for
+`fart status`. The offsite copy (scp from a second machine) and the restore drill are in `deploy/DEPLOY.md`.
+
+## What comes after milestone 6
 
 * The measurement week itself (frozen rules `150ca73cb354`, pooled with every later commit that keeps the
   rules fingerprint; first full day 27 Oct 2026). Its verdict is the week report's go/no-go section of
   `fart measure week --end 2026-11-02 --days 7`; only then does Jim decide about `TELEGRAM_COMMUNITY_ENABLED`.
   The preview mode shows him during the week what the community would have received.
+* X during the week: the token may go in after a day of watching without X; the watch then runs in shadow
+  mode and the reports' "X-schaduw" section shows what it would have added. The step shadow → live is a rules
+  change (`"x_live": true` in config/engine.json, a new fingerprint) after the week, never during it.
 * Reconcile every estimate in `docs/UNVERIFIED.md` on the VPS, first of all the CU per byte of the
-  websocket frames against the Alchemy dashboard (0.0002 or 0.04: that decides how much of the trade
-  stream the daily share lets through), then the HTTP methods, X prices and the real recordings that
-  prove the event layouts byte for byte.
+  websocket frames against the Alchemy dashboard (`fart budget calibrate --day D --dashboard-cu N`: 0.0002 or
+  0.04 decides how much of the trade stream the daily share lets through), then the HTTP methods, the X prices
+  (`fart social dryrun` before, `x spend today` after) and the real recordings that prove the event layouts
+  byte for byte.
+* Why the coin branch gives few observations: `fart engine explain --day D` and the daily report show the
+  distribution; a change of thresholds, if any, is a decision after the week (a new rules_version), not a
+  conclusion of this milestone.

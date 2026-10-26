@@ -26,7 +26,11 @@ ENV_KEYS = (
     "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_CHAT_ID", "TELEGRAM_NOTIFY_ENABLED",
     # milestone 5: the community channel, off by default (both must be set explicitly to send anywhere else)
     "TELEGRAM_COMMUNITY_CHAT_ID", "TELEGRAM_COMMUNITY_ENABLED", "TELEGRAM_COMMUNITY_PREVIEW",
+    # milestone 6: the X mode (off | shadow | live); unset = off without a token, shadow with one
+    "X_MODE",
 )
+
+X_MODES = ("off", "shadow", "live")
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -74,6 +78,7 @@ class Settings:
     pumpportal_api_key: str = ""
     x_bearer_token: str = ""
     x_daily_budget_usd: float = 3.0
+    x_mode_requested: str = ""
     telegram_bot_token: str = ""
     telegram_owner_chat_id: str = ""
     telegram_notify_enabled: bool = False
@@ -129,6 +134,60 @@ class Settings:
     def x_configured(self) -> bool:
         return bool(self.x_bearer_token)
 
+    # ----- milestone 6: the X mode ---------------------------------------------------------------
+    @property
+    def x_live_allowed(self) -> bool:
+        """`live` is a rules change: X data may only reach decisions when config/engine.json carries
+        `"x_live": true`, which changes the rules fingerprint (a new segment in the week report). The key
+        is absent during the measurement week, so `live` cannot be reached from `.env` alone."""
+        return (self.configs.get("engine") or {}).get("x_live") is True
+
+    @property
+    def x_mode(self) -> str:
+        """The effective X mode.
+
+        off     no bearer token, or X_MODE=off: fart-social idles with a heartbeat (as before milestone 6).
+        shadow  a token and X_MODE unset or `shadow`: the whole X watch runs within its budget, but nothing of
+                it reaches `decisions`: fast posts land in `shadow_decisions`, confirmation counts in
+                `shadow_confirmations`, the engine gets no mega-post feature and neutral X features.
+        live    X_MODE=live AND `x_live` true in config/engine.json: the milestone-2 behaviour. Without the
+                config key a requested `live` runs as shadow and says so (`x_mode_note`, `fart status`).
+        """
+        if not self.x_configured:
+            return "off"
+        req = self.x_mode_requested
+        if req == "off":
+            return "off"
+        if req == "live" and self.x_live_allowed:
+            return "live"
+        return "shadow"
+
+    @property
+    def x_mode_note(self) -> str | None:
+        """Why the effective mode differs from X_MODE, for `fart status` and the daemon logs; None when it does not."""
+        req = self.x_mode_requested
+        if req and req not in X_MODES:
+            return f"X_MODE={req!r} is not one of {'/'.join(X_MODES)}: running {self.x_mode}"
+        if req == "live" and not self.x_configured:
+            return "X_MODE=live without X_BEARER_TOKEN: off"
+        if req == "live" and not self.x_live_allowed:
+            return "X_MODE=live refused: config/engine.json has no \"x_live\": true (a rules change, after the measurement week); running shadow"
+        if req == "shadow" and not self.x_configured:
+            return "X_MODE=shadow without X_BEARER_TOKEN: off"
+        return None
+
+    @property
+    def x_active(self) -> bool:
+        return self.x_mode != "off"
+
+    @property
+    def x_shadow(self) -> bool:
+        return self.x_mode == "shadow"
+
+    @property
+    def x_live(self) -> bool:
+        return self.x_mode == "live"
+
     @property
     def telegram_configured(self) -> bool:
         return bool(self.telegram_bot_token) and bool(self.telegram_owner_chat_id)
@@ -174,6 +233,10 @@ class Settings:
             "pumpportal_trades": "pumpportal (api key)" if self.pumpportal_trades_enabled else "rpc only (no key)",
             "x_bearer_token": "configured" if self.x_configured else "not configured",
             "x_daily_budget_usd": self.x_daily_budget_usd,
+            "x_mode": self.x_mode,
+            "x_mode_requested": self.x_mode_requested or "unset",
+            "x_mode_note": self.x_mode_note,
+            "x_live_allowed": self.x_live_allowed,
             "telegram": "configured" if self.telegram_configured else "not configured",
             "telegram_notify_enabled": self.telegram_notify_enabled,
             "telegram_community": "configured" if self.community_configured else "not configured",
@@ -218,6 +281,7 @@ def load_settings(root: str | os.PathLike | None = None, env: dict[str, str] | N
         pumpportal_api_key=merged.get("PUMPPORTAL_API_KEY", "").strip(),
         x_bearer_token=merged.get("X_BEARER_TOKEN", "").strip(),
         x_daily_budget_usd=x_usd,
+        x_mode_requested=merged.get("X_MODE", "").strip().lower(),
         telegram_bot_token=merged.get("TELEGRAM_BOT_TOKEN", "").strip(),
         telegram_owner_chat_id=merged.get("TELEGRAM_OWNER_CHAT_ID", "").strip(),
         telegram_notify_enabled=_flag(merged.get("TELEGRAM_NOTIFY_ENABLED")),

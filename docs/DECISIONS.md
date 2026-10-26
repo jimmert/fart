@@ -497,3 +497,117 @@ nieuw segment in het rapport; de criteria worden per segment getoetst.
 86. **Timer** `fart-measure-week.timer` runs daily at 06:30 UTC (after the 06:00 daily report); the Monday run is
     the Monday-Sunday calendar week and the JSON says so (`calendar_week`). One timer instead of two: the same
     command, the same file name `week-<end>`.
+
+## Milestone 6 (26 oktober 2026)
+
+**Samenvatting voor Jim.** Mijlpaal 6 maakt de X-laag veilig in gebruik te nemen zonder de meetweek te raken,
+maakt zichtbaar waarom de munt-tak weinig observaties geeft, en sluit twee operationele gaten. Geen regelbestand
+verandert: de vingerafdruk blijft `sha256:e3bf4320c45c` (dezelfde test bewaakt dat), dus het weekrapport blijft
+deze commit poolen met `150ca73cb354`. (1) **X in schaduwstand.** Nieuwe omgevingsvariabele `X_MODE`
+(`off` zonder sleutel, `shadow` zodra `X_BEARER_TOKEN` gezet is, `live`). In `shadow` draait `fart-social`
+volledig binnen het bestaande budget (mega-watch elke 60 s, KOL-watch elke 180 s, verversing, bevestigings-
+tellingen, snelle-postdetectie), maar niets ervan bereikt de beslissingen: een snelle post wordt een rij in de
+nieuwe append-only tabel `shadow_decisions` (dezelfde kolommen als `decisions` plus `would_kind`), een
+bevestigingstelling een rij in `shadow_confirmations` (gekoppeld aan de observatie die ze bevestigd zou hebben,
+met de drempel van dat moment en of het laatste uur / de laatste 24 uur die haalde), en de engine krijgt geen
+mega-post-feature en neutrale X-velden, wat dan ook in de sociale tabellen staat. Een test vergelijkt een
+schaduwdag met een dag zonder X: de `decisions`-rijen zijn byte voor byte gelijk; zonder sleutel blijft alles
+zoals het was. `live` is de M2-werking en kan alleen samen met `"x_live": true` in `config/engine.json`, een
+regelwijziging met een nieuwe vingerafdruk (nieuw segment in het weekrapport): de overgang shadow → live gebeurt
+pas ná de meetweek; een `X_MODE=live` zonder die sleutel draait als shadow en zegt dat in `fart status`. Dag- en
+weekrapport krijgen een sectie "X-schaduw": hoeveel beslissingen X zou hebben toegevoegd, hoeveel bestaande
+observaties X binnen 1 u / 24 u bevestigde (telling ≥ `search_when_count_1h`), en de uitkomst van de
+schaduwbeslissingen (winnaar / geen winnaar / onbekend) met dezelfde noemerregels als de echte trefkans.
+(2) **Droogloop zonder HTTP**: `fart social dryrun [--hours 24]` rekent uit `config/x.json`, de huidige
+beslissingen en de watchlist uit welke aanroepen per soort zouden volgen, wat dat per dag kost volgens `prices`,
+en loopt de komende uren door de uurenvelop, de 30%-reserve en het KOL-plafond heen; het toont de uren (en de
+piekuren) waarin aanroepen geweigerd zouden worden, tegenover `X_DAILY_BUDGET_USD`. De prijzen zelf zijn niet
+geverifieerd; `docs/UNVERIFIED.md` zegt hoe Jim ze tegen de X-developer-console controleert. (3)
+**Beslisdiagnostiek, alleen lezen**: de engine schrijft per UTC-dag één rij per gevolgde munt en per gerangschikt
+thema met de hoogste drempel-features die hij zag (`engine_candidates`); `fart engine explain --day <dag>` en het
+dagrapport ("Waarom wel of geen observaties") tonen per drempel uit `config/engine.json` hoeveel kandidaten
+eraan voldeden, de verdeling (p50, p90, max) per feature, het aandeel probation-munten dat überhaupt trades had
+(per uur, naast de stroompauzes van die dag) en hetzelfde voor thema's. Het commando verandert niets, de
+drempels blijven wat ze zijn, en er is geen advies over nieuwe drempels. (4) **Backupcontrole en
+hersteloefening**: `fart backup verify` pakt het nieuwste archief uit onder `data/`, draait `quick_check`,
+vergelijkt de rijaantallen van `coins`, `migrations`, `decisions`, `outcomes` met de live database (live ≥
+archief) en ruimt op; `deploy/backup.sh` roept het na elke backup aan en een mislukte controle maakt de unit
+`failed`; DEPLOY.md beschrijft de handmatige offsite-kopie (`scp` naar een tweede locatie) en de
+hersteloefening stap voor stap. (5) **Kostenijking**: `fart budget calibrate --day <dag> --dashboard-cu <N>`
+leest het grootboek van die dag, berekent de impliciete CU per byte van de websocketmethoden (dashboardtotaal
+minus de HTTP-methoden tegen de gepubliceerde tarieven, gedeeld door de bytes) en drukt de waarde van
+`config/budget.json` → `rpc.cu_per_byte` af die daarbij hoort en wat dat per dag betekent; het schrijft niets.
+(6) **Uitrol**: `deploy/DEPLOY.md`, sectie "Upgrade to milestone 6": `X_MODE`, schema v6, de verwachte regels in
+`fart status` en de rooktests `fart social dryrun`, `fart engine explain --day 2026-10-27`, `fart backup verify`.
+
+87. **Branch and PR**: all work on the harness branch `claude/youthful-darwin-y08qkv`; the PR targets `main`.
+88. **`X_MODE` is resolved in `Settings.x_mode`** (`fart/config.py`): `off` without a token or with `X_MODE=off`;
+    `shadow` with a token and `X_MODE` unset or `shadow`; `live` only with `X_MODE=live` AND `"x_live": true` in
+    `config/engine.json` (`Settings.x_live_allowed`). An unknown value or a refused `live` falls back and explains
+    itself (`x_mode_note`, printed by `fart status` and logged by both daemons). The social daemon and the engine
+    each write the mode they run into kv (`social.x_mode`, `engine.x_mode`) so `fart status` shows whether both
+    read the same `.env`.
+89. **Why `live` is gated by a rules key and not by `.env` alone**: X data changes which rows become decisions
+    (the mega-post feature, the `fast_post` rows), so switching it on is a change of the rules of the measurement
+    week. The fingerprint is a hash of the rule files; the only way to make the week report open a new segment is a
+    change in one of them. `config/engine.json` is the file that says what becomes an observation, so the switch
+    lives there (absent = not allowed; the key cannot be added now without changing the frozen fingerprint). After
+    the week the commit that adds `"x_live": true` also updates `community_gate.frozen_rules` on purpose, as the
+    existing test demands.
+90. **The engine guarantee, not the social daemon's discipline, is what protects the week** (`fart/engine/service.py`):
+    in `off` and `shadow` the engine never calls `features.mega_post_feature()` and overwrites the X fields of
+    every coin's features with `X_NEUTRAL`, the values `features.x_features()` returns on empty tables (a test pins
+    the two to each other). So even a `ca` post the shadow search stored, or a `social_counts` row from an earlier
+    live run, cannot reach a decision. The rule files (`features.py`, `decide.py`) are untouched; the neutralization
+    is orchestration. `tests/test_m6_x_shadow.py::test_shadow_mode_leaves_decisions_byte_for_byte_as_without_x`
+    builds the same world twice and compares the `decisions` rows.
+91. **Shadow tables** (`fart/social/shadow.py`, schema v6): `shadow_decisions` has the columns of `decisions` plus
+    `would_kind` (`fast_post`); `kind` is always `shadow` so a reader never mistakes the row for a decision. The
+    fast-post dedupe looks at `shadow_decisions` in shadow mode and at `decisions` in live mode (a post judged in
+    shadow is judged again if live is ever switched on; that is the point of a new segment). `shadow_confirmations`
+    keeps every count with the decision it belongs to, the threshold of the moment and the two confirmation flags, so
+    the report never depends on a later config value. In shadow mode `social_counts` is not written; the `ca`
+    search still runs (same calls, same money) and its posts are stored as data (`social_posts`, kind `ca`), which
+    the engine neutralizes (item 90). Both tables are append-only (triggers) and never pruned.
+92. **Shadow outcome rule** (`report.shadow_decision_outcome`): a shadow `fast_post` decision has no mint of its own,
+    only the coins its rare words matched. Its outcome rests on the graduation outcomes the tracker already measures:
+    winner when one matched coin graduated within 24 h of the decision and that graduation's 24 h outcome is a winner;
+    not a winner when every matched coin either did not graduate within those 24 h (a winner is a graduation by
+    definition, docs/METING.md) or was measured "no winner" with tracker coverage; unknown otherwise, and unknown stays
+    in the denominator exactly as in the hit rate (item 74); pending while the 24 h of the decision or of such a
+    graduation have not elapsed. No `outcomes` row is written for a shadow decision (`method_version` m1.0 stays).
+93. **`engine_candidates` instead of per-tick `features_asof` rows** (`fart/engine/candidates.py`): `features_asof`
+    is a snapshot per decision (item 7); a row per watched coin per 15 s tick would be over a million rows a day. One
+    UPSERT per coin and per ranked meta per tick keeps, per UTC day, the highest value of every threshold feature,
+    the lowest and highest largest-buyer share, the last and the "ever" value of `bundled`, the highest
+    `trades_total` (data availability), whether both momentum thresholds were met in one tick and whether the whole
+    verdict passed in one tick, plus the watchlist reason at first sight. The rows are written in the engine's
+    decision transaction after the verdicts and are never read by the engine; retention prunes them after
+    `candidates_days` (30, config/ingest.json). `fart engine explain` opens the database read-only.
+94. **No advice in the explain output**: the command and the report section show counts per threshold and the
+    distribution (nearest-rank p50, p90, max) and say so in a fixed line; a change of thresholds, if any, is a
+    decision after the week with a new rules_version.
+95. **Dry-run model** (`fart/social/dryrun.py`): requests per day from the intervals, billed units from the posting
+    volume (observed in `social_posts` over the last 7 days when the daemon ran, else the `dryrun` assumptions of
+    config/x.json: 80 mega posts/day, 200 KOL posts/day, 10% of the counts triggering a search), prices from
+    `prices`, the day's volume arriving uniformly (`--arrival envelope` follows the envelope weights instead). The
+    hour walk applies the same four refusal rules as `XBudget.allow` in the same order; a refused mega/KOL search is
+    carried to the next hour (since_id), a refused count is lost. `ca_search` is an upper bound (every post and
+    author new); `refresh` is assumed free, as the daemon assumes. The command creates the database when none exists
+    (an empty one) and never opens a network connection (a test replaces `urlopen` with an assertion).
+96. **Backup verify under `data/`** (`fart/backup.py`): the temporary directory is `data/backup/.verify-<pid>/`
+    (inside the unit's `ReadWritePaths`, outside `PrivateTmp`), removed in a `finally`; the archive copy is opened
+    read-only (`mode=ro`) so no `-wal` file is created; a table missing in both databases is `absent`, not a
+    failure (the M3 test's bare database); missing only in the archive is a failure. The result is kept in kv
+    `backup.verify.last` (best effort) so `fart status` has a `backup:` line; the unit fails on exit 1 by the
+    script's own check, after the archive was written, so a failed verify never loses the backup itself.
+97. **Calibration arithmetic** (`fart/net/calibrate.py`): HTTP methods are valued at the published rates of the
+    cost table (a method outside the table at `cost_default`, marked), `ws_connect` included as a flat HTTP-side
+    estimate; the websocket bytes are the six byte-priced methods; the suggestion is the documented candidate (0,
+    0.0002, 0.04) within 15% of the implied factor, else the factor rounded to two significant digits. The command
+    prints the day's CU at the implied factor against the cap and whether the trade stream's bytes still fit its
+    daily share. It writes nothing; `config/budget.json` is not a rule file, so the commit keeps the fingerprint.
+98. **`fart status` lines added**: the X mode with its requested value and note, the shadow counters (totals and
+    today, confirmations with the two flags, the modes the daemons report), today's `engine_candidates` rows, and the
+    last backup verification. The reports add "X-schaduw" (day and week) and "Waarom wel of geen observaties" (day).
+

@@ -112,12 +112,20 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
      counts should match the dashboard's within the rows of the minute boundaries. A different CU per call
      goes into `config/budget.json` → `rpc.cost_table` (one commit = a new `rules_version`).
   4. Websocket: factor = dashboard CU of the subscription line(s) / our bytes of all six `ws_*` methods
-     together. Factor close to 0.0002: the table stands, tick this item with the dashboard numbers and the
-     date. Factor close to 0.04: set `rpc.cu_per_byte` to 0.04 in a commit; the hourly envelope then admits
-     1/200 of the frames (lower `rpc_trades_cap` / `meta_burst_max_total` or raise the cap) and the enrich
-     limit is unaffected. No websocket CU at all on the dashboard: set `cu_per_byte` to 0 (the envelope and
-     the 80% rule become moot for the streams) and write the date down. Anything in between: use the
-     measured factor rounded to two significant digits.
+     together. Since milestone 6 the command does the arithmetic from the day's total:
+     ```
+     sudo -u fart /opt/fart/bin/fart budget calibrate --day <day> --dashboard-cu <the dashboard's CU of that UTC day, all methods>
+     ```
+     It prints our ledger per method, the HTTP methods at the published rates, the websocket bytes, the implied
+     factor = (dashboard total - HTTP at the published rates) / bytes, the documented value it is closest to and
+     the `config/budget.json` line that follows (a candidate within 15%, else the measured factor rounded to
+     two significant digits); it writes nothing. Factor close to 0.0002: the table stands, tick this item with
+     the dashboard numbers and the date. Factor close to 0.04: set `rpc.cu_per_byte` to 0.04 in a commit; the
+     hourly envelope then admits 1/200 of the frames (lower `rpc_trades_cap` / `meta_burst_max_total` or raise
+     the cap; the command says whether the trade stream's bytes still fit its daily share) and the enrich limit
+     is unaffected. No websocket CU at all on the dashboard: set `cu_per_byte` to 0 (the envelope and the 80%
+     rule become moot for the streams) and write the date down. Anything in between: the measured factor
+     rounded to two significant digits. `config/budget.json` is not a rule file: the rules fingerprint stays.
   5. Record the dashboard figures here (day, CU per method, websocket CU, our bytes, the factor). Nothing
      is "confirmed" without the dashboard numbers next to it.
 - [ ] **Milestone-1 estimate**: ~13,400 CU per 10 minutes (~2M CU/day) against the 3M cap before the
@@ -142,8 +150,26 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
 ## X (Twitter) API v2
 
 - [ ] **Prices** in `config/x.json` (search/recent $0.005 per post returned, counts/recent $0.005 per
-  request, author expansion $0.010 per user per UTC day) are the previous builder's notes of 24 Oct 2026:
-  compare with the developer console and with `fart status` → `x spend today` after one day.
+  request, author expansion $0.010 per user per UTC day) are the previous builder's notes of 24 Oct 2026, not a
+  verified price list. **Jim verifies them against the X developer console before (and again after) the token
+  goes in**, as follows:
+  1. console.x.com → the project / app that owns the bearer token → *Products* / *Pay-per-use* (the exact menu
+     name changes; look for the per-endpoint price list and the usage page of the same app). Note, per
+     endpoint, the unit X bills for and the price: `GET /2/tweets/search/recent` (per post returned? per
+     request?), `GET /2/tweets/counts/recent` (per request?), the `expansions=author_id` user objects (per user?
+     per day?), and `GET /2/tweets?ids=` (free re-read of the same day's ids, or billed per post?).
+  2. Put the four numbers into `config/x.json` → `prices` (`post_usd`, `counts_request_usd`,
+     `author_expansion_usd`, `refresh_post_usd`) in a commit (not a rule file: the fingerprint stays). A unit
+     that differs from ours (a price per request where we assume per post) is a code change in
+     `fart/social/x.py` (`_search` books posts and authors; `confirm` books requests), not a config change.
+  3. `fart social dryrun` (milestone 6, no HTTP) then shows what the watch would cost per day at those prices
+     against `X_DAILY_BUDGET_USD`, per kind, with the hours in which the envelope, the 30% reserve or the KOL
+     sub-cap would refuse calls.
+  4. After the first full day with the token (shadow mode): compare `fart status` → `x spend today` and
+     `select kind, sum(n), round(sum(usd), 3) from x_spend where day='<day>' group by kind` with the console's
+     usage / billing page of the same UTC day. A gap means a wrong unit or price; the per-day dedupe (`x_dedupe`)
+     and the "refresh is free" assumption below are the first suspects. Write the console figures here (day,
+     per endpoint: units and USD) next to ours; nothing is "verified" without them.
 - [ ] **Per-day deduplication** of billed posts/authors (assumed by the pricing notes; `x_dedupe`).
 - [ ] **`GET /2/tweets?ids=` re-reads are free** for same-day ids (booked as `refresh` at $0).
 - [ ] **Response field names** (`data[].public_metrics.like_count/quote_count/impression_count`,
@@ -174,6 +200,26 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
 - [ ] **Preview volume** (`TELEGRAM_COMMUNITY_PREVIEW=1`): previews count towards the owner's 6 observation
   batches per hour; on a busy day the owner may receive fewer observation batches because of them (by design,
   per the brief). Check `fart notify outbox` for `community_preview` rows and `observe_deferred` in the tick log.
+
+## Milestone 6
+
+- [ ] **Shadow mode is the only X mode during the week** (`X_MODE` unset with a token): the engine passes
+  neutral X features and no mega post whatever the social tables hold (`fart/engine/service.py`, `X_NEUTRAL`,
+  pinned to `features.x_features` by a test), the social daemon writes `shadow_decisions` /
+  `shadow_confirmations`. On the VPS, after the token goes in: `fart status` must say `mode shadow` and
+  `daemons report social=shadow engine=shadow`, `decisions` must contain no `fast_post` row
+  (`select count(*) from decisions where kind='fast_post'` stays 0) and `social_counts` must stay empty
+  while `shadow_confirmations` grows. Live is a rules change (`x_live` in `config/engine.json`) after the week.
+- [ ] **The dry-run assumptions** (`config/x.json` → `dryrun`: 80 mega posts/day, 200 KOL posts/day, 10% of
+  the counts triggering a search) are guesses; after the first shadow day `fart social dryrun` uses the
+  observed post rates of `social_posts` and says so. Replace the guesses by the observed figures in a commit.
+- [ ] **The shadow outcome rule** (a shadow `fast_post` decision is a winner when one of its matched coins
+  graduated within 24 h and that graduation's 24 h outcome is a winner; a coin that did not graduate within
+  24 h is not a winner, as the universe is graduations) has not been exercised on real data: read the first
+  week's "X-schaduw" sections and check a few shadow decisions by hand against `migrations` and `outcomes`.
+- [ ] **`engine_candidates` volume**: one row per watched coin and ranked meta per day (expected a few thousand
+  rows per day, pruned after 30 days). Check `select day, kind, count(*) from engine_candidates group by 1, 2`
+  after the first day and the engine's `tick_s` in the journal (the UPSERTs run inside the decision write).
 
 ## Measurement (milestone 5)
 

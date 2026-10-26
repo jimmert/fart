@@ -102,8 +102,14 @@
       "ONE"
     ]
   },
+  "dryrun": {
+    "_comment": "Assumptions of `fart social dryrun` (milestone 6, no HTTP) while social_posts has no history: posts per UTC day the mega query returns (elonmusk replies included) and the KOL batch returns, and the share of confirmation counts that reach search_when_count_1h and trigger a search. Once the daemon ran, the command uses the observed rates of social_posts over the last 7 days and says so; replace these guesses by the observed figures in a commit (not a rule file).",
+    "mega_posts_per_day": 80,
+    "kol_posts_per_day": 200,
+    "ca_search_share": 0.1
+  },
   "fast_post": {
-    "_comment": "A fast mega post whose rare words appear in >= min_coins pump.fun coin names created within window_s of the post by >= min_creators creators -> decisions kind fast_post (observation, no tier words).",
+    "_comment": "A fast mega post whose rare words appear in >= min_coins pump.fun coin names created within window_s of the post by >= min_creators creators -> decisions kind fast_post (observation, no tier words). Milestone 6: in shadow mode the row goes to shadow_decisions (would_kind fast_post), never to decisions.",
     "window_s": 1800,
     "min_coins": 3,
     "min_creators": 2,

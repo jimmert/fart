@@ -9,6 +9,11 @@ Endpoints (pay-per-use, prices in config/x.json, TO VERIFY against the console):
 Every call: XBudget policy (envelope, reserve, sub-cap) -> generic gate (rate, hard USD cap,
 backoff on 429 with x-rate-limit-reset) -> urllib -> actual cost booked in x_spend and api_ledger.
 The bearer token travels only in the Authorization header and is never logged.
+
+Milestone 6, shadow mode (`XClient(shadow=True)`, the default with a token until `X_MODE=live` is allowed):
+the same calls and the same money, but a fast post becomes a `shadow_decisions` row (never a `decisions`
+row) and a confirmation count a `shadow_confirmations` row (never a `social_counts` row), each linked to the
+observe / observe_meta decision it would have confirmed (`fart/social/shadow.py`).
 """
 from __future__ import annotations
 
@@ -28,6 +33,7 @@ from ..log import Throttle, get_logger
 from ..net.budget import Blocked, Budget
 from ..net.http import HttpError, request_json
 from ..util import now as wall_now
+from . import shadow as shadow_mod
 from .xbudget import SOURCE, XBudget
 
 log = get_logger("x")
@@ -168,6 +174,29 @@ def counts_from_response(resp: Any, now: float) -> tuple[int | None, int | None]
     return (last_hour if seen or buckets else None), (int(total) if isinstance(total, int) else None)
 
 
+def confirmation_candidates(conn: sqlite3.Connection, now: float, ccfg: dict[str, Any], stopwords: set[str]) -> list[dict[str, Any]]:
+    """Every key a confirmation count would be taken for right now, regardless of the interval: mints with an
+    observe decision in the last `window_s` that are still on the active watchlist (most recent first), then
+    the observe_meta terms of the window that are specific enough to search. Each entry carries the decision
+    it belongs to (id, kind, as_of) so a shadow row can be linked to it; `fart social dryrun` counts them."""
+    window = float(ccfg.get("window_s", 21600))
+    out: list[dict[str, Any]] = []
+    for r in conn.execute(
+        "SELECT d.id, d.mint, MAX(d.as_of) AS t, c.name, c.symbol FROM decisions d JOIN coins c ON c.mint = d.mint"
+        " WHERE d.kind='observe' AND d.verdict='observe' AND d.as_of >= ? AND d.mint IN (SELECT mint FROM watchlist WHERE active=1)"
+        " GROUP BY d.mint ORDER BY t DESC", (now - window,)):
+        out.append({"key": r["mint"], "kind": "mint", "query": confirmation_query(r["mint"], r["name"], r["symbol"], stopwords, ccfg),
+                    "decision_id": int(r["id"]), "decision_kind": "observe", "decision_as_of": float(r["t"])})
+    for r in conn.execute(
+        "SELECT id, term, MAX(as_of) AS t FROM decisions WHERE kind='observe_meta' AND verdict='observe' AND as_of >= ? GROUP BY term ORDER BY t DESC",
+        (now - window,)):
+        q = meta_term_query(r["term"], stopwords, ccfg)
+        if q:
+            out.append({"key": f"meta:{r['term']}", "kind": "meta", "query": q, "decision_id": int(r["id"]), "decision_kind": "observe_meta",
+                        "decision_as_of": float(r["t"])})
+    return out
+
+
 # ----- storage ------------------------------------------------------------------------------------------
 def upsert_post(conn: sqlite3.Connection, p: dict[str, Any]) -> bool:
     """Insert a post or refresh its metrics. received_at keeps the first arrival (as-of guarantee).
@@ -212,6 +241,7 @@ class XClient:
         rules_version: str,
         clock: Callable[[], float] = wall_now,
         request: Callable[..., Any] = request_json,
+        shadow: bool = False,
     ):
         self.conn = conn
         self.budget = budget
@@ -223,6 +253,7 @@ class XClient:
         self.rules_version = rules_version
         self.clock = clock
         self._request = request
+        self.shadow = bool(shadow)
         self.base = cfg.get("api_base", "https://api.x.com/2").rstrip("/")
         self._throttle = Throttle(3600)
         self.stats: dict[str, int] = {}
@@ -370,23 +401,12 @@ class XClient:
         """Keys due for a counts call: mints with an observe decision in the window that are still on the
         active watchlist (most recent first), then observe_meta terms; each at most once per interval."""
         ccfg = self.cfg["confirm"]
-        window = float(ccfg.get("window_s", 21600))
         interval = float(ccfg.get("interval_s", 900))
-        out: list[dict[str, Any]] = []
-        for r in self.conn.execute(
-            "SELECT d.mint, MAX(d.as_of) AS t, c.name, c.symbol FROM decisions d JOIN coins c ON c.mint = d.mint"
-            " WHERE d.kind='observe' AND d.verdict='observe' AND d.as_of >= ? AND d.mint IN (SELECT mint FROM watchlist WHERE active=1)"
-            " GROUP BY d.mint ORDER BY t DESC", (now - window,)):
-            out.append({"key": r["mint"], "kind": "mint", "query": confirmation_query(r["mint"], r["name"], r["symbol"], self.stopwords, ccfg)})
-        for r in self.conn.execute(
-            "SELECT term, MAX(as_of) AS t FROM decisions WHERE kind='observe_meta' AND verdict='observe' AND as_of >= ? GROUP BY term ORDER BY t DESC",
-            (now - window,)):
-            q = meta_term_query(r["term"], self.stopwords, ccfg)
-            if q:
-                out.append({"key": f"meta:{r['term']}", "kind": "meta", "query": q})
+        out = confirmation_candidates(self.conn, now, ccfg, self.stopwords)
+        table = "shadow_confirmations" if self.shadow else "social_counts"
         due = []
         for k in out:
-            last = self.conn.execute("SELECT MAX(ts) FROM social_counts WHERE key=?", (k["key"],)).fetchone()[0]
+            last = self.conn.execute(f"SELECT MAX(ts) FROM {table} WHERE key=?", (k["key"],)).fetchone()[0]
             if last is None or now - float(last) >= interval:
                 due.append(k)
         return due[: int(ccfg.get("max_keys_per_loop", 4))]
@@ -401,11 +421,16 @@ class XClient:
             if resp is None:
                 break  # budget or transport: stop this round, keep the keys due
             n1h, n24 = counts_from_response(resp, now)
+            threshold = int(ccfg.get("search_when_count_1h", 10))
 
             def _write(c, k=k, n1h=n1h, n24=n24) -> None:
                 self.xb.book("ca_counts", 1, unit, now)
-                c.execute("INSERT OR REPLACE INTO social_counts(key, kind, ts, n_last_hour, n_24h, query) VALUES(?,?,?,?,?,?)",
-                          (k["key"], k["kind"], now, n1h, n24, k["query"]))
+                if self.shadow:
+                    # shadow: the count is kept next to the decision it would have confirmed, never in social_counts
+                    shadow_mod.write_shadow_confirmation(c, now, k, n1h, n24, threshold, self.rules_version)
+                else:
+                    c.execute("INSERT OR REPLACE INTO social_counts(key, kind, ts, n_last_hour, n_24h, query) VALUES(?,?,?,?,?,?)",
+                              (k["key"], k["kind"], now, n1h, n24, k["query"]))
 
             db.write_tx(self.conn, _write, what="x.counts")
             stats["counts"] += 1
@@ -445,12 +470,14 @@ class XClient:
                 "matched": matched, "mints": sorted({m for x in matched for m in x["mints"]})}
 
     def fast_post_decisions(self, now: float) -> int:
-        """One `fast_post` decision per fast mega post whose rare words match a burst of coin names."""
+        """One `fast_post` decision per fast mega post whose rare words match a burst of coin names. In shadow
+        mode the row goes to `shadow_decisions` (would_kind `fast_post`) and `decisions` is never touched."""
         fcfg = self.cfg["fast_post"]
         horizon = float(fcfg.get("window_s", 1800)) + float(self.cfg["mega"].get("refresh_max_age_s", 7200))
+        seen = ("SELECT 1 FROM shadow_decisions WHERE would_kind='fast_post' AND term = 'x:' || social_posts.id" if self.shadow
+                else "SELECT 1 FROM decisions WHERE kind='fast_post' AND term = 'x:' || social_posts.id")
         rows = self.conn.execute(
-            "SELECT * FROM social_posts WHERE fast=1 AND fast_at >= ? AND NOT EXISTS"
-            " (SELECT 1 FROM decisions WHERE kind='fast_post' AND term = 'x:' || social_posts.id)", (now - horizon,),
+            f"SELECT * FROM social_posts WHERE fast=1 AND fast_at >= ? AND NOT EXISTS ({seen})", (now - horizon,),
         ).fetchall()
         n = 0
         for post in rows:
@@ -458,10 +485,15 @@ class XClient:
             if m is None:
                 continue
             reasons = [f"fast_post likes_per_min={m['likes_per_min']}", *(f"{x['word']}: {x['n_coins']} coins / {x['n_creators']} creators" for x in m["matched"][:3])]
-            db.write_tx(self.conn, lambda c, post=post, m=m, reasons=reasons: decide.write_decision(
-                c, now, now, "fast_post", None, f"x:{post['id']}", m, self.rules_version, "observe", reasons), what="x.fast_post")
+            if self.shadow:
+                db.write_tx(self.conn, lambda c, post=post, m=m, reasons=reasons: shadow_mod.write_shadow_decision(
+                    c, now, now, "fast_post", None, f"x:{post['id']}", m, self.rules_version, "observe", reasons), what="x.shadow_fast_post")
+            else:
+                db.write_tx(self.conn, lambda c, post=post, m=m, reasons=reasons: decide.write_decision(
+                    c, now, now, "fast_post", None, f"x:{post['id']}", m, self.rules_version, "observe", reasons), what="x.fast_post")
             n += 1
-            log.info("x.fast_post_decision", post_id=post["id"], words=[x["word"] for x in m["matched"]], mints=len(m["mints"]))
+            log.info("x.fast_post_decision", post_id=post["id"], words=[x["word"] for x in m["matched"]], mints=len(m["mints"]),
+                     shadow=self.shadow)
         return n
 
     # ----- scheduler ------------------------------------------------------------------------------------------
@@ -482,4 +514,5 @@ class XClient:
             summary["confirm"] = self.confirm(now)
         summary["fast_post_decisions"] = self.fast_post_decisions(now)
         summary["spend_today_usd"] = round(self.xb.spend_today(now), 4)
+        summary["x_mode"] = "shadow" if self.shadow else "live"
         return summary
