@@ -147,3 +147,6 @@ Format: decision — why — where. Newest at the bottom.
     heartbeat itself is fresh (a dead daemon is systemd's job, not Telegram's).
 42. **"Link to the raw data id"** is the decision id (`data: beslissing #<id>`) plus the mint in monospace;
     no external links, so a message never looks like a call to action.
+43. **Failed pay-per-use calls cost nothing**: when a call's price depends on its response (X: per post
+    returned), a transport error, 429 or 5xx books $0 in the ledger (the estimate stays the gate's check
+    before the call). RPC calls keep booking their estimate on failure as in milestone 1.

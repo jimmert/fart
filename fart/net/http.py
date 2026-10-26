@@ -101,11 +101,14 @@ def request_json(
             body = e.read(2000).decode("utf-8", errors="replace")
         except Exception:
             body = None
-        budget.record(source, method, verdict.cost, False, e.code, latency, err=str(e.reason), retry_after_s=retry_after)
+        # a response-priced call (X: per post returned) that failed returned nothing and is not billed
+        budget.record(source, method, 0.0 if cost_from_response is not None else verdict.cost, False, e.code, latency,
+                      err=str(e.reason), retry_after_s=retry_after)
         raise HttpError(e.code, str(e.reason), retry_after, body=body) from None
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError) as e:
         latency = (time.monotonic() - t0) * 1000.0
-        budget.record(source, method, verdict.cost, False, None, latency, err=f"{type(e).__name__}: {e}")
+        budget.record(source, method, 0.0 if cost_from_response is not None else verdict.cost, False, None, latency,
+                      err=f"{type(e).__name__}: {e}")
         raise HttpError(None, f"{type(e).__name__}: {e}") from None
 
 

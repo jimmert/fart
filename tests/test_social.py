@@ -256,6 +256,7 @@ def test_http_429_backs_off_and_blocks(settings, conn, monkeypatch):
     assert len(calls) == 1 and c.stats["http_error"] == 1
     h = conn.execute("SELECT backoff_until, err_count FROM health WHERE source='x'").fetchone()
     assert h["err_count"] == 1 and 100 <= h["backoff_until"] - T0 <= 130  # x-rate-limit-reset honored
+    assert budget.daily_usage("x")["cost"] == 0.0  # a failed pay-per-use call is not billed
     assert c.kol_watch(T0 + 1) == {"new_posts": 0}
     assert len(calls) == 1 and c.stats["blocked_gate"] == 1  # the gate refused with 'backoff', no HTTP call
     assert conn.execute("SELECT blocked_reason FROM api_ledger WHERE source='x' AND blocked_reason IS NOT NULL").fetchone()[0] == "backoff"
