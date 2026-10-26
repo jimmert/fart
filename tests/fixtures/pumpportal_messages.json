@@ -1,0 +1,55 @@
+{
+ "junk": {
+  "message": "Successfully subscribed to token creation events."
+ },
+ "migration": {
+  "mint": "CcnpRLK4pnA35KjAd2aGZr4GAat16h8oTTKQq9pSZgfe",
+  "pool": "pump-amm",
+  "signature": "3oWB2X64vx9fGaU5PbTkJz1sptZYZLS2EGzqL4naniPQKQSxpSMfH7aSAJfrtidnJxaX8Ph5SEEA7JF4WWDa3NC6",
+  "txType": "migrate"
+ },
+ "new_token": {
+  "bondingCurveKey": "DtWfLZLaGFM1QwoBj9oJGa2YT5Whm3WeFwkuN99sjjx1",
+  "initialBuy": 51000000.0,
+  "marketCapSol": 30.82,
+  "mint": "CcnpRLK4pnA35KjAd2aGZr4GAat16h8oTTKQq9pSZgfe",
+  "name": "Goldberg Cat",
+  "pool": "pump",
+  "signature": "63fwjkxUN5u2PyzKgzTvqgrtrHMZaJwCsEzo3KF5QqL3hcuqo8cTXGz2rZQ1TpHTcBp98mjjyFWUFqfLc2JR1Vwn",
+  "solAmount": 1.5,
+  "symbol": "GOLDCAT",
+  "traderPublicKey": "4fV6XUxhxxpPBv2JYohq278jfZGLCze7mUPVGNGYzfaG",
+  "txType": "create",
+  "uri": "https://ipfs.io/ipfs/QmSyntheticUri",
+  "vSolInBondingCurve": 31.5,
+  "vTokensInBondingCurve": 1022000000.0
+ },
+ "sell": {
+  "bondingCurveKey": "DtWfLZLaGFM1QwoBj9oJGa2YT5Whm3WeFwkuN99sjjx1",
+  "marketCapSol": 32.09,
+  "mint": "CcnpRLK4pnA35KjAd2aGZr4GAat16h8oTTKQq9pSZgfe",
+  "newTokenBalance": 15000000.0,
+  "pool": "pump",
+  "signature": "sWJsRw2MqceWvaGmSABNGVB7bZK6G5jz5L4CBGjGNhjjeZJGD9n5TaRuRqDPsKZr1Vr6Yq5eJyUoCGdtVruyb7s",
+  "solAmount": 0.16,
+  "tokenAmount": 5000000.0,
+  "traderPublicKey": "BaLb4omR2Sn4Qr1BRS2McGrAGHPPQVBi3V52y9jgWofS",
+  "txType": "sell",
+  "vSolInBondingCurve": 31.99,
+  "vTokensInBondingCurve": 1007000000.0
+ },
+ "trade": {
+  "bondingCurveKey": "DtWfLZLaGFM1QwoBj9oJGa2YT5Whm3WeFwkuN99sjjx1",
+  "marketCapSol": 32.09,
+  "mint": "CcnpRLK4pnA35KjAd2aGZr4GAat16h8oTTKQq9pSZgfe",
+  "newTokenBalance": 20000000.0,
+  "pool": "pump",
+  "signature": "61UzzWUNnH3FNf9YqSQCgtrvZHPejForZR4TVD79V3UwswhJTp2eaYreAN8QJ4kY9fvfDwTV3eaqpCmuKh5MgJVp",
+  "solAmount": 0.65,
+  "tokenAmount": 20000000.0,
+  "traderPublicKey": "BaLb4omR2Sn4Qr1BRS2McGrAGHPPQVBi3V52y9jgWofS",
+  "txType": "buy",
+  "vSolInBondingCurve": 32.15,
+  "vTokensInBondingCurve": 1002000000.0
+ }
+}

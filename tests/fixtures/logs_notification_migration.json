@@ -1,0 +1,22 @@
+{
+ "jsonrpc": "2.0",
+ "method": "logsNotification",
+ "params": {
+  "result": {
+   "context": {
+    "slot": 370000900
+   },
+   "value": {
+    "err": null,
+    "logs": [
+     "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]",
+     "Program log: Instruction: Migrate",
+     "Program data: velduVyU6pRsaV23E1aJy7d+tLwtCt/yG/hBsAFfUeMAMMieNWLbpqybsMu0lAxMpYGtuUC0SdKhVxH8gPKtdF1NVUn/VLotAAgBqSy8AACAe8zJEwAAAIDR8AgAAAAAv35m9CiJPCpm/oD6ugW3gR6Xy7qak3dUDbRdxzRM0Y6aDf5oAAAAAE7G/1XWL1Bz7/hzqIF2pbu24gruwDlI5PITXST3zwfk",
+     "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success"
+    ],
+    "signature": "3oWB2X64vx9fGaU5PbTkJz1sptZYZLS2EGzqL4naniPQKQSxpSMfH7aSAJfrtidnJxaX8Ph5SEEA7JF4WWDa3NC6"
+   }
+  },
+  "subscription": 1
+ }
+}

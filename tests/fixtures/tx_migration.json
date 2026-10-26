@@ -1,0 +1,69 @@
+{
+ "id": 1,
+ "jsonrpc": "2.0",
+ "result": {
+  "blockTime": 1761480090,
+  "meta": {
+   "err": null,
+   "fee": 5000,
+   "innerInstructions": [
+    {
+     "index": 0,
+     "instructions": [
+      {
+       "accounts": [
+        "8zmsLUETAvmdz5J74fBs4DBU91WtisXW1yLK3jnYAe7L"
+       ],
+       "data": "4nMqxPPYfh5uNwfEUeVHkqjaBktV6z5GKhthixnFS8oSzv6PBmtaHFbHScqboSPx7HumeUD2MK9QbA8Yt2hVNmqDMoazNLFQCp2TcdjS5ApXdpeRykyrv5muWBMMWSQn1UxYiHjVDXQ3WE3C2DNmxCZbJmq3WgkDkgSijUtKT7yrcPXYjMUqQZHAy4xPJXY8FNdApiAUmJx6z6scra35aLL1CSWRd4uEXW5r13EPb78HZWgcs",
+       "programId": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+      }
+     ]
+    }
+   ],
+   "logMessages": [
+    "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]",
+    "Program log: Instruction: Migrate",
+    "Program data: velduVyU6pRsaV23E1aJy7d+tLwtCt/yG/hBsAFfUeMAMMieNWLbpqybsMu0lAxMpYGtuUC0SdKhVxH8gPKtdF1NVUn/VLotAAgBqSy8AACAe8zJEwAAAIDR8AgAAAAAv35m9CiJPCpm/oD6ugW3gR6Xy7qak3dUDbRdxzRM0Y6aDf5oAAAAAE7G/1XWL1Bz7/hzqIF2pbu24gruwDlI5PITXST3zwfk",
+    "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success"
+   ],
+   "postBalances": [],
+   "preBalances": []
+  },
+  "slot": 370000900,
+  "transaction": {
+   "message": {
+    "accountKeys": [
+     {
+      "pubkey": "8JCDdAucaj5ywiwB9i5q4pftWq5CokT2tUft3Zn1G3uX",
+      "signer": true,
+      "writable": true
+     },
+     {
+      "pubkey": "CcnpRLK4pnA35KjAd2aGZr4GAat16h8oTTKQq9pSZgfe",
+      "signer": false,
+      "writable": true
+     },
+     {
+      "pubkey": "6JWo6VtZqN5hs6qsPEjk23VN5YEz8SL76rkuwYabjNyq",
+      "signer": false,
+      "writable": true
+     }
+    ],
+    "instructions": [
+     {
+      "accounts": [
+       "8JCDdAucaj5ywiwB9i5q4pftWq5CokT2tUft3Zn1G3uX",
+       "CcnpRLK4pnA35KjAd2aGZr4GAat16h8oTTKQq9pSZgfe",
+       "6JWo6VtZqN5hs6qsPEjk23VN5YEz8SL76rkuwYabjNyq"
+      ],
+      "data": "synthetic",
+      "programId": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+     }
+    ]
+   },
+   "signatures": [
+    "3oWB2X64vx9fGaU5PbTkJz1sptZYZLS2EGzqL4naniPQKQSxpSMfH7aSAJfrtidnJxaX8Ph5SEEA7JF4WWDa3NC6"
+   ]
+  }
+ }
+}

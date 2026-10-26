@@ -1,0 +1,73 @@
+{
+ "id": 1,
+ "jsonrpc": "2.0",
+ "result": {
+  "blockTime": 1761480000,
+  "meta": {
+   "err": null,
+   "fee": 5000,
+   "innerInstructions": [
+    {
+     "index": 0,
+     "instructions": [
+      {
+       "accounts": [
+        "8zmsLUETAvmdz5J74fBs4DBU91WtisXW1yLK3jnYAe7L"
+       ],
+       "data": "5oQqPwQ2EA5UKbnQD8Un5H2tGnu1dn6KheGpYgoK7Q98fPbcYvmbNd4sUoEA2621XWV6Yc9tj1keVTCERJ1s7fUo1z8p3ukyNVW242wU4Ys3Sq17ZHzbsujVwVDG1vrbtt1Cy69KG4HSAKSfkFLVcA38zjduTg2Bi3kaWwBA3uhJdowGvowp9v6tGFACrRjcokeF8nsGmEYaNeu1k3vzSUXWNXQQeYpKNgA9PRpoA77Y9WLhdh2kGgdAQb9LTFBtnAJGX2x1LsxGptvufMc3Sbr8x3nB4bBGUMDgtagGrJ9gr4ZwejGyowiZVZEXFTgpW3vmphTXTj3eWHSojy3Cns",
+       "programId": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+      },
+      {
+       "accounts": [
+        "8zmsLUETAvmdz5J74fBs4DBU91WtisXW1yLK3jnYAe7L"
+       ],
+       "data": "2zjR1PvPvgqdhPdZLxuWCL8w7L1CTrvTozocd5Zro5JXKxhbvQ5RMLj8yGDbhNQCDPQ19ZWHhp27WVFJi3JCDuwiiszJTvTMAm2oDNMcTMbR23N3JGfv4Kh5Mdq2yxtG2R1dcLsbqnAQiUTSLUxsJ3As1rqpD1oiHgFvPfyrcSWTF35HWbcJGG8wbrtB5A71S71ddST4QoULaxkokFuH9s7yVndBgt9sR835ynzepmmYXf3epCN7NjzyKR8p21Kwv3ywzX6bBiZuUXtaGyqHTaPmpKUjr749Qfuj1uo3CRzrxL65NVfNFjDt5vy3CP9",
+       "programId": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+      }
+     ]
+    }
+   ],
+   "logMessages": [
+    "Program log: Instruction: Create"
+   ],
+   "postBalances": [],
+   "preBalances": []
+  },
+  "slot": 370000001,
+  "transaction": {
+   "message": {
+    "accountKeys": [
+     {
+      "pubkey": "4fV6XUxhxxpPBv2JYohq278jfZGLCze7mUPVGNGYzfaG",
+      "signer": true,
+      "writable": true
+     },
+     {
+      "pubkey": "CcnpRLK4pnA35KjAd2aGZr4GAat16h8oTTKQq9pSZgfe",
+      "signer": false,
+      "writable": true
+     },
+     {
+      "pubkey": "DtWfLZLaGFM1QwoBj9oJGa2YT5Whm3WeFwkuN99sjjx1",
+      "signer": false,
+      "writable": true
+     }
+    ],
+    "instructions": [
+     {
+      "accounts": [
+       "4fV6XUxhxxpPBv2JYohq278jfZGLCze7mUPVGNGYzfaG",
+       "CcnpRLK4pnA35KjAd2aGZr4GAat16h8oTTKQq9pSZgfe",
+       "DtWfLZLaGFM1QwoBj9oJGa2YT5Whm3WeFwkuN99sjjx1"
+      ],
+      "data": "synthetic",
+      "programId": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+     }
+    ]
+   },
+   "signatures": [
+    "63fwjkxUN5u2PyzKgzTvqgrtrHMZaJwCsEzo3KF5QqL3hcuqo8cTXGz2rZQ1TpHTcBp98mjjyFWUFqfLc2JR1Vwn"
+   ]
+  }
+ }
+}

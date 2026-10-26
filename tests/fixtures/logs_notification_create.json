@@ -1,0 +1,27 @@
+{
+ "jsonrpc": "2.0",
+ "method": "logsNotification",
+ "params": {
+  "result": {
+   "context": {
+    "slot": 370000001
+   },
+   "value": {
+    "err": null,
+    "logs": [
+     "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P invoke [1]",
+     "Program log: Instruction: Create",
+     "Program 11111111111111111111111111111111 invoke [2]",
+     "Program 11111111111111111111111111111111 success",
+     "Program data: G3KpTd7rY3YMAAAAR29sZGJlcmcgQ2F0BwAAAEdPTERDQVQjAAAAaHR0cHM6Ly9pcGZzLmlvL2lwZnMvUW1TeW50aGV0aWNVcmmsm7DLtJQMTKWBrblAtEnSoVcR/IDyrXRdTVVJ/1S6Lb9+ZvQoiTwqZv6A+roFt4Eel8u6mpN3VA20Xcc0TNGONm7mIUCSmFCG1RcCi+Rj7n6eQqKYKNK45MJ8Rzjka9k2buYhQJKYUIbVFwKL5GPufp5Copgo0rjkwnxHOORr2UAN/mgAAAAAABDYR+PPAwAArCP8BgAAAAB4xftR0QIAAIDGpH6NAwA=",
+     "Program log: Instruction: Buy",
+     "Program data: vdt/007mYe6sm7DLtJQMTKWBrblAtEnSoVcR/IDyrXRdTVVJ/1S6LQAvaFkAAAAAADDiXGIuAAABNm7mIUCSmFCG1RcCi+Rj7n6eQqKYKNK45MJ8Rzjka9lADf5oAAAAAADbi1UHAAAAAOD16oChAwAAL2hZAAAAAABI457vogIAeab3vYovUvpv5qV4j0a4RdawfnVPD4ofaEdpm2FdgLZfAAAAAAAAABBw2QAAAAAANm7mIUCSmFCG1RcCi+Rj7n6eQqKYKNK45MJ8Rzjka9kFAAAAAAAAALBxCwAAAAAA",
+     "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P consumed 123456 of 400000 compute units",
+     "Program 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P success"
+    ],
+    "signature": "63fwjkxUN5u2PyzKgzTvqgrtrHMZaJwCsEzo3KF5QqL3hcuqo8cTXGz2rZQ1TpHTcBp98mjjyFWUFqfLc2JR1Vwn"
+   }
+  },
+  "subscription": 1
+ }
+}
