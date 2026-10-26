@@ -172,7 +172,7 @@ def test_migration_v1_to_v2_preserves_milestone1_data(tmp_path):
     c.close()
     conn = db.connect(path)
     try:
-        assert db.schema_version(conn) == db.SCHEMA_VERSION == 4  # v1 -> v2 -> v3 -> v4 in one go
+        assert db.schema_version(conn) == db.SCHEMA_VERSION == 5  # v1 -> v2 -> v3 -> v4 -> v5 in one go
         counts = db.table_counts(conn, ("coins", "migrations", "trades", "decisions", "outcomes", "coverage", "coverage_gaps", "raw_undecoded"))
         assert all(v == 1 for v in counts.values()), counts
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -189,7 +189,7 @@ def test_migration_v1_to_v2_preserves_milestone1_data(tmp_path):
         assert "bytes" in {r[1] for r in conn.execute("PRAGMA table_info(api_ledger)")}
         assert conn.execute("SELECT coin_unknown FROM migrations WHERE mint='M1'").fetchone()[0] == 0  # M1 has a create
         assert conn.execute("SELECT recovered_at FROM coverage_gaps").fetchone()[0] is None
-        assert db.migrate(conn) == 4  # idempotent
+        assert db.migrate(conn) == db.SCHEMA_VERSION  # idempotent
         # the append-only triggers survived
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute("DELETE FROM decisions")

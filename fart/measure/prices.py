@@ -123,18 +123,22 @@ class PriceFeed:
     # ----- market cap samples -------------------------------------------------------------------
     def sample_mints(self, mints: list[str], sol_usd: float | None) -> dict[str, int]:
         """Fetch DexScreener pairs for up to N mints per call and store one mcap_samples row per mint
-        that has a pair. Mints without a pair are counted (not stored: unknown stays unknown)."""
+        that has a pair. Mints without a pair are counted (not stored: unknown stays unknown). `skipped`
+        counts the mints no call was made for (the gate blocked the source: the rest of the run is skipped)
+        or whose call failed (milestone 5: the tracker books them in `measure.track.skipped`)."""
         batch = int(self.cfg["sampling"].get("dexscreener_batch", 30))
-        stats = {"requested": len(mints), "stored": 0, "no_pair": 0, "calls": 0, "blocked": 0, "errors": 0}
+        stats = {"requested": len(mints), "stored": 0, "no_pair": 0, "calls": 0, "blocked": 0, "errors": 0, "skipped": 0}
         for i in range(0, len(mints), batch):
             chunk = mints[i:i + batch]
             try:
                 pairs = request_json(self.budget, "dexscreener", "tokens", DEXSCREENER_TOKENS + ",".join(chunk))
             except Blocked:
                 stats["blocked"] += 1
+                stats["skipped"] += len(mints) - i
                 break
             except HttpError as e:
                 stats["errors"] += 1
+                stats["skipped"] += len(chunk)
                 log.warning("sample.dexscreener_error", error=str(e)[:160])
                 continue
             stats["calls"] += 1

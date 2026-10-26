@@ -8,7 +8,7 @@ Target layout (shared host, unprivileged user, outbound HTTPS/WSS only, no inbou
   bin/fart            wrapper: cd /opt/fart/app && exec /opt/fart/venv/bin/python -m fart "$@" (FART_ROOT set)
   venv/               python3.12 venv with websockets
   data/               fart.db (SQLite WAL), raw/<source>/YYYYMMDD/HH.jsonl.gz, archive/, backup/
-  out/recall/         daily reports <day>.json + <day>.md
+  out/recall/         daily reports <day>.json + <day>.md, week reports week-<end>.json + .md (milestone 5)
   logs/               ingest.log, engine.log, social.log, notify.log, measure-*.log (JSON lines, 5 MB x 5)
   .env                root:fart 0640 - the ONLY place where keys live
 ```
@@ -27,6 +27,7 @@ systemd units (all in `deploy/`, installed to `/etc/systemd/system/`):
 | `fart-notify.service` | Telegram outbox to the owner chat (milestone 2; idle unless `TELEGRAM_NOTIFY_ENABLED=1`) | daemon, 20 s loop |
 | `fart-measure-track.timer` | price samples + due outcomes + paper trades | every 5 min |
 | `fart-measure-report.timer` | daily recall report for the previous UTC day | 06:00 UTC |
+| `fart-measure-week.timer` | week report (rolling 7 days ending yesterday; the Monday run is the Monday-Sunday calendar week): universe, hit rate, recall, lead time, bootstrap intervals, costs, the frozen go/no-go test (milestone 5) | 06:30 UTC daily |
 | `fart-backup.timer` | SQLite online backup + quick_check, 14 days kept | 05:30 UTC |
 
 Hardening on every service: `User=fart`, `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
@@ -75,6 +76,9 @@ X_DAILY_BUDGET_USD=3.00             # hard daily cap for all X calls together
 TELEGRAM_BOT_TOKEN=                 # optional: bot token from @BotFather
 TELEGRAM_OWNER_CHAT_ID=             # the owner's chat id (fart-notify sends nowhere else)
 TELEGRAM_NOTIFY_ENABLED=0           # 1 = send; 0 = build nothing, send nothing
+TELEGRAM_COMMUNITY_CHAT_ID=         # milestone 5, leave empty: the community chat (group/channel id); never sent to without BOTH set
+TELEGRAM_COMMUNITY_ENABLED=0        # milestone 5, leave 0 during the measurement week: 1 = community messages to that chat
+TELEGRAM_COMMUNITY_PREVIEW=0        # milestone 5: 1 = the community text to the OWNER, headed "VOORBEELD community-bericht"
 FART_ROOT=/opt/fart
 ```
 
@@ -83,6 +87,15 @@ strict rate limits, no key, **no per-mint trade stream**). The file is read by t
 (`root:fart 0640`); it is never logged and never copied anywhere. `fart status` prints only
 `configured` / `not configured` per key. After editing:
 `sudo systemctl restart fart-ingest fart-engine fart-social fart-notify`.
+
+The community channel (milestone 5) is off by default and stays off until two names are set explicitly:
+`TELEGRAM_COMMUNITY_CHAT_ID` (the chat id of the group or channel; the bot must be a member or admin there)
+AND `TELEGRAM_COMMUNITY_ENABLED=1`, on top of the owner channel being enabled. Without both, `fart-notify`
+never queues or sends a message for any chat but the owner's (a test proves it, and the sender refuses a
+row for another chat without calling the API). `TELEGRAM_COMMUNITY_PREVIEW=1` sends the community-formatted
+text to the owner as an extra message headed "VOORBEELD community-bericht"; previews count within the owner
+limits (20 per minute, 6 observation batches per hour) and follow the community rules (one per coin and per
+theme per 24 h, 6 per hour, quiet hours 02:00-08:00 Europe/Amsterdam; `config/notify.json` -> `community`).
 
 `RPC_DAILY_BUDGET_CU` is a hard daily cap on *estimated* compute units (cost table in
 `config/budget.json`: the HTTP methods at the figures of Alchemy's compute-unit page, websocket frames per
@@ -321,6 +334,103 @@ subscriptions, what closed today and why, bytes next to CU. Step by step:
    `graduation` rows only with `subscribe_graduations` (false), so nothing comes back by itself; the
    pre-upgrade `.db` from step 1 is the clean way back. The 35 closed graduation rows stay closed.
 
+## 5d. Upgrade to milestone 5 (M5)
+
+M5 delivers what the measurement week needs and prepares the community step without taking it. On the
+server it changes: a **week report** (`fart measure week`, new timer `fart-measure-week.timer`, 06:30 UTC
+daily, `out/recall/week-<end>.md|json`) with per-day universe, hit rate, recall, lead time, block-bootstrap
+intervals, costs and the **frozen go/no-go test** (`config/measure.json` → `community_gate`,
+`docs/DECISIONS.md`); a **community channel** in `fart-notify` that is OFF unless two new `.env` names are
+set, plus a **preview mode** that sends the community text to you; the **tracker-coverage line** in the
+daily and week report (a graduation without a `mcap_samples` row at least every 10 minutes is "uitkomst
+onbekend", never "geen winnaar"; `outcomes` rows and `method_version` m1.0 are unchanged) and the counter
+`measure.track.skipped`; and the **M4 leftover**: the 195 `meta_burst` rows milestone 3 wrote kept their
+slots after the M4 upgrade (probation got 5 of its 100 reserved slots), so the engine now trims
+`meta_burst` rows above 40 every tick and **schema v5** trims them once at the upgrade. No engine rule
+changes: the fingerprint of the rule-defining files equals the frozen one of `150ca73cb354` (a test pins
+it), so the week report pools the new commit's `rules_version` with the frozen one. Step by step:
+
+1. **Back up first** (the migration is one-way, although it only closes watchlist rows):
+   ```bash
+   sudo systemctl start fart-backup.service; systemctl show -p Result fart-backup.service   # Result=success
+   ls -la /opt/fart/data/backup/
+   ```
+2. **Pull and install:**
+   ```bash
+   cd /opt/fart-src && git pull --ff-only && sudo deploy/install.sh
+   ```
+   * The installer opens the database once as the `fart` user: schema migration 4 → 5 adds no table and no
+     column; it **closes the active `meta_burst` watchlist rows above 40**, oldest first, keeping the mints of
+     the engine's frozen choice (kv `engine.meta_burst_sets`) and any row that traded in the last 10 minutes.
+     It prints `v5 cleanup (meta_burst rows trimmed): {"meta_burst_active_before": N, "meta_burst_closed": N-40,
+     "meta_burst_active_after": 40, ...}`; on the VPS expect `before` between 100 and 195 (whatever is left of
+     the 195 M3 rows after their idle expiry) and `after` at most 40. A second run prints zeros. The trade
+     stream unsubscribes the closed mints by itself (`close_reason` `unwatched`, 60 s later; the restart closes
+     the rest with `shutdown`). The counts stay in kv (`fart status` → `schema v5 cleanup`).
+   * The installer installs, enables and starts `fart-measure-week.timer` (06:30 UTC daily) and restarts the
+     daemons. The engine writes its rules fingerprint next to its rules_version from the first tick.
+3. **New names in `/opt/fart/.env`** (all three optional; the defaults are off; the installer never edits the
+   file, so add them yourself from `.env.example`):
+   ```
+   TELEGRAM_COMMUNITY_CHAT_ID=
+   TELEGRAM_COMMUNITY_ENABLED=0
+   TELEGRAM_COMMUNITY_PREVIEW=0
+   ```
+   During the measurement week leave the first two exactly like this. `TELEGRAM_COMMUNITY_PREVIEW=1` is
+   allowed during the week: you then receive, next to the normal observation batches, the text the community
+   would have received, headed **VOORBEELD community-bericht** (kind `community_preview` in `fart notify outbox`),
+   under the community rules (one per coin and per theme per 24 h, at most 6 per hour, nothing between 02:00 and
+   08:00 Amsterdam time; `config/notify.json` → `community`) and within your own limits (the previews count
+   towards the 6 observation batches per hour and the 20 messages per minute). On Mondays at 06:45 UTC the
+   preview also brings the weekly accountability message (the go/no-go section in plain words). Setting
+   `TELEGRAM_COMMUNITY_ENABLED=1` is the community step itself: not before the week's go/no-go, and only with
+   the chat id of the group or channel (usually a negative number; the bot must be a member or admin there).
+   After editing: `sudo systemctl restart fart-notify`.
+4. **Verify after 15 minutes:**
+   ```bash
+   sudo -u fart /opt/fart/bin/fart status
+   #   schema_version: 5
+   #   telegram community: not configured, disabled (TELEGRAM_COMMUNITY_ENABLED=0 or no chat id), preview to owner off
+   #   counts: ... watchlist_active=N (early_buyers a few, meta_burst <= 40, probation 20-100): probation has its reserve again
+   #   freshness (s): engine.heartbeat a few seconds; measure.week.last_run appears after the first 06:30 UTC run
+   #   tracker: skipped mints total=0 today=0 (measure.track.skipped; max_mints_per_run 600)   <- grows only when a run has more than 600
+   #     subjects or DexScreener refuses a batch; a growing number means the samples are thinner than every 5 minutes
+   #   rules fingerprints (engine): <new commit>=sha256:e3bf4320c45c   <- the same value as frozen_rules in config/measure.json:
+   #     the M5 code runs the frozen rules; the week report pools it with 150ca73cb354
+   #   schema v5 cleanup (meta_burst rows trimmed at ...): {"meta_burst_active_before": N, "meta_burst_closed": ..., "meta_burst_active_after": <= 40, ...}
+   #   failures: none
+   systemctl list-timers 'fart-*' --no-pager                 # fart-measure-week.timer, next elapse tomorrow 06:30 UTC
+   journalctl -u fart-engine --since -15min --no-pager | grep -c tick_failed      # 0
+   sudo -u fart sqlite3 /opt/fart/data/fart.db "select reason, count(*) from watchlist where active=1 group by 1"
+   #   meta_burst <= 40; probation present; the ratio is what the M4 reserve was meant to give
+   sudo -u fart sqlite3 /opt/fart/data/fart.db "select close_reason, count(*) from ws_subscriptions where until > strftime('%s','now') - 900 group by 1"
+   #   unwatched (the trimmed mints) and shutdown (the restart); nothing else new
+   ```
+5. **Smoke test of the week report on real data** (reads the database, writes two files, sends nothing):
+   ```bash
+   sudo -u fart /opt/fart/bin/fart measure week --end 2026-10-27 --days 1
+   ls -la /opt/fart/out/recall/week-2026-10-27.*
+   sed -n 1,60p /opt/fart/out/recall/week-2026-10-27.md
+   ```
+   Check in the markdown: the header says `1 dagen, rollend venster`; one segment headed `Regels ... (bevroren
+   meetweek)` lists the rules_versions of that day's decisions (`150ca73cb354` and/or the new commit: the same
+   fingerprint, so one segment, never two); the
+   "Universum per dag" row for 2026-10-27 matches `out/recall/2026-10-27.md` (graduations, winners, hours not
+   covered); the interval lines say `te weinig data (1 gedekte dagen (< 3), ...)`; the go/no-go table has six
+   rows, none of them `voldaan` by accident on one day; the costs table shows the CU estimate with the
+   calibration caveat. Run it after 06:30 UTC on 28 Oct so the day's 24 h outcomes are in; before that the day
+   shows `nog bezig` graduations, which is correct, not a fault. The timer's first run is 27 Oct 06:30 UTC with
+   `--end 2026-10-26` (the deploy day: partly M3/M4 rules_versions, pooled only where the fingerprint matches).
+   The Monday run on 2 Nov covers 26 Oct to 1 Nov; the first full measurement week (27 Oct to 2 Nov) is
+   `fart measure week --end 2026-11-02 --days 7` on 3 Nov after 06:30 UTC. Nothing in it decides or sends.
+6. **The daily report** (`out/recall/<day>.md`) carries new lines: "Dekking van de tracker" in the summary,
+   "Piekuren (12:00 tot 02:00 UTC) niet gedekt" under coverage, a section "Budget en kosten", "Tracker: N munten
+   overgeslagen" under "Verrijking en fouten", and "Observaties per rules_version" under "Versies". The counts
+   `geen winnaar` and `uitkomst onbekend` now follow the tracker-coverage rule; the `outcomes` rows are unchanged.
+7. **Rollback** to M4 code after the migration: M4 ignores nothing new (no columns were added) and would not
+   re-add the trimmed rows; disable the new timer (`systemctl disable --now fart-measure-week.timer`) since the
+   M4 installer does not know it. The pre-upgrade `.db` from step 1 is the clean way back if you want the rows.
+
 ## 6. First-day checklist (docs/UNVERIFIED.md)
 
 1. `fart chain global`: reserves, supply, `fee_basis_points` 95 and `creator_fee_basis_points` 5 must
@@ -339,6 +449,9 @@ subscriptions, what closed today and why, bytes next to CU. Step by step:
 5. Watch `coverage --hours 24` for a day: `grads_without_create` should be close to zero.
 6. X: compare the prices in `config/x.json` with the developer console; `fart status` → `x spend today`.
 7. Telegram: `fart notify test`, then watch `fart notify outbox` for `sent` rows.
+8. Week report (M5): `fart measure week --end <yesterday> --days 1` after 06:30 UTC; compare its universe row with
+   the daily report of the same day; the bootstrap says `te weinig data` until the window has 3 covered days and
+   20 winners.
 
 ## 7. Backup and restore
 
@@ -394,4 +507,8 @@ old rows stay, new rows get the old version string again.
 | `grads_without_create` high | creates missed by both streams | check `sweep.done missed=` and `enrich.done`; RPC key present? |
 | `decode.truncated_or_drift` counting up | pump.fun changed an event layout | inspect `raw_undecoded`, update `fart/chain/events.py` LAYOUTS |
 | `outbox` rows stuck in `pending` with `error` | Telegram unreachable or wrong token/chat id | `fart notify outbox`; fix `.env`; rows retry 15 s → 1 h then `gave_up` |
+| `outbox` rows `gave_up` with `chat not allowed` | a row was queued for a chat that is not the owner's while the community channel is off (or was switched off) | expected and safe: nothing left the server; `fart status` → `telegram community` shows the state; set both community names on purpose or leave it |
+| `tracker: skipped mints total=N` growing in `status` | more than 600 subjects in a tracker run (`max_mints_per_run`) or DexScreener refused batches | the reports count the affected graduations as `uitkomst onbekend`; raise `max_mints_per_run` in `config/measure.json` (a commit) or accept thinner coverage |
+| `counts: ... meta_burst` above 40 for more than one engine tick | the trim did not run (engine down) or the frozen sets hold more than 40 | `journalctl -u fart-engine`; `meta_burst_trimmed` in the tick log; the frozen sets are bounded by `meta_burst_max_total` as well |
+| week report says `te weinig data` everywhere | fewer than 3 covered days or fewer than 20 winners in the window | expected early in the week; the Monday report of a full week has the data or says why not |
 | `database is locked` | another connection held the write lock for more than 15 s (busy timeout), or a writer used a plain `BEGIN` after reading | every writer uses `BEGIN IMMEDIATE` with 3 retries (`fart/db.py`); a `sqlite3` shell left in a transaction is the usual culprit |

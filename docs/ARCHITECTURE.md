@@ -1,4 +1,4 @@
-# Architecture (milestone 4)
+# Architecture (milestone 5)
 
 `fart` is a read-only consumer of public Solana / pump.fun data. It never signs, never trades.
 Milestone 1 delivered complete and redundant ingestion, an event-time data model in which hindsight
@@ -12,8 +12,11 @@ for hours fart was not running. Milestone 4 made the watchlist and the trade str
 eviction, a reserve for probation, a frozen and bounded meta_burst choice, subscription hysteresis),
 gave the stream a daily CU share instead of 1/24 per hour, calibrated the cost table and books websocket
 frames per byte, and keeps the universe complete when PumpPortal reports the graduation of a coin fart
-never saw created. Still no ML, no web UI, no trading, and the only outbound write anywhere is
-`sendMessage` to the owner chat.
+never saw created. Milestone 5 delivers the measurement week's instruments without changing a rule: a week
+report with block-bootstrap intervals and the frozen go/no-go test, a tracker-coverage rule in the reports, a
+community channel that is off unless two `.env` names are set (with a preview to the owner), and the trim of
+the leftover `meta_burst` rows (schema v5). Still no ML, no web UI, no trading, and the only outbound write
+anywhere is `sendMessage` to the owner chat (and, once Jim switches it on after the week, to the community chat).
 
 ## Processes
 
@@ -24,7 +27,7 @@ never saw created. Still no ML, no web UI, no trading, and the only outbound wri
                                                ▼         ▼                          ◄── fart-social (15 s)  X API v2
                                         data/raw/...  coins / migrations / trades / coverage / ws_subscriptions
                                                                                     ◄── fart-notify (20 s)  Telegram
-                                                                                    ◄── fart-measure-track (5 min), -report (daily)
+                                                                                    ◄── fart-measure-track (5 min), -report (06:00), -week (06:30)
 ```
 
 * **fart-ingest** (`fart/ingest/service.py`): one PumpPortal connection (`pumpportal.py`; trade
@@ -53,9 +56,18 @@ never saw created. Still no ML, no web UI, no trading, and the only outbound wri
   (`notify/telegram.py`); idles unless `TELEGRAM_NOTIFY_ENABLED=1`.
 * **fart-measure-track** (`fart/measure/outcomes.py`): samples DexScreener for every subject under
   measurement, writes due `outcomes` rows (+1 h / +6 h / +24 h) and the paper trade per decision.
-* **fart-measure-report** (`fart/measure/report.py`): the daily recall report to `out/recall/`.
+* **fart-measure-report** (`fart/measure/report.py`): the daily recall report to `out/recall/`; since
+  milestone 5 with the tracker-coverage rule (a graduation without a sample at least every 10 minutes is
+  "uitkomst onbekend", never "geen winnaar") and the per-rules_version blocks the week report aggregates.
+* **fart-measure-week** (`fart/measure/week.py`): the rolling 7-day report (`week-<end>.md|json`, 06:30 UTC,
+  the Monday run is the calendar week): daily reports rebuilt per method_version, pooled per rules fingerprint
+  (`fart/version.py`: identical rule files = one segment, every rules_version listed), hit rate with unknown in
+  the denominator, recall and lead time on the earliest coin-or-theme decision, block bootstrap with days as
+  blocks (9,999 draws, fixed seed; "te weinig data" under 3 covered days or 20 winners), costs, and the frozen
+  go/no-go criteria of `config/measure.json` → `community_gate` printed as voldaan / niet voldaan / te weinig
+  data. It decides nothing and sends nothing.
 
-All processes share `data/fart.db` (SQLite, WAL, 15 s busy timeout, schema `PRAGMA user_version` 4) and
+All processes share `data/fart.db` (SQLite, WAL, 15 s busy timeout, schema `PRAGMA user_version` 5) and
 the budget lock file. Cross-process coordination happens through tables only: the engine writes the
 `watchlist` (and its frozen meta_burst choice in kv `engine.meta_burst_sets`), the ingest daemon diffs
 the watchlist against its subscriptions every 5 s with hysteresis; the social daemon writes `decisions`,
@@ -162,7 +174,11 @@ from `activated_at`), and `probation_reserve` (100 of the 200 slots) can only be
 the other reasons share the rest. The engine's meta_burst entries are a frozen, bounded choice
 (`decide.meta_burst_sets`: the 5 youngest not yet graduated coins of every bursting meta, at most 40 in
 all, strongest metas first; a set is kept while its meta bursts and released 10 minutes after it stopped;
-persisted in kv so a restart continues with the same set). Entries expire by TTL or by idleness.
+persisted in kv so a restart continues with the same set). Entries expire by TTL or by idleness. Since
+milestone 5 the engine also trims `meta_burst` rows above the bound of 40 every tick (oldest first, never a
+row of the frozen sets or one that traded in the last 10 minutes), because the 195 rows milestone 3 had
+written kept their slots after the M4 upgrade and left probation 5 of its 100 reserved slots; schema v5 did
+the same once at the upgrade.
 Sources of trades:
 `rpc_trades` (TradeEvent on the bonding curve, decoded from the per-mint RPC subscription), `pump_amm`
 (BuyEvent/SellEvent whose pool maps to a known base mint, e.g. the first pool buy inside the migration
@@ -184,6 +200,16 @@ never exceeds 20 messages a minute and honors 429 `retry_after`. Observation bat
 (max 6/hour), fast posts immediately, the digest at 06:10 UTC, health alerts with a 1 h cooldown.
 Dutch, facts only, Europe/Amsterdam with UTC in brackets, a fixed footer.
 
+Milestone 5 adds the community channel behind a gate: `Notifier.allowed_chats` is the owner chat plus the
+community chat only while `TELEGRAM_COMMUNITY_CHAT_ID` is set and `TELEGRAM_COMMUNITY_ENABLED=1`; every
+builder queues through `_enqueue()` (refuses any other chat) and the sender marks a pending row for a chat
+that is not allowed `gave_up` without calling the API. The community text (`format.community_message`: what
+was seen, why it stands out, the frozen rules, a fixed warning, the mint as text, no link) goes to the
+community chat when enabled and, with `TELEGRAM_COMMUNITY_PREVIEW=1`, to the owner headed "VOORBEELD
+community-bericht" within the owner limits. Rules for both: one per coin and per theme per 24 h, 6 per hour,
+quiet hours, a weekly accountability message (Monday 06:45 UTC) that puts the week report's go/no-go section
+into plain words.
+
 ## Measurement
 
 See `docs/METING.md` (Dutch) for definitions. Mechanically: `subjects()` = every `observe`
@@ -197,10 +223,12 @@ per horizon from own trades (curve math times SOL/USD) and/or samples. Unknown s
 `rules_version`. Secrets live only in `$FART_ROOT/.env` (names in `.env.example`); URLs are
 logged as host only.
 
-## What comes after milestone 4
+## What comes after milestone 5
 
-* A measured week with frozen rules (one `rules_version`) before anything reaches a community chat;
-  the daily digest and `out/recall/` are the yardstick.
+* The measurement week itself (frozen rules `150ca73cb354`, pooled with every later commit that keeps the
+  rules fingerprint; first full day 27 Oct 2026). Its verdict is the week report's go/no-go section of
+  `fart measure week --end 2026-11-02 --days 7`; only then does Jim decide about `TELEGRAM_COMMUNITY_ENABLED`.
+  The preview mode shows him during the week what the community would have received.
 * Reconcile every estimate in `docs/UNVERIFIED.md` on the VPS, first of all the CU per byte of the
   websocket frames against the Alchemy dashboard (0.0002 or 0.04: that decides how much of the trade
   stream the daily share lets through), then the HTTP methods, X prices and the real recordings that

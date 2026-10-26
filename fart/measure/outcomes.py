@@ -2,6 +2,12 @@
 decisions) measure at +1 h, +6 h, +24 h: peak market cap (own trades for watched mints,
 DexScreener samples otherwise), volume, hit_100k, bundled. Missing data stays unknown (NULL),
 never 0. Rows are append-only; a new method_version writes new rows.
+
+Milestone 5 (fidelity, not a method change): a run that cannot sample every subject (more mints than
+`max_mints_per_run`, DexScreener blocked by the gate or failing) counts the mints it skipped in kv
+`measure.track.skipped` (all time) and `measure.track.skipped.<day>`, with the reasons in
+`measure.track.skipped.last`; `fart status` shows them. The reports count a graduation without samples at
+least every 10 minutes as "uitkomst onbekend", never as "geen winnaar" (`fart/measure/report.py`).
 """
 from __future__ import annotations
 
@@ -165,8 +171,19 @@ class Tracker:
             sol_usd, src = self.feed.sol_usd()
             stats["sol_usd"] = sol_usd
             stats["sol_usd_src"] = src
-            mints = sorted({s["mint"] for s in subs})[: int(self.cfg["sampling"].get("max_mints_per_run", 600))]
+            all_mints = sorted({s["mint"] for s in subs})
+            mints = all_mints[: int(self.cfg["sampling"].get("max_mints_per_run", 600))]
             stats["sampled"] = self.feed.sample_mints(mints, sol_usd)
+            skipped = {"over_cap": len(all_mints) - len(mints), "dexscreener": int(stats["sampled"].get("skipped", 0))}
+            stats["skipped"] = skipped
+            n_skipped = skipped["over_cap"] + skipped["dexscreener"]
+            if n_skipped:
+                def _count(c, n=n_skipped, detail=dict(skipped)) -> None:
+                    db.counter_bump_daily(c, "measure.track.skipped", n, now)
+                    db.kv_set(c, "measure.track.skipped.last", json.dumps({"at": now, **detail}), now)
+
+                db.write_tx(self.conn, _count, what="measure.skipped")
+                log.warning("track.skipped", **skipped, subjects=len(all_mints), max_mints_per_run=len(mints))
         stats["outcomes"], stats["paper"] = self.measure_due(now)
         db.kv_set(self.conn, "measure.track.last_run", str(now), now)
         log.info("track.done", **{k: (v if not isinstance(v, dict) else json.dumps(v)) for k, v in stats.items()})

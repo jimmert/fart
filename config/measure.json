@@ -1,5 +1,5 @@
 {
-  "_comment": "Outcome measurement and paper trading. method_version changes whenever these semantics change.",
+  "_comment": "Outcome measurement and paper trading. method_version changes whenever the outcome semantics change (milestone 5 adds the tracker coverage check and the week report WITHOUT changing them: m1.0 stays). community_gate holds the frozen go/no-go criteria for community alerts that `fart measure week` tests and prints; it decides nothing and sends nothing.",
   "method_version": "m1.0",
   "horizons_s": [
     3600,
@@ -40,5 +40,51 @@
       600,
       3600
     ]
+  },
+  "tracker": {
+    "_comment": "Tracker fidelity (milestone 5, point 4): a graduation counts as tracker-covered when its mcap_samples rows in the winner window are never more than max_sample_gap_s apart (the tracker runs every 300 s; 600 s allows one missed run). A graduation whose stored outcome says 'no winner' but that is NOT tracker-covered is reported as 'uitkomst onbekend' (a peak between sparse samples may have been missed), never as 'geen winnaar'. A graduation that IS a winner stays a winner (sparse samples cannot invent a peak). The outcomes rows themselves are unchanged (method_version m1.0).",
+    "max_sample_gap_s": 600
+  },
+  "week": {
+    "_comment": "fart measure week: a rolling window of `days` UTC days ending at --end (default yesterday), written to out/recall/week-<end>.md|json. The Monday 06:30 UTC run covers the whole Monday-Sunday calendar week. Confidence intervals: block bootstrap with days as blocks (a NIET GEDEKT day is not a block and never counts as a day with zero winners), `draws` draws, fixed `seed`, two-sided `alpha`; with fewer than min_days covered days or fewer than min_winners winners the report says 'te weinig data' instead of an interval.",
+    "days": 7,
+    "bootstrap": {
+      "draws": 9999,
+      "seed": 20261026,
+      "alpha": 0.05,
+      "min_days": 3,
+      "min_winners": 20
+    }
+  },
+  "community_gate": {
+    "_comment": "Go/no-go criteria for community alerts, frozen BEFORE the measurement week (docs/DECISIONS.md, milestone 5, 26 Oct 2026). Start values chosen by the builder; Jim may adjust them before the week ends, never afterwards. The week report prints every criterion as voldaan / niet voldaan / te weinig data and an overall verdict; nothing is decided or sent by it. complete day = a day of the window in which every peak hour (peak_hours_utc, 12:00-02:00 UTC as the hours 12..23 and 0..1 of that UTC day) was covered. hit rate = observe (coin) decisions that became a winner within 24 h, over the decisions whose 24 h have elapsed: an unknown outcome stays in the denominator (not a demonstrated hit), a pending one is listed apart. recall = winners with an observe or observe_meta decision before graduation. lead time = graduation minus the earliest observe/observe_meta decision. observations per day = observe + observe_meta decisions per covered day. frozen_rules: the rules_version that started the measurement week and the fingerprint of the rule-defining files at that commit (fart/version.py RULE_FILES); every later rules_version with the same fingerprint ran the same rules and is pooled with it.",
+    "frozen_rules": {
+      "rules_version": "150ca73cb354",
+      "rules_fingerprint": "sha256:e3bf4320c45c7cd3c159bc045a66164ae1754637979ddacc759dc6bd59bbbd46",
+      "since": "2026-10-26T12:18:00Z",
+      "first_full_day": "2026-10-27"
+    },
+    "min_complete_days": 5,
+    "peak_hours_utc": [
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      0,
+      1
+    ],
+    "min_winners": 30,
+    "min_hit_rate_ci_low": 0.15,
+    "min_recall_before_graduation_ci_low": 0.25,
+    "min_median_lead_s_before_graduation": 600,
+    "max_observations_per_day": 12
   }
 }

@@ -353,7 +353,7 @@ def test_schema_v4_closes_the_graduation_rows_and_flags_migrations_without_a_cre
     _v3_database(path, [(f"G{i}", "graduation", T0 + i) for i in range(35)] + [("E1", "early_buyers", T0), ("M1", "meta_burst", T0)])
     conn = db.connect(path)
     try:
-        assert db.schema_version(conn) == 4
+        assert db.schema_version(conn) == db.SCHEMA_VERSION  # v4 and then v5 (milestone 5) in one go
         assert conn.execute("SELECT COUNT(*) FROM watchlist WHERE active=1 AND reason='graduation'").fetchone()[0] == 0
         assert {r[0] for r in conn.execute("SELECT mint FROM watchlist WHERE active=1")} == {"E1", "M1"}
         assert conn.execute("SELECT COUNT(*) FROM ws_subscriptions WHERE until IS NULL").fetchone()[0] == 2
@@ -362,7 +362,8 @@ def test_schema_v4_closes_the_graduation_rows_and_flags_migrations_without_a_cre
         assert conn.execute("SELECT COUNT(*) FROM watchlist WHERE activated_at IS NULL").fetchone()[0] == 0
         rec = json.loads(db.kv_get(conn, "schema.v4.cleanup"))
         assert rec["counts"] == {"watchlist_graduation_closed": 35, "ws_subscriptions_closed": 35, "migrations_coin_unknown": 1, "watchlist_activated_at_filled": 37}
-        assert db.migrate(conn) == 4 and db._cleanup_v4(conn, T0) == {"watchlist_graduation_closed": 0, "ws_subscriptions_closed": 0, "migrations_coin_unknown": 0, "watchlist_activated_at_filled": 0}
+        assert db.migrate(conn) == db.SCHEMA_VERSION
+        assert db._cleanup_v4(conn, T0) == {"watchlist_graduation_closed": 0, "ws_subscriptions_closed": 0, "migrations_coin_unknown": 0, "watchlist_activated_at_filled": 0}
     finally:
         conn.close()
 

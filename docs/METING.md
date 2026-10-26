@@ -86,3 +86,71 @@ nieuwe rijen; oude rijen blijven staan.
 * Geen volledige marktdata: DexScreener-samples elke 5 minuten missen pieken tussen samples;
   eigen trades bestaan alleen voor gevolgde munten. Beide beperkingen staan in de `json`-kolom
   van elke `outcomes`-rij (`peak_src`, `samples_n`, `trades_n`, `data_quality`).
+
+## Het weekrapport (mijlpaal 5)
+
+`fart measure week --end JJJJ-MM-DD --days 7` schrijft `out/recall/week-<einddag>.md` en `.json`: een
+rollend venster van 7 UTC-dagen dat standaard gisteren eindigt. De timer draait elke dag om 06:30 UTC; de
+maandagrun beslaat de hele kalenderweek (maandag tot en met zondag). Het rapport is een optelling van de
+dagrapporten die het ter plekke opnieuw bouwt (dus met alle inmiddels gemeten uitkomsten), **per segment**:
+één set regels × één meetmethode.
+
+**Segment.** Elke deploy is een nieuwe commit en dus een nieuwe `rules_version`, ook als er geen drempel
+veranderde. Daarom krijgt elke `rules_version` een *vingerafdruk* van de regelbestanden (`fart/version.py`:
+`config/engine.json`, `config/pumpfun.json`, `config/stopwords.json`, curve-wiskunde, features, clustering,
+verdicts). Gelijke vingerafdruk = dezelfde regels; die rules_versions staan samen in één segment en worden
+allemaal genoemd. De bevroren regels van de meetweek (`150ca73cb354`, vingerafdruk in `config/measure.json`
+→ `community_gate.frozen_rules`) zijn het eerste segment. Een echte regelwijziging opent een nieuw segment.
+Een andere `method_version` in `outcomes` geeft een eigen segment met eigen dagrapporten.
+
+**Universum per dag.** Creates per bron (PumpPortal, RPC, unie), graduaties, graduaties zonder bekende
+create (`coin_unknown`), winnaars (organisch / gebundeld / onbekend), geen winnaar, uitkomst onbekend (en
+hoeveel daarvan door te weinig samples), uren NIET GEDEKT, piekuren niet gedekt, budgetpauzes (geblokkeerde
+calls door het RPC- of X-plafond, seconden stroomgat door het plafond, pauzes van de trade-stroom door de
+uurenvelop) en de dekking van de tracker. Een dag zonder gedekt uur is **NIET GEDEKT**: zijn rij toont
+"onbekend", hij telt niet mee in de totalen, is geen blok voor de bootstrap en nooit een "complete dag".
+
+**Trefkans.** Van de `observe`-beslissingen (munten) van de gedekte dagen: raak = winnaar binnen 24 u na de
+beslissing. Noemer = de beslissingen waarvan de 24 u verstreken zijn, **inclusief** de beslissingen met een
+onbekende uitkomst (een observatie die we niet konden meten is geen aangetoonde treffer). Beslissingen die
+nog bezig zijn staan apart en komen in de noemer zodra hun 24 u voorbij zijn. Daarnaast staat de trefkans
+over alleen de bekende uitkomsten. Dit is bewust voorzichtig; het is de maat waarop de go/no-go toetst.
+
+**Recall.** Aandeel winnaars met een munt- óf thema-beslissing vóór de gebeurtenis, apart voor "vóór de
+eerste trade die wij zagen" en "vóór graduatie"; munt-alleen en thema-alleen staan ernaast. Een winnaar
+zonder bekende eerste trade telt niet mee in de noemer van "vóór eerste trade".
+
+**Lead time.** Gebeurtenis minus de vroegste munt- of thema-beslissing van het segment, in seconden;
+positief = op tijd. Mediaan, p25, p75 en de bins uit `config/measure.json` → `report.lead_time_bins_s`
+(< -60 min, -60 tot -10, -10 tot 0, 0 tot 10, 10 tot 60, ≥ 60 min).
+
+**Betrouwbaarheidsintervallen.** Blokbootstrap met de gedekte dagen als blokken: 9.999 keer worden de dagen
+met teruglegging getrokken, per trekking de samengevoegde verhouding, percentielen bij alpha 0,05; vaste seed
+20261026 zodat twee runs hetzelfde interval geven. Een trekking zonder noemer is ongedefinieerd (nooit nul).
+Met minder dan 3 gedekte dagen of minder dan 20 winnaars staat er "te weinig data" in plaats van een
+interval. Dagen als blokken vangen op dat beslissingen binnen een dag niet onafhankelijk zijn (één meta,
+één markt); zeven blokken geven brede intervallen, en dat is eerlijk.
+
+**Kosten.** Per dag de geschatte CU (kostentabel; de ijking met het Alchemy-dashboard staat open in
+`docs/UNVERIFIED.md`, dus het blijft een schatting), het CU-plafond, de X-uitgaven in dollars en het aantal
+DexScreener-verzoeken.
+
+**Dekking van de tracker.** Aandeel gemeten graduaties met in het winnaarsvenster minstens elke 10 minuten
+een `mcap_samples`-rij (de gaten naar het begin en einde van het venster tellen mee). Een graduatie die
+volgens de opgeslagen uitkomst "geen winnaar" is maar níet zo gedekt werd, telt in dag- en weekrapport als
+**uitkomst onbekend** (een piek tussen schaarse samples kan gemist zijn), nooit als "geen winnaar". Een
+winnaar blijft een winnaar: schaarse samples kunnen geen piek verzinnen. De `outcomes`-rijen zelf veranderen
+niet; `method_version` blijft m1.0. Loopt de tracker achter (meer dan 600 munten per run of DexScreener
+weigert), dan telt `measure.track.skipped` dat (`fart status`) en noemt het dagrapport het aantal.
+
+**Go/no-go.** De vaste sectie toetst de vooraf bevroren criteria uit `config/measure.json` → `community_gate`
+(zie `docs/DECISIONS.md`, mijlpaal 5): minimaal 5 complete dagen (piekuren 12:00-02:00 UTC gedekt),
+minimaal 30 winnaars, ondergrens trefkans-interval ≥ 0,15, ondergrens recall-interval vóór graduatie ≥ 0,25,
+mediane lead time vóór graduatie ≥ 10 minuten, gemiddeld hoogstens 12 observaties per dag. Per criterium
+"voldaan", "niet voldaan" of "te weinig data", plus één oordeel. Het rapport beslist niets en verstuurt niets;
+het wekelijkse verantwoordingsbericht van `fart-notify` zet deze sectie in gewone woorden over.
+
+**Dagrapport, nieuw sinds mijlpaal 5.** "Dekking van de tracker" in de samenvatting, "Piekuren niet gedekt"
+onder dekking, de sectie "Budget en kosten", "Tracker: N munten overgeslagen" onder verrijking en fouten, en
+"Observaties per rules_version" onder versies. `geen winnaar` en `uitkomst onbekend` volgen de
+tracker-dekkingsregel.

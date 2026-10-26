@@ -1,0 +1,42 @@
+[Unit]
+Description=fart measure week: rolling 7-day recall report with bootstrap intervals and the frozen go/no-go test
+Documentation=file:///opt/fart/app/deploy/DEPLOY.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/fart/venv/bin/python -m fart --quiet measure week
+TimeoutStartSec=900
+# --- hardening (shared host; outbound HTTPS/WSS only; no inbound ports) ---
+User=fart
+Group=fart
+Slice=fart.slice
+WorkingDirectory=/opt/fart/app
+Environment=FART_ROOT=/opt/fart
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+UMask=0027
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/opt/fart/data /opt/fart/out /opt/fart/logs
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes

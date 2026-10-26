@@ -163,7 +163,30 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
 - [ ] **HTML parse mode** rejects unbalanced tags: every chain/X text is escaped; a 400 "can't parse
   entities" marks the row `gave_up` with the description (visible in `fart notify outbox`).
 - [ ] **Time zone data**: `zoneinfo` needs `/usr/share/zoneinfo` (Ubuntu has it; the code falls back to
-  UTC labels when it is missing).
+  UTC labels when it is missing). Milestone 5: the community quiet hours (02:00-08:00 Europe/Amsterdam) use
+  the same lookup; without zoneinfo they would be read as UTC (two hours off in winter).
+- [ ] **Community chat id and rights** (milestone 5, `TELEGRAM_COMMUNITY_CHAT_ID`, off by default): a Telegram
+  supergroup or channel id is a negative number (channels and supergroups `-100...`); the bot must be a member
+  (group) or an administrator with the right to post (channel) before `sendMessage` succeeds; a 400/403 marks
+  the row `gave_up` with the description. Nothing was tried from the sandbox. When the day comes: set the id
+  with `TELEGRAM_COMMUNITY_ENABLED=0` first, watch `fart status` → `telegram community: configured, disabled`,
+  then switch the flag after the week's go/no-go.
+- [ ] **Preview volume** (`TELEGRAM_COMMUNITY_PREVIEW=1`): previews count towards the owner's 6 observation
+  batches per hour; on a busy day the owner may receive fewer observation batches because of them (by design,
+  per the brief). Check `fart notify outbox` for `community_preview` rows and `observe_deferred` in the tick log.
+
+## Measurement (milestone 5)
+
+- [ ] **Tracker coverage threshold** (`config/measure.json` → `tracker.max_sample_gap_s` 600): the tracker runs
+  every 5 minutes, so 600 s allows one missed run; whether DexScreener lists every pump-amm pool from the first
+  minutes after graduation (so the gap from the graduation to the first sample stays under 10 minutes) is to be
+  read from the first week's `Dekking van de tracker` line. A low share with a healthy timer means DexScreener
+  lists pools late, not that the tracker failed; the reports count those graduations as `uitkomst onbekend`.
+- [ ] **Bootstrap seed and percentiles** (`week.bootstrap_ratio`): nearest-rank percentiles of 9,999 pooled
+  ratios with `random.Random(20261026)`; the choice of days as blocks is documented in METING. A different
+  seed gives slightly different bounds; the reported one is reproducible.
+- [ ] **CU per day in the week report is the same estimate** as `fart status` and the daily report: nothing is
+  calibrated until the Alchemy dashboard comparison above is done; the report says so on every costs line.
 
 ## Prices
 

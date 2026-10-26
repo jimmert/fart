@@ -34,7 +34,7 @@ from .util import day_key
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 BUSY_TIMEOUT_MS = 15000
 WRITE_RETRY_ATTEMPTS = 3
@@ -523,6 +523,47 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[4] = _migrate_v4
+
+
+# ----- schema version 5 (milestone 5) --------------------------------------------------------------
+# No new tables or columns. A one-off cleanup of the M4 leftover: after the M4 upgrade (VPS, 26 Oct 2026
+# 12:18 UTC) 195 `meta_burst` watchlist rows written by milestone 3 kept their slots (the M4 rules only
+# limit new additions; rows expire by idleness or TTL), so probation got 5 slots instead of its reserve of
+# 100. The migration closes the `meta_burst` rows above SCHEMA_V5_META_BURST_MAX_TOTAL (the engine's
+# `meta_burst_max_total`, pinned by a test), oldest first, keeping the mints of the engine's frozen choice
+# (kv `engine.meta_burst_sets`) and any row that traded in the last 10 minutes; the engine does the same
+# every tick from now on (`watch.trim`). Counts land in kv `schema.v5.cleanup`; a second run changes nothing.
+# The open `ws_subscriptions` rows of the closed mints are left to the trade stream, which unsubscribes a
+# mint 60 s after its watchlist row went inactive (`close_reason` unwatched) and closes everything at restart.
+SCHEMA_V5_META_BURST_MAX_TOTAL = 40
+
+
+def _cleanup_v5(conn: sqlite3.Connection, now: float) -> dict[str, Any]:
+    from .ingest.watch import trim  # local import: fart.ingest.watch has no dependency on this module
+
+    raw = kv_get(conn, "engine.meta_burst_sets")
+    keep: list[str] = []
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                keep = [str(m) for v in data.values() if isinstance(v, dict) for m in v.get("mints", [])]
+        except json.JSONDecodeError:
+            keep = []
+    before = int(conn.execute("SELECT COUNT(*) FROM watchlist WHERE active=1 AND reason='meta_burst'").fetchone()[0])
+    closed = trim(conn, "meta_burst", SCHEMA_V5_META_BURST_MAX_TOTAL, keep, now)
+    after = int(conn.execute("SELECT COUNT(*) FROM watchlist WHERE active=1 AND reason='meta_burst'").fetchone()[0])
+    return {"meta_burst_active_before": before, "meta_burst_closed": closed, "meta_burst_active_after": after,
+            "frozen_mints_kept": len(keep), "max_total": SCHEMA_V5_META_BURST_MAX_TOTAL}
+
+
+def _migrate_v5(conn: sqlite3.Connection) -> None:
+    now = time.time()
+    counts = _cleanup_v5(conn, now)
+    kv_set(conn, "schema.v5.cleanup", json.dumps({"at": now, "counts": counts}), now)
+
+
+MIGRATIONS[5] = _migrate_v5
 
 
 def _apply_pragmas(conn: sqlite3.Connection, readonly: bool) -> None:

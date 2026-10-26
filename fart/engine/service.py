@@ -17,6 +17,12 @@ all, frozen while the meta bursts, released `meta_burst_release_s` after it stop
 is persisted in kv `engine.meta_burst_sets`, so a restart continues with the same set. Before, every
 tick re-added up to 20 coins of every bursting meta, evicted the oldest equal-priority entries and
 made the trade stream re-subscribe the difference (5,298 subscriptions in 52 minutes on the VPS).
+
+Milestone 5: step 1 also trims `meta_burst` rows above `meta_burst_max_total` that are not in the frozen
+sets (oldest first, never a row that traded in the last 10 minutes): after the M4 upgrade 195 M3 rows kept
+their slots until their TTL and left probation 5 of its 100 reserved slots. The engine also records the
+fingerprint of the rule-defining files next to its rules_version (kv `engine.rules_fingerprint.<rv>`) so the
+week report can pool rules_versions that ran identical rules.
 """
 from __future__ import annotations
 
@@ -34,7 +40,7 @@ from ..ingest import watch
 from ..log import get_logger
 from ..net.budget import Budget
 from ..util import now as wall_now
-from ..version import rules_version
+from ..version import rules_fingerprint, rules_version
 from . import decide, features
 from .enrich import creator_activity, holder_concentration
 from .meta import cluster, load_stopwords
@@ -52,6 +58,7 @@ class Engine:
         self.stopwords = load_stopwords(settings.config("stopwords"))
         self.rpc = rpc
         self.rules_version = rules_version()
+        self.rules_fingerprint = rules_fingerprint()
         self.stats: dict[str, int] = {}
         self.burst_sets: dict[str, dict[str, Any]] = self._load_burst_sets()
 
@@ -89,12 +96,21 @@ class Engine:
         cooldown = float(self.cfg.get("decision_cooldown_s", 1800))
         summary: dict[str, Any] = {"as_of": as_of, "coins": 0, "promoted": 0, "coin_decisions": 0, "meta_decisions": 0,
                                    "bursting_metas": 0, "rpc_lookups": 0, "meta_burst_sets": 0, "meta_burst_mints": 0,
-                                   "meta_burst_released": 0}
+                                   "meta_burst_released": 0, "meta_burst_trimmed": 0}
         cap, reserve = watch.limits(wcfg)
         t_start = time.monotonic()
 
-        # 1. expire (short write)
-        db.write_tx(self.conn, lambda c: watch.expire(c, now, float(wcfg.get("dead_after_idle_s", 7200))), what="engine.expire")
+        # 1. expire and trim (short write): rows past their TTL or idle, then meta_burst rows above the bound
+        #    that are not part of the frozen choice (milestone 5; a row that traded in the last 10 min stays)
+        frozen_mints = [m for s_ in self.burst_sets.values() for m in s_.get("mints", [])]
+        max_total = int(wcfg.get("meta_burst_max_total", 40))
+
+        def _expire(c: sqlite3.Connection) -> tuple[int, int]:
+            expired = watch.expire(c, now, float(wcfg.get("dead_after_idle_s", 7200)))
+            trimmed = watch.trim(c, "meta_burst", max_total, frozen_mints, now)
+            return expired, trimmed
+
+        summary["expired"], summary["meta_burst_trimmed"] = db.write_tx(self.conn, _expire, what="engine.expire")
 
         # 2. features (read snapshot, no writes)
         candidates: list[dict[str, Any]] = []
@@ -184,6 +200,7 @@ class Engine:
                 db.kv_set(c, "engine.meta_burst_sets", json.dumps(new_sets, sort_keys=True), now)
             db.kv_set(c, "engine.heartbeat", str(now), now)
             db.kv_set(c, "engine.rules_version", self.rules_version, now)
+            db.kv_set(c, f"engine.rules_fingerprint.{self.rules_version}", self.rules_fingerprint, now)
             return n_coin, n_meta, n_added
 
         summary["coin_decisions"], summary["meta_decisions"], summary["meta_burst_watched"] = db.write_tx(self.conn, _write, what="engine.decisions")
