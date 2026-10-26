@@ -1,0 +1,39 @@
+{
+  "_comment": "Ingest daemon parameters.",
+  "pumpportal": {
+    "watchdog_idle_s": 120,
+    "backoff_min_s": 20,
+    "backoff_max_s": 180,
+    "max_connects_per_hour": 12,
+    "raw_flush_interval_s": 5,
+    "raw_flush_lines": 200,
+    "watchlist_sync_interval_s": 5,
+    "max_trade_subscriptions": 200
+  },
+  "rpc_logs": {
+    "enabled": true,
+    "commitment": "confirmed",
+    "watchdog_idle_s": 180,
+    "backoff_min_s": 10,
+    "backoff_max_s": 300,
+    "ping_interval_s": 30
+  },
+  "backfill": {
+    "enabled": true,
+    "min_gap_s": 30,
+    "max_signatures_per_gap": 1000,
+    "max_transactions_per_gap": 100,
+    "max_transactions_per_day": 1500
+  },
+  "enrich": {
+    "enabled": true,
+    "batch": 10,
+    "max_attempts": 3
+  },
+  "retention": {
+    "raw_days": 30,
+    "trades_days": 14,
+    "samples_days": 30,
+    "api_ledger_days": 30
+  }
+}

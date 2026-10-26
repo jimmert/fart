@@ -1,0 +1,35 @@
+{
+  "_comment": "Candidate engine v0 thresholds. Observations, not alerts. Changing a value changes rules_version only through a git commit.",
+  "loop_interval_s": 15,
+  "meta": {
+    "window_s": 10800,
+    "baseline_from_s": 172800,
+    "baseline_to_s": 21600,
+    "min_token_len": 4,
+    "min_coins": 3,
+    "min_distinct_creators": 3,
+    "burst_ratio": 3.0,
+    "observe_min_sol_inflow": 20.0,
+    "observe_min_unique_buyers": 25,
+    "max_terms": 50
+  },
+  "coin": {
+    "observe_min_unique_buyers_5m": 25,
+    "observe_min_net_sol_5m": 10.0,
+    "observe_max_largest_buyer_share": 0.35,
+    "observe_require_not_bundled": true,
+    "holder_concentration_top_n": 10,
+    "max_holder_lookups_per_loop": 3,
+    "max_creator_lookups_per_loop": 3
+  },
+  "watchlist": {
+    "cap": 200,
+    "ttl_s": 86400,
+    "dead_after_idle_s": 7200,
+    "early_buyers_threshold": 10,
+    "early_window_s": 300,
+    "subscribe_graduations": true,
+    "subscribe_bursting_meta": true
+  },
+  "decision_cooldown_s": 1800
+}

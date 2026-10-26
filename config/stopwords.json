@@ -1,0 +1,12 @@
+{
+  "_comment": "Tokens ignored when clustering coin names/symbols into metas (lowercase).",
+  "stopwords": [
+    "coin", "coins", "token", "tokens", "pump", "pumpfun", "fun", "the", "and", "for", "with", "this", "that",
+    "from", "your", "you", "are", "was", "not", "but", "all", "any", "can", "has", "have", "will", "just",
+    "sol", "solana", "meme", "memes", "memecoin", "inu", "dog", "doge", "cat", "pepe", "moon", "mooning", "rocket",
+    "official", "real", "based", "chad", "degen", "dev", "test", "new", "first", "only", "one", "100x", "1000x",
+    "baby", "mini", "mega", "super", "ultra", "king", "queen", "lord", "god", "mr", "mrs", "dr", "ai", "agent",
+    "bonk", "wif", "hat", "wojak", "elon", "trump", "ceo", "labs", "protocol", "network", "finance", "swap",
+    "http", "https", "www", "com"
+  ]
+}
