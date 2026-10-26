@@ -97,7 +97,7 @@ def coin_features(conn: sqlite3.Connection, mint: str, as_of: float, params: Cur
             f" FROM trades WHERE mint=? AND buyer=? AND {ASOF}",
             (mint, coin["creator"], as_of, as_of),
         ).fetchone()
-        bought = float(cr["bought"]) + (0.0 if coin["dev_buy_sol"] is None else 0.0)
+        bought = float(cr["bought"])
         f["creator_sold_frac"] = (float(cr["sold"]) / bought) if bought > 0 else (1.0 if float(cr["sold"]) > 0 else None)
     else:
         f["creator_sold_frac"] = None
