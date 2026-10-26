@@ -1,0 +1,57 @@
+/* fart website (milestone 8): one small stylesheet of our own, no external fonts or scripts. */
+:root {
+  --bg: #f6f7f9; --fg: #1b1f24; --muted: #5b6470; --card: #ffffff; --line: #d9dee5; --accent: #1f5f8b;
+  --warn-bg: #fff4e5; --warn-fg: #7a4b00; --bad-bg: #fde8e8; --bad-fg: #8a1f1f; --ok-bg: #e6f4ea; --ok-fg: #1e5c2f;
+  --nc-bg: #f0f0f0; --nc-fg: #777;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151a; --fg: #e6e9ee; --muted: #9aa4b1; --card: #1b2028; --line: #2d3541; --accent: #7fb3d9;
+    --warn-bg: #3a2a10; --warn-fg: #f3c57a; --bad-bg: #3d1a1a; --bad-fg: #f1a0a0; --ok-bg: #16331f; --ok-fg: #9fd9ae;
+    --nc-bg: #22262c; --nc-fg: #8a8f96;
+  }
+}
+* { box-sizing: border-box; }
+html { font-size: 15px; }
+body { margin: 0; background: var(--bg); color: var(--fg); font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; line-height: 1.45; }
+header.top { background: var(--card); border-bottom: 1px solid var(--line); padding: 0.6rem 1rem; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1.2rem; }
+header.top .brand { font-weight: 700; letter-spacing: 0.02em; color: var(--accent); text-decoration: none; font-size: 1.1rem; }
+header.top nav a { color: var(--fg); text-decoration: none; padding: 0.25rem 0.5rem; border-radius: 4px; }
+header.top nav a.active, header.top nav a:hover { background: var(--bg); }
+header.top form { margin-left: auto; }
+.banner { background: var(--warn-bg); color: var(--warn-fg); padding: 0.5rem 1rem; font-weight: 600; text-align: center; border-bottom: 1px solid var(--line); }
+main { max-width: 1280px; margin: 0 auto; padding: 1rem; }
+h1 { font-size: 1.5rem; margin: 0.4rem 0 0.8rem; }
+h2 { font-size: 1.15rem; margin: 1.2rem 0 0.5rem; }
+h3 { font-size: 1rem; margin: 1rem 0 0.4rem; }
+section.card { background: var(--card); border: 1px solid var(--line); border-radius: 6px; padding: 0.8rem 1rem; margin: 0.8rem 0; overflow-x: auto; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 0.8rem; }
+.grid section.card { margin: 0; }
+table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+th, td { border-bottom: 1px solid var(--line); padding: 0.3rem 0.5rem; text-align: left; vertical-align: top; }
+th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tr.notcovered td { background: var(--nc-bg); color: var(--nc-fg); }
+tr.stale td { background: var(--warn-bg); color: var(--warn-fg); }
+tr.never td { color: var(--muted); }
+tr.winner td { background: var(--ok-bg); }
+tr.unknown td, tr.pending td { color: var(--muted); }
+tr.ok td.status { color: var(--ok-fg); font-weight: 600; }
+tr.fail td.status { color: var(--bad-fg); font-weight: 600; }
+dl.kv { display: grid; grid-template-columns: minmax(8rem, max-content) minmax(0, 1fr); gap: 0.25rem 1rem; margin: 0.4rem 0; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; }
+.muted { color: var(--muted); font-size: 0.9rem; }
+.verdict { font-size: 1.1rem; font-weight: 700; }
+.error { background: var(--bad-bg); color: var(--bad-fg); padding: 0.5rem 0.8rem; border-radius: 4px; margin: 0.6rem 0; }
+.notice { background: var(--warn-bg); color: var(--warn-fg); padding: 0.5rem 0.8rem; border-radius: 4px; margin: 0.6rem 0; }
+.features { font-size: 0.8rem; color: var(--muted); max-width: 42rem; word-break: break-word; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.9em; background: var(--bg); padding: 0 0.2em; border-radius: 3px; word-break: break-all; }
+.login { max-width: 24rem; margin: 3rem auto; }
+.login input[type=password] { width: 100%; padding: 0.5rem; font-size: 1rem; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); color: var(--fg); }
+button { padding: 0.45rem 0.9rem; font-size: 0.95rem; border: 1px solid var(--line); border-radius: 4px; background: var(--card); color: var(--fg); cursor: pointer; }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+footer { color: var(--muted); font-size: 0.85rem; padding: 1rem; text-align: center; }
+#refresh-state { font-size: 0.85rem; color: var(--muted); }
+.report h1 { font-size: 1.4rem; } .report h2 { font-size: 1.15rem; margin-top: 1.4rem; } .report h3 { font-size: 1rem; }
+.report table { font-size: 0.88rem; }

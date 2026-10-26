@@ -234,6 +234,39 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
   batches per hour; on a busy day the owner may receive fewer observation batches because of them (by design,
   per the brief). Check `fart notify outbox` for `community_preview` rows and `observe_deferred` in the tick log.
 
+## Website / Caddy (milestone 8)
+
+The website was built and tested against its own server in the sandbox (`tests/test_m8_web.py`: a real
+`ThreadingHTTPServer` on the loopback, Chromium screenshots of the pages); what the VPS's shared Caddy and systemd do
+with it is implemented from documentation. Verify at the rollout (`deploy/DEPLOY.md`, "Milestone 8: website"):
+
+- [ ] **Caddy 2.6.2 accepts the site file** (`deploy/caddy/fart.caddy`): `request_body { max_size 64KB }`, the `?`
+  (default) and `-` (delete) prefixes and the `defer` subdirective of `header`, `encode zstd gzip`, `reverse_proxy`.
+  All four are documented for Caddy 2.4 and later; `caddy validate --adapter caddyfile` is the proof before any reload.
+  If `defer` is refused, drop that line (the `?` defaults then apply before the upstream answered and the app's own
+  headers win anyway, because Caddy's `header` without `defer` runs before the proxy and the upstream's headers are
+  copied afterwards; the HSTS line and `-Server` keep working).
+- [ ] **Caddy's DynamicUser can read `/srv/fart/fart.caddy`** (`root:root 0644` in a `0755` directory) and really cannot
+  read `/opt/fart/app/deploy/caddy/fart.caddy` (`/opt/fart` is `root:fart 0750`): that is why DEPLOY.md copies the file
+  instead of importing it from the app directory. Validate as `nobody` to see what the DynamicUser sees.
+- [ ] **The admin API is on** in that Caddy (`caddy reload` needs it; `admin off` in the Caddyfile means a restart, which
+  interrupts every site on it for a few seconds).
+- [ ] **`www.kingdegen.dev` has an A record**; without one, remove it from the site address line (Caddy would keep
+  retrying the certificate for it).
+- [ ] **`X-Forwarded-For` as Caddy sends it**: `reverse_proxy` appends the client IP as the last entry by default; the
+  login guard and the log use that last entry when the peer is the loopback (`fart/web/server.py::_client_ip`). If this
+  Caddy is configured with `trusted_proxies` or a different header policy, the IPs in `journalctl -u fart-web` show it.
+- [ ] **`IPAddressDeny=any` + `IPAddressAllow=localhost`** in `fart-web.service` need systemd's cgroup BPF support
+  (Ubuntu 24.04, systemd 255: yes). If the unit logs that the setting is unsupported, the service still runs (systemd
+  ignores it with a warning); the loopback bind is the real guard.
+- [ ] **Read-only WAL behaviour under `ReadOnlyPaths`**: with the daemons running, `-wal` and `-shm` exist and the
+  read-only connection reads normally (SQLite 3.22+ opens the shm read-only when it cannot write it); with every daemon
+  stopped the files are gone and the `immutable=1` fallback reads the checkpointed file. `fart/web/data.py::open_db`
+  documents both; `journalctl -u fart-web` shows `web.request_failed` with `unable to open database file` if neither
+  path works on this SQLite build (then start `fart-ingest`, which recreates the WAL files).
+- [ ] **`/usr/share/zoneinfo`** is present on the VPS (the pages show Europe/Amsterdam times; without zoneinfo they would
+  be labelled UTC twice, like the Telegram messages).
+
 ## Milestone 7
 
 - [ ] **The planner's stop rules against real chatter**: `refuted` after three consecutive counts without growth of the
