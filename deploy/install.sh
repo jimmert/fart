@@ -98,7 +98,8 @@ chmod 0640 "$FART_ROOT/.env"
 # trims the meta_burst watchlist rows above the engine's bound of 40 (kv schema.v5.cleanup); milestone 6
 # (user_version 6) only creates the tables shadow_decisions, shadow_confirmations and engine_candidates;
 # milestone 7 (user_version 7) adds the planner table x_keys and the column x_spend.unit; milestone 8 adds no migration
-# (the website reads only); a second run changes nothing.
+# (the website reads only); milestone 10 (user_version 8) adds the indexes trades(received_at) and trades(block_time)
+# (seconds on the VPS; the time windows of the public dashboard); a second run changes nothing.
 if [ -f "$FART_ROOT/data/fart.db" ]; then
   if STATUS_JSON="$(sudo -u "$FART_USER" "$FART_ROOT/bin/fart" --quiet --json status 2>/dev/null)"; then
     log "database schema: $(printf '%s' "$STATUS_JSON" | "$VENV/bin/python" -c 'import json,sys

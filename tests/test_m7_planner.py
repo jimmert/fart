@@ -465,7 +465,7 @@ def test_status_shows_the_planner_and_plan_versus_actual(settings, conn, capsys)
 
 def test_schema_v7_is_idempotent_and_the_old_spend_rows_keep_working(settings):
     c = db.connect(settings.db_path)
-    assert db.schema_version(c) == 7 and db.migrate(c) == 7
+    assert db.schema_version(c) == db.SCHEMA_VERSION >= 7 and db.migrate(c) == db.SCHEMA_VERSION  # v7 ran (milestone 10 adds v8 on top)
     tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert "x_keys" in tables and "unit" in {r[1] for r in c.execute("PRAGMA table_info(x_spend)")}
     c.execute("INSERT INTO x_spend(day, kind, n, usd, ts) VALUES('2026-10-26', 'mega_search', 10, 0.42, 1)")  # a milestone-6 row

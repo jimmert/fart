@@ -8,6 +8,15 @@ that none of the owner vocabulary occurs in it.
 The honesty rules of the reports apply to every number: observation, never advice; an hour or a day NIET GEDEKT shows no
 counts (empty, never zero); an outcome that could not be measured stays "onbekend"; a decision inside its 24 hours is
 "nog bezig"; a bootstrap interval that does not exist yet is "te weinig data". Nothing here writes.
+
+Milestone 10 (performance, no change of design or content): every time window over `trades`, `coins` and `migrations`
+is bounded on the indexed `received_at` first (a margin of `ET_MARGIN_S` wider than the window) and the event time
+`COALESCE(block_time, received_at)` is applied to the rows in that range, so no window scans a table (schema v8 adds
+`trades(received_at)`; a test proves every window is an index range); the coverage of the last 24 hours comes from the
+`coverage` table the ingest recomputes every minute instead of being counted again per view; the observations fetch
+their coin names and outcomes in batches; and the themes card reads the engine's own ranked metas from kv
+(`engine.metas_latest`, written every tick) and computes nothing. A view that is still being computed for the first
+time is the placeholder `computing()`: the card says "wordt berekend", the JSON says `{"state": "computing"}`.
 """
 from __future__ import annotations
 
@@ -17,8 +26,9 @@ import sqlite3
 from typing import Any
 
 from ..config import Settings
+from ..engine import themes as engine_themes
 from ..notify.format import age as age_label, fmt_day, fmt_time, n as fmt_n
-from ..util import day_bounds, day_key, day_start, utc_iso
+from ..util import day_bounds, day_key, day_start, hour_bounds, hour_key, utc_iso
 from ..version import rules_fingerprint, rules_version
 from . import data
 
@@ -26,6 +36,9 @@ H24 = 86400
 WEEK_DAYS = 7
 FRESH_S = 180                 # the ingest heartbeat is "vers" up to this age
 STALE_S = 900                 # above this the page says the data is old
+ET_MARGIN_S = 60              # a row's received_at is never more than this before its event time (our clock versus the chain's)
+COVERAGE_RECENT_S = 180       # a coverage row computed within this many seconds still describes the current hour (milestone 10)
+FAST_LOOKBACK_S = 86400       # a post received longer ago than this cannot become "fast" today (the X layer refreshes a post for 2 hours)
 OUTCOME_NL = data.OUTCOME_NL
 STATUS_NL = data.STATUS_NL
 MONTHS = ["januari", "februari", "maart", "april", "mei", "juni", "juli", "augustus", "september", "oktober", "november", "december"]
@@ -35,7 +48,7 @@ PILL = {
     "fresh": "vers", "stale": "oud", "unknown": "onbekend", "not_covered": "NIET GEDEKT", "few": "te weinig data",
     "winner": "winnaar", "not_winner": "geen winnaar", "pending": "nog bezig", "none": "thema", "ok": "voldaan",
     "fail": "niet voldaan", "complete": "COMPLEET", "incomplete": "NIET COMPLEET", "go": "GO", "nogo": "NO-GO",
-    "soon": "binnenkort", "frozen": "bevroren",
+    "soon": "binnenkort", "frozen": "bevroren", "computing": "wordt berekend",
 }
 
 
@@ -94,6 +107,65 @@ def _float(v: Any) -> float | None:
 def _kv(conn: sqlite3.Connection, keys: tuple[str, ...]) -> dict[str, str]:
     marks = ",".join("?" for _ in keys)
     return {str(r["key"]): r["value"] for r in conn.execute(f"SELECT key, value FROM kv WHERE key IN ({marks})", keys)}
+
+
+# ----- milestone 10: the placeholder of a view that is being computed for the first time ------------------------------
+def computing(name: str) -> dict[str, Any]:
+    """What a request gets while the background thread has not finished a view's first computation: never a number."""
+    return {"state": "computing", "view": name, "generated_at": None, "generated_label": PILL["computing"],
+            "note": "Dit onderdeel wordt nu berekend; binnen een halve minuut staat het hier."}
+
+
+def is_computing(v: Any) -> bool:
+    return isinstance(v, dict) and v.get("state") == "computing"
+
+
+# ----- milestone 10: time windows as index ranges, coverage from the table --------------------------------------------
+ET = "COALESCE(block_time, received_at)"
+
+
+def _count_since(conn: sqlite3.Connection, table: str, t: float) -> int:
+    """Rows of `coins` or `migrations` with an event time at or after `t`: the index range on `received_at` first (a margin
+    of ET_MARGIN_S wider), the event time on the rows in that range. Never a scan."""
+    return int(conn.execute(f"SELECT COUNT(*) FROM {table} WHERE received_at >= ? AND {ET} >= ?", (t - ET_MARGIN_S, t)).fetchone()[0])
+
+
+def _newest(conn: sqlite3.Connection, sql: str, limit: int, key: str = "t") -> list[sqlite3.Row]:
+    """The `limit` newest rows by event time: three times as many newest by the indexed `received_at` (the index walks
+    them in order and stops), then sorted by the event time `key` of the row. `sql` ends with ORDER BY ... received_at
+    DESC and takes the limit as its one parameter."""
+    rows = conn.execute(sql, (3 * int(limit),)).fetchall()
+    rows.sort(key=lambda r: float(r[key]), reverse=True)
+    return rows[: int(limit)]
+
+
+def _coverage_rows(conn: sqlite3.Connection, first_hour: str, last_hour: str) -> dict[str, dict[str, Any]]:
+    """The hour rows the ingest wrote (`coverage.recompute_recent`, every minute for the current and the last three
+    hours; every hour was current once), by hour key. A row written before schema v3 has no `covered`: complete then."""
+    out = {}
+    for r in conn.execute("SELECT hour, creates_union, grads, complete, covered, computed_at FROM coverage WHERE hour >= ? AND hour <= ? ORDER BY hour",
+                          (first_hour, last_hour)):
+        covered = r["covered"] if r["covered"] is not None else r["complete"]
+        out[str(r["hour"])] = {"hour": str(r["hour"]), "creates_union": r["creates_union"], "grads": r["grads"], "complete": bool(r["complete"]),
+                               "covered": bool(covered), "computed_at": _float(r["computed_at"])}
+    return out
+
+
+def _hour_covered(conn: sqlite3.Connection, now: float) -> bool:
+    """Is the current hour covered? The ingest's own row for this hour; in the first minute of an hour, before that row
+    exists, the previous hour's row says so when it was computed a moment ago (the counting was running then and the
+    gap state carries over). No row, or an old one: not covered, honestly."""
+    cur = hour_key(now)
+    rows = _coverage_rows(conn, hour_key(now - 3600), cur)
+    if cur in rows:
+        return rows[cur]["covered"]
+    prev = rows.get(hour_key(now - 3600))
+    return bool(prev and prev["covered"] and prev["computed_at"] is not None and now - prev["computed_at"] <= COVERAGE_RECENT_S)
+
+
+def _day_covered(conn: sqlite3.Connection, now: float) -> bool:
+    rows = _coverage_rows(conn, hour_key(day_start(now)), hour_key(now))
+    return any(r["covered"] for r in rows.values()) or _hour_covered(conn, now)
 
 
 # ----- the measurement week -----------------------------------------------------------------------------------------
@@ -169,18 +241,14 @@ def status_view(conn: sqlite3.Connection | None, settings: Settings, now: float)
     out["freshness"] = fresh
     out["db_exists"] = True
     # live numbers: the last 60 minutes only count when the hour was covered (we were there to count)
-    cov_now = data.coverage_view(conn, now, hours=2)
-    current = cov_now["rows"][-1] if cov_now["rows"] else {}
-    hour_covered = bool(current.get("covered"))
-    creates_1h = None
-    if hour_covered:
-        creates_1h = int(conn.execute("SELECT COUNT(*) FROM coins WHERE COALESCE(block_time, received_at) >= ?", (now - 3600,)).fetchone()[0])
+    hour_covered = _hour_covered(conn, now)
+    creates_1h = _count_since(conn, "coins", now - 3600) if hour_covered else None
     t0 = day_start(now)
-    grads_today = int(conn.execute("SELECT COUNT(*) FROM migrations WHERE COALESCE(block_time, received_at) >= ?", (t0,)).fetchone()[0])
-    coins_today = int(conn.execute("SELECT COUNT(*) FROM coins WHERE COALESCE(block_time, received_at) >= ?", (t0,)).fetchone()[0])
+    grads_today = _count_since(conn, "migrations", t0)
+    coins_today = _count_since(conn, "coins", t0)
     obs_today = int(conn.execute("SELECT COUNT(*) FROM decisions WHERE verdict='observe' AND kind IN ('observe', 'observe_meta') AND as_of >= ?", (t0,)).fetchone()[0])
-    last_dec = _float(conn.execute("SELECT MAX(as_of) FROM decisions WHERE kind IN ('observe', 'observe_meta')").fetchone()[0])
-    day_covered = any(r["covered"] for r in data.coverage_view(conn, now, hours=_hours_into_day(now))["rows"])
+    last_dec = _last_observation_at(conn)
+    day_covered = _day_covered(conn, now)
     out["live"] = {
         "creates_last_hour": creates_1h, "creates_last_hour_label": fmt_n(creates_1h) if creates_1h is not None else "–",
         "hour_covered": hour_covered,
@@ -197,8 +265,10 @@ def status_view(conn: sqlite3.Connection | None, settings: Settings, now: float)
     return out
 
 
-def _hours_into_day(now: float) -> int:
-    return max(1, int((now - day_start(now)) // 3600) + 1)
+def _last_observation_at(conn: sqlite3.Connection) -> float | None:
+    """The newest observation: the `decisions_as_of` index walked backwards, stopping at the first observation."""
+    r = conn.execute("SELECT as_of FROM decisions WHERE kind IN ('observe', 'observe_meta') ORDER BY as_of DESC LIMIT 1").fetchone()
+    return None if r is None else _float(r[0])
 
 
 def headline(st: dict[str, Any]) -> str:
@@ -240,19 +310,31 @@ def coverage_view(conn: sqlite3.Connection | None, now: float, hours: int = 24) 
                                                                    "creates_covered": None, "grads_covered": None}})
         out["sentence"] = "Er zijn nog geen gegevens over de dekking."
         return out
-    inner = data.coverage_view(conn, now, hours)
+    # milestone 10: the hour rows the ingest wrote (recomputed every minute while the hour was current and for three
+    # hours after), not counted again per view; an hour without a row was never counted: NIET GEDEKT, no number
+    keys = [hour_key(now - i * 3600) for i in range(int(hours) - 1, -1, -1)]
+    table = _coverage_rows(conn, keys[0], keys[-1])
     rows = []
-    for r in inner["rows"]:
-        rows.append({"hour": r["hour"], "hour_label": r["hour_label"], "clock": clock_label(_hour_start(r["hour"])), "covered": r["covered"],
-                     "complete": r["complete"], "status": "complete" if r["complete"] else ("covered" if r["covered"] else "not_covered"),
-                     "status_label": "compleet" if r["complete"] else ("gedekt" if r["covered"] else PILL["not_covered"]),
-                     "creates": r["creates_union"], "creates_label": fmt_n(r["creates_union"]) if r["creates_union"] is not None else "–",
-                     "grads": r["grads"], "grads_label": fmt_n(r["grads"]) if r["grads"] is not None else "–"})
-    s = inner["summary"]
+    covered = complete = creates = grads = 0
+    for i, hour in enumerate(keys):
+        r = table.get(hour)
+        is_cov = bool(r and r["covered"]) or (i == len(keys) - 1 and _hour_covered(conn, now))
+        is_complete = bool(r and r["complete"]) and is_cov
+        c = int(r["creates_union"] or 0) if (r and is_cov) else None
+        g = int(r["grads"] or 0) if (r and is_cov) else None
+        if is_cov:
+            covered += 1
+            complete += 1 if is_complete else 0
+            creates += c or 0
+            grads += g or 0
+        rows.append({"hour": hour, "hour_label": fmt_time(_hour_start(hour)), "clock": clock_label(_hour_start(hour)), "covered": is_cov,
+                     "complete": is_complete, "status": "complete" if is_complete else ("covered" if is_cov else "not_covered"),
+                     "status_label": "compleet" if is_complete else ("gedekt" if is_cov else PILL["not_covered"]),
+                     "creates": c, "creates_label": fmt_n(c) if c is not None else "–", "grads": g, "grads_label": fmt_n(g) if g is not None else "–"})
     out["rows"] = rows
-    out["summary"] = {"hours_covered": s["hours_covered"], "hours_complete": s["hours_complete"], "hours_not_covered": s["hours_not_covered"],
-                      "creates_covered": s["creates_union_covered"], "grads_covered": s["grads_covered"]}
-    nc = s["hours_not_covered"]
+    out["summary"] = {"hours_covered": covered, "hours_complete": complete, "hours_not_covered": len(rows) - covered,
+                      "creates_covered": creates, "grads_covered": grads}
+    nc = out["summary"]["hours_not_covered"]
     if nc == 0:
         out["sentence"] = f"Alle {len(rows)} uren waren gedekt: elke telling van de laatste 24 uur is compleet."
     else:
@@ -262,8 +344,6 @@ def coverage_view(conn: sqlite3.Connection | None, now: float, hours: int = 24) 
 
 
 def _hour_start(hour: str) -> float:
-    from ..util import hour_bounds
-
     return hour_bounds(hour)[0]
 
 
@@ -290,10 +370,14 @@ def observations_view(conn: sqlite3.Connection | None, settings: Settings, now: 
                            (t0, t1, lim))
     else:
         cur = conn.execute("SELECT * FROM decisions WHERE kind IN ('observe', 'observe_meta') ORDER BY as_of DESC, id DESC LIMIT ?", (lim,))
+    decs = cur.fetchall()
+    # milestone 10: the coin names and the outcomes of all rows in a few batched queries instead of two per row
+    names = _coin_names(conn, [str(d["mint"]) for d in decs if d["mint"]])
+    outcomes = _decision_outcomes(conn, [int(d["id"]) for d in decs if d["kind"] == "observe" and d["mint"]], now, h24, mv)
     rows = []
     counts: dict[str, int] = {}
-    for d in cur:
-        row = observation_row(conn, d, now, h24, mv, ecfg)
+    for d in decs:
+        row = observation_row(conn, d, now, h24, mv, ecfg, names=names, outcomes=outcomes)
         counts[row["outcome"]] = counts.get(row["outcome"], 0) + 1
         rows.append(row)
     out["rows"] = rows
@@ -310,7 +394,37 @@ def outcome_definition(settings: Settings) -> str:
             "meting ontbreekt of niets kon vaststellen; nog bezig zolang de 24 uur niet om zijn. Een thema-observatie heeft geen eigen uitkomst.")
 
 
-def observation_row(conn: sqlite3.Connection, d: sqlite3.Row, now: float, h24: int, mv: str, ecfg: dict[str, Any]) -> dict[str, Any]:
+def _coin_names(conn: sqlite3.Connection, mints: list[str]) -> dict[str, tuple[str | None, str | None]]:
+    out: dict[str, tuple[str | None, str | None]] = {}
+    uniq = sorted(set(mints))
+    for i in range(0, len(uniq), 400):
+        chunk = uniq[i:i + 400]
+        marks = ",".join("?" for _ in chunk)
+        for r in conn.execute(f"SELECT mint, name, symbol FROM coins WHERE mint IN ({marks})", chunk):
+            out[str(r["mint"])] = (r["name"], r["symbol"])
+    return out
+
+
+def _decision_outcomes(conn: sqlite3.Connection, ids: list[int], now: float, h24: int, mv: str) -> dict[int, dict[str, Any]]:
+    """The newest 24 h outcome row per decision (`outcomes_decision` index), as `data.decision_outcome` reads it per row."""
+    latest: dict[int, tuple[float, Any, Any]] = {}
+    for i in range(0, len(ids), 400):
+        chunk = ids[i:i + 400]
+        marks = ",".join("?" for _ in chunk)
+        for r in conn.execute(f"SELECT decision_id, measured_at, hit_100k, peak_mcap_usd FROM outcomes WHERE subject='decision' AND decision_id IN ({marks})"
+                              f" AND horizon_s=? AND method_version=?", (*chunk, int(h24), mv)):
+            did = int(r["decision_id"])
+            if did not in latest or float(r["measured_at"]) > latest[did][0]:
+                latest[did] = (float(r["measured_at"]), r["hit_100k"], r["peak_mcap_usd"])
+    out: dict[int, dict[str, Any]] = {}
+    for did, (_, hit, peak) in latest.items():
+        out[did] = {"status": "unknown" if hit is None else ("winner" if hit else "not_winner"), "peak_mcap_usd": peak}
+    return out
+
+
+def observation_row(conn: sqlite3.Connection, d: sqlite3.Row, now: float, h24: int, mv: str, ecfg: dict[str, Any],
+                    names: dict[str, tuple[str | None, str | None]] | None = None, outcomes: dict[int, dict[str, Any]] | None = None) -> dict[str, Any]:
+    """One observation; with `names` and `outcomes` (the batches of `observations_view`) no query runs per row."""
     try:
         f = json.loads(d["features_json"]) if d["features_json"] else {}
     except json.JSONDecodeError:
@@ -329,10 +443,19 @@ def observation_row(conn: sqlite3.Connection, d: sqlite3.Row, now: float, h24: i
                     "outcome_short": PILL["none"], "peak_mcap_usd": None, "peak_label": "–"})
         return row
     mint = d["mint"] or f.get("mint") or ""
-    c = conn.execute("SELECT name, symbol FROM coins WHERE mint=?", (mint,)).fetchone() if mint else None
-    name = (c["name"] if c is not None else None) or f.get("name") or None
-    symbol = (c["symbol"] if c is not None else None) or f.get("symbol") or None
-    outcome = data.decision_outcome(conn, d, now, h24, mv) if mint else {"status": "unknown"}
+    if names is not None:
+        c = names.get(str(mint)) if mint else None
+    else:
+        r = conn.execute("SELECT name, symbol FROM coins WHERE mint=?", (mint,)).fetchone() if mint else None
+        c = None if r is None else (r["name"], r["symbol"])
+    name = (c[0] if c is not None else None) or f.get("name") or None
+    symbol = (c[1] if c is not None else None) or f.get("symbol") or None
+    if not mint:
+        outcome: dict[str, Any] = {"status": "unknown"}
+    elif outcomes is not None:
+        outcome = outcomes.get(int(d["id"])) or {"status": "pending" if as_of + h24 > now else "unknown"}
+    else:
+        outcome = data.decision_outcome(conn, d, now, h24, mv)
     title = (name or "naam onbekend") + (f" (${symbol})" if symbol else "")
     row.update({"subject": mint, "title": title, "mint": mint, "mint_short": short_mint(mint), "name": name, "symbol": symbol,
                 "why": coin_why(f), "facts": coin_facts(f), "outcome": outcome["status"], "outcome_label": OUTCOME_NL.get(outcome["status"], outcome["status"]),
@@ -433,6 +556,13 @@ def report_list(settings: Settings) -> list[dict[str, Any]]:
             row["key_points"] = {"status": "unknown", "status_label": PILL["unknown"], "items": []}
         out.append(row)
     return out
+
+
+def report_exists(settings: Settings, name: str) -> bool:
+    """Does a report of this name exist on disk? A cheap check (no parse) for a page the store has not computed yet."""
+    if not data.REPORT_NAME.match(name + ".json"):
+        return False
+    return (data.report_dir(settings) / f"{name}.json").is_file()
 
 
 def _load_json(settings: Settings, name: str) -> dict[str, Any] | None:
@@ -807,7 +937,6 @@ HOT_LIMIT = 10
 NEW_LIMIT = 12
 THEME_LIMIT = 8
 GRAD_LIMIT = 10
-ET = "COALESCE(block_time, received_at)"
 
 
 def sol_label(x: Any, decimals: int = 1) -> str:
@@ -923,10 +1052,9 @@ def live_view(conn: sqlite3.Connection | None, settings: Settings, now: float) -
     out["db_exists"] = True
     out["freshness"] = freshness(conn, now)
     out["sol_usd"] = sol_usd_now(conn, now)
-    cov = data.coverage_view(conn, now, hours=2)
-    hour_covered = bool(cov["rows"] and cov["rows"][-1]["covered"])
-    c10 = int(conn.execute(f"SELECT COUNT(*) FROM coins WHERE {ET} >= ?", (now - 600,)).fetchone()[0])
-    c60 = int(conn.execute(f"SELECT COUNT(*) FROM coins WHERE {ET} >= ?", (now - 3600,)).fetchone()[0])
+    hour_covered = _hour_covered(conn, now)
+    c10 = _count_since(conn, "coins", now - 600)
+    c60 = _count_since(conn, "coins", now - 3600)
     out["creates"] = {"last_10m": c10 if hour_covered else None, "per_min": round(c10 / 10.0, 1) if hour_covered else None,
                       "per_min_label": fmt_n(c10 / 10.0, 1) if hour_covered else "–", "last_hour": c60 if hour_covered else None,
                       "last_hour_label": fmt_n(c60) if hour_covered else "–", "hour_covered": hour_covered}
@@ -945,13 +1073,13 @@ def live_view(conn: sqlite3.Connection | None, settings: Settings, now: float) -
     out["watched"] = {"active": len(mints), "buyers_5m": buyers, "buyers_label": fmt_n(buyers), "net_sol_5m": round(net, 2), "net_sol_label": sol_label(net, 1),
                       "trades_5m": trades, "buys_5m": buys, "sells_5m": sells, "with_trades_5m": with_trades}
     t0 = day_start(now)
-    day_covered = any(r["covered"] for r in data.coverage_view(conn, now, hours=_hours_into_day(now))["rows"])
-    g60 = int(conn.execute(f"SELECT COUNT(*) FROM migrations WHERE {ET} >= ?", (now - 3600,)).fetchone()[0])
-    gday = int(conn.execute(f"SELECT COUNT(*) FROM migrations WHERE {ET} >= ?", (t0,)).fetchone()[0])
+    day_covered = _day_covered(conn, now)
+    g60 = _count_since(conn, "migrations", now - 3600)
+    gday = _count_since(conn, "migrations", t0)
     out["graduations"] = {"last_hour": g60 if hour_covered else None, "last_hour_label": fmt_n(g60) if hour_covered else "–",
                           "today": gday if day_covered else None, "today_label": fmt_n(gday) if day_covered else "–", "day_covered": day_covered}
     obs_today = int(conn.execute("SELECT COUNT(*) FROM decisions WHERE kind IN ('observe', 'observe_meta') AND as_of >= ?", (t0,)).fetchone()[0])
-    last_dec = _float(conn.execute("SELECT MAX(as_of) FROM decisions WHERE kind IN ('observe', 'observe_meta')").fetchone()[0])
+    last_dec = _last_observation_at(conn)
     out["observations"] = {"today": obs_today, "today_label": fmt_n(obs_today), "last_at": utc_iso(last_dec), "last_label": fmt_time(last_dec) if last_dec else "nog geen"}
     out["headline"] = live_headline(out)
     return out
@@ -1009,7 +1137,8 @@ def hot_coins_view(conn: sqlite3.Connection | None, settings: Settings, now: flo
     for r in top:
         mint = str(r["mint"])
         c = conn.execute(f"SELECT name, symbol, creator, {ET} AS t, dev_buy_sol FROM coins WHERE mint=?", (mint,)).fetchone()
-        last = conn.execute(f"SELECT virtual_sol, virtual_token FROM trades WHERE mint=? AND virtual_sol IS NOT NULL ORDER BY {ET} DESC, received_at DESC LIMIT 1", (mint,)).fetchone()
+        last = conn.execute(f"SELECT virtual_sol, virtual_token FROM trades WHERE mint=? AND received_at >= ? AND virtual_sol IS NOT NULL ORDER BY {ET} DESC, received_at DESC LIMIT 1",
+                            (mint, now - LIVE_LOOK_S - ET_MARGIN_S)).fetchone()
         big = conn.execute(f"SELECT buyer, SUM(sol) AS s FROM trades WHERE mint=? AND is_buy=1 AND received_at >= ? AND {ET} >= ? GROUP BY buyer ORDER BY s DESC LIMIT 1",
                            (mint, now - LIVE_LOOK_S - 60, now - LIVE_LOOK_S)).fetchone()
         net = float(r["buy_5m"]) - float(r["sell_5m"])
@@ -1048,14 +1177,13 @@ def new_coins_view(conn: sqlite3.Connection | None, settings: Settings, now: flo
     if conn is None:
         out["note"] = "Er zijn nog geen gegevens."
         return out
-    cov = data.coverage_view(conn, now, hours=2)
-    hour_covered = bool(cov["rows"] and cov["rows"][-1]["covered"])
-    c10 = int(conn.execute(f"SELECT COUNT(*) FROM coins WHERE {ET} >= ?", (now - 600,)).fetchone()[0])
+    hour_covered = _hour_covered(conn, now)
+    c10 = _count_since(conn, "coins", now - 600)
     out["rate"] = {"last_10m": c10 if hour_covered else None, "per_min": round(c10 / 10.0, 1) if hour_covered else None, "per_min_label": fmt_n(c10 / 10.0, 1) if hour_covered else "–",
                    "hour_covered": hour_covered}
-    out["today"] = int(conn.execute(f"SELECT COUNT(*) FROM coins WHERE {ET} >= ?", (day_start(now),)).fetchone()[0])
+    out["today"] = _count_since(conn, "coins", day_start(now))
     active = _active_watchlist(conn)
-    rows = conn.execute(f"SELECT mint, name, symbol, creator, {ET} AS t, dev_buy_sol, initial_mcap_sol FROM coins ORDER BY {ET} DESC LIMIT ?", (int(limit),)).fetchall()
+    rows = _newest(conn, f"SELECT mint, name, symbol, creator, {ET} AS t, dev_buy_sol, initial_mcap_sol FROM coins ORDER BY received_at DESC LIMIT ?", int(limit))
     observed = _observed_mints(conn, [str(r["mint"]) for r in rows])
     result = []
     for r in rows:
@@ -1078,52 +1206,48 @@ def new_coins_view(conn: sqlite3.Connection | None, settings: Settings, now: flo
 
 def themes_view(conn: sqlite3.Connection | None, settings: Settings, now: float, limit: int = THEME_LIMIT) -> dict[str, Any]:
     """The words that suddenly appear in many new coin names, with the money and the wallets behind them: the engine's
-    own clustering and ranking (read-only, the same functions, the same thresholds) over the last three hours."""
-    from ..engine import decide, features
-    from ..engine.meta import cluster, load_stopwords
-
+    own clustering and ranking, read from the snapshot the engine writes every tick (kv `engine.metas_latest`,
+    milestone 10). Nothing is computed here; a snapshot older than `engine_themes.MAX_AGE_S` is not shown as current."""
     mcfg = settings.config("engine").get("meta") or {}
     window_s = float(mcfg.get("window_s", 10800))
     out: dict[str, Any] = {**data.stamp(now), "rows": [], "window_hours": round(window_s / 3600), "min_coins": int(mcfg.get("min_coins", 3)),
+                           "state": "missing", "computed_at": None, "computed_label": "nog niet", "age_s": None, "age_label": "–", "bursting": 0,
                            "definition": (f"Een thema is een woord dat in de laatste {round(window_s / 3600)} uur in de namen van minstens {fmt_n(mcfg.get('min_coins', 3))} nieuwe munten "
                                           f"van verschillende makers opduikt. Opkomend = {fmt_n(mcfg.get('burst_ratio', 3), 1)}× zo vaak als de eigen basislijn van dat woord, of helemaal nieuw.")}
     if conn is None:
         out["note"] = "Er zijn nog geen gegevens."
         return out
-    stopwords = load_stopwords(settings.config("stopwords"))
-    recent = features.recent_coins(conn, now, window_s)
-    clusters = cluster(recent, stopwords, int(mcfg.get("min_token_len", 4)))
-    metas = []
-    for term, members in clusters.items():
-        if len(members) < int(mcfg.get("min_coins", 3)):
-            continue
-        metas.append(features.meta_features(conn, term, members, now, mcfg, stopwords))
-    metas = features.rank_metas(metas)[: int(mcfg.get("max_terms", 50))]
-    out["clusters_total"] = len(metas)
-    out["coins_in_window"] = len(recent)
+    snap = engine_themes.read(conn)
+    if snap is None:
+        out["note"] = "Thema’s worden nu niet berekend: de engine heeft nog geen thema’s opgeslagen."
+        return out
+    as_of = float(snap["as_of"])
+    age = max(0.0, now - as_of)
+    out.update({"computed_at": utc_iso(as_of), "computed_label": fmt_time(as_of), "age_s": round(age), "age_label": age_label(age),
+                "clusters_total": int(snap.get("clusters_total") or 0), "coins_in_window": int(snap.get("coins_in_window") or 0)})
+    if age > engine_themes.MAX_AGE_S or as_of > now + ET_MARGIN_S:
+        # never an old figure without saying so: no rows, the age in the note
+        out["state"] = "stale"
+        out["note"] = f"Thema’s worden nu niet berekend: de laatste berekening van de engine is {age_label(age)} oud."
+        return out
+    out["state"] = "fresh"
+    metas = [m for m in snap["metas"] if isinstance(m, dict) and m.get("term")]
     if not metas:
         out["note"] = f"Geen woord komt in de laatste {round(window_s / 3600)} uur in {fmt_n(mcfg.get('min_coins', 3))} of meer nieuwe muntnamen voor."
         return out
-    t0 = day_start(now)
-    observed_today = {str(r[0]) for r in conn.execute("SELECT DISTINCT term FROM decisions WHERE kind='observe_meta' AND as_of >= ?", (t0,))}
-    raw_sets = conn.execute("SELECT value FROM kv WHERE key='engine.meta_burst_sets'").fetchone()
-    try:
-        watched_terms = set(json.loads(raw_sets[0]).keys()) if raw_sets is not None else set()
-    except (ValueError, AttributeError):
-        watched_terms = set()
     rows = []
     for m in metas[: int(limit)]:
-        bursting = decide.is_bursting(m, mcfg)
-        names = []
-        for c in sorted(clusters[m["term"]], key=lambda x: float(x.get("t") or 0.0), reverse=True)[:3]:
-            names.append((c.get("name") or "?") + (f" (${c['symbol']})" if c.get("symbol") else ""))
-        rows.append({"term": m["term"], "n_coins": m["n_coins"], "distinct_creators": m["distinct_creators"], "graduations": m["graduations"],
-                     "sol_inflow": m["sol_inflow"], "sol_inflow_label": sol_label(m["sol_inflow"], 1), "net_sol": m["net_sol"], "unique_buyers": m["unique_buyers"],
-                     "mints_with_trades": m["mints_with_trades"], "burst_ratio": m["burst_ratio"], "burst_is_new": bool(m["burst_ratio_is_inf"]),
-                     "burst_label": "nieuw woord" if m["burst_ratio_is_inf"] else (f"{fmt_n(m['burst_ratio'], 1)}×" if m["burst_ratio"] is not None else "–"),
-                     "bursting": bool(bursting), "status": "bursting" if bursting else "quiet", "status_label": "opkomend" if bursting else "rustig",
-                     "observed_today": m["term"] in observed_today, "watched": m["term"] in watched_terms,
-                     "first_seen_label": fmt_time(m["first_seen"]) if m.get("first_seen") else "–", "examples": names})
+        bursting = bool(m.get("bursting"))
+        is_inf = bool(m.get("burst_ratio_is_inf"))
+        ratio = _float(m.get("burst_ratio"))
+        rows.append({"term": str(m["term"]), "n_coins": m.get("n_coins"), "distinct_creators": m.get("distinct_creators"), "graduations": m.get("graduations"),
+                     "sol_inflow": m.get("sol_inflow"), "sol_inflow_label": sol_label(m.get("sol_inflow"), 1), "net_sol": m.get("net_sol"), "unique_buyers": m.get("unique_buyers"),
+                     "mints_with_trades": m.get("mints_with_trades"), "burst_ratio": ratio, "burst_is_new": is_inf,
+                     "burst_label": "nieuw woord" if is_inf else (f"{fmt_n(ratio, 1)}×" if ratio is not None else "–"),
+                     "bursting": bursting, "status": "bursting" if bursting else "quiet", "status_label": "opkomend" if bursting else "rustig",
+                     "observed_today": bool(m.get("observed_today")), "watched": bool(m.get("watched")),
+                     "first_seen_label": fmt_time(_float(m.get("first_seen"))) if m.get("first_seen") is not None else "–",
+                     "examples": [str(x) for x in (m.get("examples") or [])][:engine_themes.EXAMPLES]})
     out["rows"] = rows
     out["bursting"] = sum(1 for r in rows if r["bursting"])
     return out
@@ -1160,13 +1284,12 @@ def graduations_view(conn: sqlite3.Connection | None, settings: Settings, now: f
     mv = str(cfg["method_version"])
     h24 = max(int(h) for h in cfg["horizons_s"])
     max_gap = float((cfg.get("tracker") or {}).get("max_sample_gap_s", 600))
-    cov = data.coverage_view(conn, now, hours=2)
-    hour_covered = bool(cov["rows"] and cov["rows"][-1]["covered"])
-    g60 = int(conn.execute(f"SELECT COUNT(*) FROM migrations WHERE {ET} >= ?", (now - 3600,)).fetchone()[0])
+    hour_covered = _hour_covered(conn, now)
+    g60 = _count_since(conn, "migrations", now - 3600)
     out["last_hour"] = g60 if hour_covered else None
-    out["today"] = int(conn.execute(f"SELECT COUNT(*) FROM migrations WHERE {ET} >= ?", (day_start(now),)).fetchone()[0])
-    rows = conn.execute(f"SELECT m.mint, {ET.replace('block_time', 'm.block_time').replace('received_at', 'm.received_at')} AS t, c.name, c.symbol,"
-                        f" COALESCE(c.block_time, c.received_at) AS created FROM migrations m LEFT JOIN coins c ON c.mint = m.mint ORDER BY t DESC LIMIT ?", (int(limit),)).fetchall()
+    out["today"] = _count_since(conn, "migrations", day_start(now))
+    rows = _newest(conn, f"SELECT m.mint, COALESCE(m.block_time, m.received_at) AS t, c.name, c.symbol, COALESCE(c.block_time, c.received_at) AS created"
+                         f" FROM migrations m LEFT JOIN coins c ON c.mint = m.mint ORDER BY m.received_at DESC LIMIT ?", int(limit))
     observed = _observed_mints(conn, [str(r["mint"]) for r in rows])
     theme_obs = {}
     result = []
@@ -1232,7 +1355,8 @@ def social_view(conn: sqlite3.Connection | None, settings: Settings, now: float)
         out["counts"]["confirmed_today"] = int(conn.execute("SELECT COUNT(*) FROM x_keys WHERE confirmed_at >= ?", (t0,)).fetchone()[0])
     if data.table_exists(conn, "social_posts"):
         out["counts"]["posts_today"] = int(conn.execute("SELECT COUNT(*) FROM social_posts WHERE received_at >= ?", (t0,)).fetchone()[0])
-        out["counts"]["fast_today"] = int(conn.execute("SELECT COUNT(*) FROM social_posts WHERE fast=1 AND COALESCE(fast_at, received_at) >= ?", (t0,)).fetchone()[0])
+        out["counts"]["fast_today"] = int(conn.execute("SELECT COUNT(*) FROM social_posts WHERE received_at >= ? AND fast=1 AND COALESCE(fast_at, received_at) >= ?",
+                                                       (t0 - FAST_LOOKBACK_S, t0)).fetchone()[0])
         posts = conn.execute("SELECT author, text, created_at, received_at, likes, quotes, likes_per_min, quotes_per_min, kind, fast_at FROM social_posts WHERE fast=1"
                              " ORDER BY COALESCE(fast_at, received_at) DESC LIMIT 5").fetchall()
         out["fast_posts"] = [{"author": r["author"], "text": (r["text"] or "")[:160], "created_label": fmt_time(r["created_at"] if r["created_at"] is not None else r["received_at"]),

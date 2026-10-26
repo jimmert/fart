@@ -62,6 +62,7 @@ def client(live):
     live["app"].guard = auth.LoginGuard(live["app"].clock)
     live["app"].limiter = server.RateLimiter()      # every test starts with a fresh window
     live["clock"][0] = NOW
+    live["app"].refresh_views()   # milestone 10: the public views are precomputed (by a thread in production; here by the test)
     return Client(live["port"])
 
 
@@ -278,12 +279,16 @@ def test_svg_charts_with_empty_and_full_data():
 
 
 # ----- the public JSON ---------------------------------------------------------------------------------------------------
-def test_public_json_carries_no_owner_fields(client, world):
+def test_public_json_carries_no_owner_fields(client, world, live):
     root = str(world["settings"].root)
     token = client.session()
     owner = json.loads(client.req("GET", "/api/status", {"Cookie": token})[2])
     owner_x = json.loads(client.req("GET", "/api/x", {"Cookie": token})[2])
     sensitive_values = {str(v) for k, v in _flatten(owner["budgets"])} | {str(v) for k, v in _flatten(owner_x["budget"])} | {world["hash"], world["secret"], PASSWORD, root}
+    # a day filter is an on-demand view (milestone 10): the first request says "computing" at once and asks the thread for it
+    st, h, body = client.req("GET", f"/api/public/observations?day={world['yesterday']}")
+    assert st == 200 and json.loads(body)["state"] == "computing" and _headers(h)["cache-control"] == "public, max-age=2"
+    assert f"observations:{world['yesterday']}" in live["app"].refresh_views()
     for path in PUBLIC_API + (f"/api/public/reports/{world['yesterday']}", f"/api/public/reports/week-{world['yesterday']}", f"/api/public/observations?day={world['yesterday']}"):
         st, h, body = client.req("GET", path)
         hd = _headers(h)
@@ -329,30 +334,34 @@ def test_public_json_carries_no_owner_fields(client, world):
 
 
 # ----- cache, ETag and the rate limit -------------------------------------------------------------------------------------
-def test_cache_shares_queries_for_thirty_seconds(client, live):
+def test_views_are_precomputed_and_a_request_never_computes(client, live):
+    """Milestone 10: the store computes the views on its schedule (15 s live, 30 s the rest); a request reads the last
+    value and never triggers a computation; a view that was never computed says so instead of waiting."""
     app = live["app"]
-    app.cache.clear()
-    before = app.cache.computes
+    store = app.store
+    before = store.computes
     st, h, body = client.req("GET", "/api/public/coverage")
     first = json.loads(body)["generated_at"]
-    assert app.cache.computes == before + 1
     for _ in range(5):
         st, h, body2 = client.req("GET", "/api/public/coverage")
         assert json.loads(body2)["generated_at"] == first
-    client.req("GET", "/")          # the dashboard reads the same cached coverage view and computes the rest once
-    n_dash = len(server.App.DASHBOARD_VIEWS)
-    assert app.cache.computes == before + n_dash and app.cache.hits >= 6
     client.req("GET", "/")
-    assert app.cache.computes == before + n_dash                      # everything served from the cache
+    assert store.computes == before                                  # requests computed nothing at all
+    assert app.refresh_views() == []                                 # nothing is due at NOW: everything was computed at NOW
     live["clock"][0] = NOW + 16
     client.req("GET", "/")
-    assert app.cache.computes == before + n_dash + len(server.App.LIVE_VIEWS)   # the live views expire after 15 s, the rest after 30 s
+    assert store.computes == before                                  # a request after the TTL still computes nothing: the thread does
+    done = app.refresh_views()
+    assert set(done) == set(server.App.LIVE_VIEWS)                   # the live views were due after 15 s, the rest after 30 s
+    assert store.computes == before + len(server.App.LIVE_VIEWS)
     live["clock"][0] = NOW + 29
-    client.req("GET", "/api/public/coverage")
-    assert app.cache.computes == before + n_dash + len(server.App.LIVE_VIEWS)
+    assert app.refresh_views() == []
     live["clock"][0] = NOW + 31
+    done = app.refresh_views()
+    assert set(done) >= set(server.App.LIVE_VIEWS) | set(server.App.REST_VIEWS) and "report:week-" + live["world"]["yesterday"] in done   # the report pages ride along
+    assert store.computes - before >= 2 * len(server.App.LIVE_VIEWS) + len(server.App.REST_VIEWS) + 3
     st, h, body3 = client.req("GET", "/api/public/coverage")
-    assert app.cache.computes == before + n_dash + len(server.App.LIVE_VIEWS) + 1 and json.loads(body3)["generated_at"] != first
+    assert json.loads(body3)["generated_at"] != first
     # a matching ETag is a 304; the owner's answers are never cacheable by a shared cache
     st, h3, body4 = client.req("GET", "/api/public/coverage", {"If-None-Match": _headers(h)["etag"]})
     assert st == 304 and body4 == b""
@@ -362,23 +371,50 @@ def test_cache_shares_queries_for_thirty_seconds(client, live):
     assert st == 200 and _headers(h)["cache-control"] == "no-store" and "etag" not in _headers(h)
     st, h, body = client.req("GET", "/", {"Cookie": token})
     assert st == 200 and _headers(h)["cache-control"] == "no-store" and "Uitloggen" in body.decode()
-    # the cache itself: one computation under concurrency, eviction when full, a clock that moved back, a per-key TTL
-    c = server.Cache(ttl_s=30, clock=lambda: 1000.0, max_items=3)
+    # the store itself: a never-computed key is None, a request for an on-demand key is remembered, the clock moving back is stale
     n = {"calls": 0}
 
-    def compute():
+    def compute(key, conn):
         n["calls"] += 1
-        return n["calls"]
+        return {"key": key, "n": n["calls"]}
 
-    assert c.get("a", compute) == 1 and c.get("a", compute) == 1 and n["calls"] == 1
-    for k in ("b", "c", "d"):
-        c.get(k, compute)
-    assert "a" not in c._items and len(c._items) == 3
-    c2 = server.Cache(ttl_s=30, clock=lambda: 2000.0)
-    c2._items["x"] = (2500.0, "future")
-    assert c2.get("x", lambda: "recomputed") == "recomputed"   # an entry from the future is stale
-    c2._items["y"] = (1990.0, "old")
-    assert c2.get("y", lambda: "fresh", ttl_s=5) == "fresh" and c2.get("y", lambda: "again", ttl_s=5) == "fresh"
+    clock = [1000.0]
+    st_ = server.ViewStore(compute, lambda: [("a", 15.0), ("b", 30.0)], clock=lambda: clock[0], max_items=2)
+    assert st_.get("a") is None and st_.misses == 1
+    assert st_.refresh() == ["a", "b"] and st_.get("a").value == {"key": "a", "n": 1} and st_.hits == 1
+    assert st_.refresh() == [] and n["calls"] == 2
+    clock[0] = 1015.0
+    assert st_.refresh() == ["a"] and n["calls"] == 3
+    clock[0] = 1030.0
+    assert set(st_.refresh()) == {"a", "b"}
+    assert st_.request("obs:x") is None and st_.refresh() == ["obs:x"] and st_.get("obs:x").value["key"] == "obs:x"
+    for k in ("obs:y", "obs:z"):
+        st_.request(k)
+    st_.refresh()
+    assert st_.get("obs:x") is None and len(st_._wanted) == 2            # bounded: the oldest on-demand key went
+    clock[0] = 900.0                                                      # the clock moved back: every entry is stale
+    assert set(st_.refresh()) >= {"a", "b"}
+    rows = {r["view"]: r for r in st_.stats()}
+    assert rows["a"]["state"] == "computed" and rows["a"]["seconds"] >= 0 and rows["a"]["errors"] == 0
+    # a failing view keeps its previous value, counts the error and is retried when due again; a slow one is logged
+    calls = {"n": 0}
+
+    def flaky(key, conn):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("boom")
+        return calls["n"]
+
+    clock2 = [0.0]
+    st2 = server.ViewStore(flaky, lambda: [("v", 10.0)], clock=lambda: clock2[0])
+    st2.refresh()
+    clock2[0] = 10.0
+    st2.refresh()
+    e = st2.get("v")
+    assert e.value == 1 and e.errors == 1 and e.ok is False and "RuntimeError: boom" in e.last_error and st2.failures == 1
+    assert st2.refresh() == []                                            # not retried before its TTL
+    clock2[0] = 20.0
+    assert st2.refresh() == ["v"] and st2.get("v").value == 3 and st2.get("v").ok is True and st2.get("v").errors == 1
 
 
 def test_rate_limit_per_ip_on_public_routes(client, live):
@@ -536,6 +572,7 @@ def test_public_views_without_a_database(tmp_path):
     assert public.reports_view(s, NOW)["rows"] == [] and public.week_view(s, NOW)["found"] is False and len(public.week_view(s, NOW)["criteria"]) == 6
     assert public.day_report_view(s, "2026-10-25", NOW) is None and public.week_report_view(s, "week-2026-10-25", NOW) is None
     app = server.App(s, clock=lambda: NOW)
+    app.refresh_views()
     for path in PUBLIC_PAGES + PUBLIC_API:
         r = app.handle(server.Request("GET", path, {}, {}, b"", "127.0.0.1"))
         assert r.status == 200, path

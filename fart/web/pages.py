@@ -8,6 +8,9 @@ anything; every value from the chain or from a report is HTML-escaped.
 
 Honesty on every card: a key figure, one line in plain words about what it means, a status pill (vers, oud, NIET
 GEDEKT, onbekend, te weinig data, ...), and the technical words linked to the glossary on /methode.
+
+Milestone 10: a view the background thread has not computed yet arrives as the placeholder `public.computing()`; every
+card and page renders it as the same card with the pill "wordt berekend" and one sentence, nothing else changes.
 """
 from __future__ import annotations
 
@@ -139,6 +142,24 @@ def empty_state(text: str) -> str:
     return f'<p class="empty-state">{esc(text)}</p>'
 
 
+def is_computing(v: Any) -> bool:
+    return isinstance(v, dict) and v.get("state") == "computing"
+
+
+COMPUTING_TEXT = "Dit onderdeel wordt nu berekend; binnen een halve minuut staat het hier. Tot die tijd staat er geen cijfer."
+
+
+def computing_card(title: str, live: str | None = None, foot: str = "", note: str | None = None, cls: str = "") -> str:
+    """The card of a view that is still being computed: the same title and region, the pill, one sentence, no number."""
+    return card(title, explain(esc(COMPUTING_TEXT)) + empty_state(note or "wordt berekend …"), pill_html=pill("computing"), live=live, foot=foot, cls=cls)
+
+
+def computing_page(title: str, name: str = "") -> str:
+    head = (f'<section class="hero"><p class="eyebrow">{esc(title)}</p><h1>{esc(name) if name else esc(title)}</h1>'
+            f'<div class="hero-meta">{pill("computing")}<span>{esc(COMPUTING_TEXT)}</span></div></section>')
+    return head + f'<div class="section">{computing_card(title)}</div>'
+
+
 MARK = ('<svg class="mark" viewBox="0 0 28 28" aria-hidden="true" focusable="false"><circle class="ring" cx="14" cy="14" r="11"/>'
         '<path class="crown" d="M8 19 L9.5 11 L13 14.5 L14 9 L15 14.5 L18.5 11 L20 19 Z"/></svg>')
 
@@ -187,6 +208,11 @@ def dashboard(ctx: dict[str, Any], v: dict[str, Any]) -> str:
     themes that come up, the latest graduations, what goes round on X, today's observations, and one line of measurement."""
     live = v["live"]
     site = ctx["site"]
+    if is_computing(live):
+        hero = (f'<section class="hero" data-live="hero"><p class="eyebrow">{esc(site["name"])} {esc(site["product"])} · live</p>'
+                f'<h1>Wat de radar nu ziet</h1><p class="lede">{esc(COMPUTING_TEXT)}</p>'
+                f'<div class="hero-meta">{pill("computing")}<span>{esc(live.get("note") or "")}</span></div></section>')
+        return _dashboard_body(hero, v, str(ctx.get("warning") or ""))
     fr = live["freshness"]
     c, w, g = live["creates"], live["watched"], live["graduations"]
     stats = (
@@ -205,6 +231,10 @@ def dashboard(ctx: dict[str, Any], v: dict[str, Any]) -> str:
         f'<span>gegevens van {esc(live["generated_label"])}</span><span>ververst elke {int(live.get("refresh_s", 15))} s</span><span>{esc(sol_note)}</span></div>'
         f'<div class="hero-stats hero-stats-4">{stats}</div></section>'
     )
+    return _dashboard_body(hero, v, live["warning"])
+
+
+def _dashboard_body(hero: str, v: dict[str, Any], warning: str) -> str:
     hot = hot_card(v["hot"])
     new = new_coins_card(v["new"])
     themes = themes_card(v["themes"])
@@ -212,7 +242,7 @@ def dashboard(ctx: dict[str, Any], v: dict[str, Any]) -> str:
     social = social_card(v["social"])
     today = today_card(v["today"], compact=True)
     meting = measurement_strip(v["week"], v["coverage"])
-    warn = warning_block(live["warning"])
+    warn = warning_block(warning) if warning else ""
     return (hero + f'<div class="section">{hot}</div><div class="grid grid-2 section">{new}{themes}</div><div class="section">{grads}</div>'
             f'<div class="grid grid-2 section">{social}{today}</div><div class="section">{meting}</div><div class="section">{warn}</div>')
 
@@ -245,6 +275,8 @@ HOT_COLS: list[Col] = [("coin", "munt", "wide"), ("age_label", "leeftijd"), ("bu
 
 
 def hot_card(h: dict[str, Any]) -> str:
+    if is_computing(h):
+        return computing_card("Waar het geld nu heen gaat", live="hot")
     rows = []
     for r in h.get("rows") or []:
         rows.append({
@@ -265,6 +297,8 @@ def hot_card(h: dict[str, Any]) -> str:
 
 
 def new_coins_card(n: dict[str, Any]) -> str:
+    if is_computing(n):
+        return computing_card("Nieuwste munten", live="nieuw")
     rate = n.get("rate") or {}
     items = []
     for r in n.get("rows") or []:
@@ -280,6 +314,8 @@ def new_coins_card(n: dict[str, Any]) -> str:
 
 
 def themes_card(t: dict[str, Any]) -> str:
+    if is_computing(t):
+        return computing_card("Thema’s die nu opkomen", live="themas")
     items = []
     for r in t.get("rows") or []:
         tags = pill("winner" if r["bursting"] else "unknown", r["status_label"])
@@ -291,9 +327,16 @@ def themes_card(t: dict[str, Any]) -> str:
                      f'{esc(fmt_n(r["unique_buyers"]))} kopers · {esc(r["burst_label"])}</div>'
                      + (f'<div class="caption">bijv. {esc(ex)}</div>' if ex else "") + "</li>")
     body = f'<ol class="themes">{"".join(items)}</ol>' if items else empty_state(t.get("note") or "Geen thema op dit moment.")
-    head_pill = pill("winner", f"{fmt_n(t.get('bursting', 0))} opkomend") if t.get("bursting") else pill("unknown", "niets opkomend")
+    if t.get("state") in ("stale", "missing"):
+        # milestone 10: the engine's snapshot is old or absent: the card says so with the age and shows no figure
+        head_pill = pill("unknown", "nu niet berekend")
+    else:
+        head_pill = pill("winner", f"{fmt_n(t.get('bursting', 0))} opkomend") if t.get("bursting") else pill("unknown", "niets opkomend")
     ex = explain(esc(t.get("definition") or "") + f" Een {term('thema')} zegt iets over de markt, niet over één munt.")
-    return card("Thema’s die nu opkomen", ex + body, pill_html=head_pill, live="themas", foot='<a href="/methode#begrip-thema">Hoe een thema geteld wordt</a>')
+    foot = '<a href="/methode#begrip-thema">Hoe een thema geteld wordt</a>'
+    if t.get("computed_label") and t.get("state") == "fresh":
+        foot = f'<span class="muted">berekend door de engine {esc(t["computed_label"])} ({esc(t.get("age_label") or "–")} geleden)</span>' + foot
+    return card("Thema’s die nu opkomen", ex + body, pill_html=head_pill, live="themas", foot=foot)
 
 
 GRAD_COLS: list[Col] = [("coin", "munt", "wide"), ("when", "gegradueerd"), ("age_at_graduation_label", "na", "num"), ("mcap", "mcap nu", "num"),
@@ -301,6 +344,8 @@ GRAD_COLS: list[Col] = [("coin", "munt", "wide"), ("when", "gegradueerd"), ("age
 
 
 def graduations_card(g: dict[str, Any]) -> str:
+    if is_computing(g):
+        return computing_card("Net gegradueerd", live="graduaties")
     rows = []
     for r in g.get("rows") or []:
         rows.append({
@@ -319,6 +364,8 @@ def graduations_card(g: dict[str, Any]) -> str:
 
 
 def social_card(sv: dict[str, Any]) -> str:
+    if is_computing(sv):
+        return computing_card("Wat rondgaat op X", live="sociaal")
     if not sv.get("active"):
         body = empty_state(sv.get("note") or "De X-laag staat uit.")
         head_pill = pill("unknown", "staat uit")
@@ -347,6 +394,8 @@ def social_card(sv: dict[str, Any]) -> str:
 
 
 def measurement_strip(wk: dict[str, Any], cov: dict[str, Any]) -> str:
+    if is_computing(wk) or is_computing(cov):
+        return computing_card("Meting", live="meting-strip", foot='<a href="/meting">De meetweek, de dekking en de rapporten</a>')
     pos = wk.get("position") or {}
     phase = {"running": pos.get("phase_label"), "before": "nog niet begonnen", "after": "voorbij"}.get(pos.get("phase"), "onbekend")
     s = cov.get("summary") or {}
@@ -369,11 +418,12 @@ def measurement_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
 
     wk, cov, reps = v["week"], v["coverage"], v["reports"]
     pos = wk.get("position") or {}
+    meta = (f'<div class="hero-meta">{pill("computing")}<span>{esc(COMPUTING_TEXT)}</span></div>' if is_computing(wk) else
+            f'<div class="hero-meta">{pill("frozen", "regels bevroren") if pos.get("rules_frozen") else pill("unknown", "regels niet bevroren")}'
+            f'<span>{esc(pos.get("phase_label") or "")}</span><span>gegevens van {esc(wk["generated_label"])}</span></div>')
     hero = ('<section class="hero"><p class="eyebrow">Meting</p><h1>Hoe goed ziet de radar het?</h1>'
             '<p class="lede">Elke observatie en elke graduatie wordt achteraf gemeten: winnaar of niet, op tijd of te laat, en wat onbekend bleef. Dit is de stand van de meetweek, '
-            'de dekking van de laatste 24 uur en de laatste rapporten.</p>'
-            f'<div class="hero-meta">{pill("frozen", "regels bevroren") if pos.get("rules_frozen") else pill("unknown", "regels niet bevroren")}'
-            f'<span>{esc(pos.get("phase_label") or "")}</span><span>gegevens van {esc(wk["generated_label"])}</span></div></section>')
+            'de dekking van de laatste 24 uur en de laatste rapporten.</p>' + meta + '</section>')
     return (hero + f'<div class="grid grid-2 section">{week_card(wk)}{coverage_card(cov, charts)}</div><div class="section">{reports_card(reps)}</div>'
             f'<div class="section">{how_card()}</div><div class="section">{warning_block(v["warning"])}</div>')
 
@@ -407,6 +457,8 @@ def _headline_html(st: dict[str, Any]) -> str:
 
 
 def today_card(today: dict[str, Any], compact: bool = False) -> str:
+    if is_computing(today):
+        return computing_card("Observaties vandaag" if compact else "Vandaag", live="vandaag", cls="" if compact else "section")
     rows = (today.get("rows") or [])[: 5 if compact else None]
     total = (today.get("counts") or {}).get("total_today")
     if rows:
@@ -434,6 +486,8 @@ def obs_item(r: dict[str, Any]) -> str:
 
 
 def week_card(wk: dict[str, Any]) -> str:
+    if is_computing(wk):
+        return computing_card("Meetweek", live="meetweek", foot='<a href="/methode#go-no-go">Wat de toets betekent</a>')
     pos = wk["position"]
     head_pill = pill("frozen", "regels bevroren") if pos.get("rules_frozen") else pill("unknown", "regels niet bevroren")
     phase_value = {"running": pos["phase_label"], "before": "nog niet begonnen", "after": "voorbij"}.get(pos["phase"], "onbekend")
@@ -470,6 +524,8 @@ def week_card(wk: dict[str, Any]) -> str:
 
 
 def coverage_card(cov: dict[str, Any], charts: Any) -> str:
+    if is_computing(cov):
+        return computing_card("Dekking en eerlijkheid", live="dekking", foot='<a href="/methode#dekking">Hoe de dekking werkt</a>')
     s = cov.get("summary") or {}
     nc = s.get("hours_not_covered")
     p = pill("not_covered", f"{fmt_n(nc)} uur NIET GEDEKT") if nc else (pill("fresh", "alle uren gedekt") if s.get("hours_covered") else pill("unknown"))
@@ -485,6 +541,8 @@ def coverage_card(cov: dict[str, Any], charts: Any) -> str:
 
 
 def reports_card(reps: dict[str, Any]) -> str:
+    if is_computing(reps):
+        return computing_card("Laatste rapporten", live="rapporten", foot='<a href="/rapporten">Alle rapporten</a>')
     rows = reps.get("latest") or []
     if not rows:
         body = empty_state(reps.get("note") or "Nog geen rapporten.")
@@ -529,6 +587,8 @@ def warning_block(text: str) -> str:
 
 # ----- observations -----------------------------------------------------------------------------------------------------
 def observations_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
+    if is_computing(v):
+        return computing_page("Observaties", "Elke observatie, met uitkomst").replace('<div class="section">', '<div class="section" data-live="observaties">', 1)
     rows = v.get("rows") or []
     c = v.get("counts") or {}
     head = (f'<section class="hero"><p class="eyebrow">Observaties</p><h1>Elke observatie, met uitkomst</h1>'
@@ -558,6 +618,8 @@ def observations_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
 
 # ----- reports ----------------------------------------------------------------------------------------------------------
 def reports_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
+    if is_computing(v):
+        return computing_page("Rapporten", "Dag- en weekrapporten").replace('<div class="section">', '<div class="section" data-live="rapporten">', 1)
     rows = v.get("rows") or []
     head = ('<section class="hero"><p class="eyebrow">Rapporten</p><h1>Dag- en weekrapporten</h1>'
             '<p class="lede">Elke ochtend een dagrapport over de vorige UTC-dag en een weekrapport over de laatste zeven dagen: het universum, de winnaars, '
@@ -697,6 +759,8 @@ def week_report_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
 
 # ----- the method page --------------------------------------------------------------------------------------------------
 def method_page(ctx: dict[str, Any], m: dict[str, Any]) -> str:
+    if is_computing(m):
+        return computing_page("Methode", "Hoe de radar werkt en wat de cijfers betekenen")
     w = m["winner"]
     fr = m["frozen"]
     crit = table([("label", "criterium"), ("threshold_label", "eis", "num")], [{**c, "_class": ""} for c in m["criteria"]], empty="geen criteria", widths=("70", "30"))
@@ -807,6 +871,8 @@ DECISION_COLS: list[Col] = [("as_of_label", "tijd"), ("kind_label", "soort"), ("
 SPEND_COLS: list[Col] = [("kind", "soort"), ("n", "eenheden", "num"), ("usd_label", "USD", "num")]
 LOG_COLS: list[Col] = [("name", "log"), ("size_label", "grootte", "num"), ("modified_label", "laatste regel"), ("warnings", "waarschuwingen (staart)", "num"),
                        ("errors", "fouten (staart)", "num"), ("last_error", "laatste fout", "wide")]
+VIEW_COLS: list[Col] = [("view", "onderdeel"), ("seconds_label", "laatste duur", "num"), ("age_label", "berekend", "num"), ("state_label", "stand"),
+                        ("errors", "fouten", "num"), ("last_error", "laatste fout", "wide")]
 
 
 def _rowcls(rows: list[dict[str, Any]], mapping: dict[str, str]) -> list[dict[str, Any]]:
@@ -817,7 +883,8 @@ def owner_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
     st, cv, x, rp, wk, sv, lg = v["status"], v["coverage"], v["x"], v["report"], v["week"], v["settings"], v["logs"]
     note = f'<p class="notice">{esc(st["note"])}</p>' if st.get("note") else ""
     anchors = "".join(f'<a href="#{a}">{t}</a>' for a, t in (("gezondheid", "Gezondheid"), ("dekking", "Dekking"), ("beslissingen", "Beslissingen"), ("budgetten", "Budgetten"),
-                                                                 ("x", "X en planner"), ("rapport", "Rapporten"), ("instellingen", "Instellingen"), ("logboek", "Logboek")))
+                                                                 ("x", "X en planner"), ("rapport", "Rapporten"), ("weergaven", "Weergaven"), ("instellingen", "Instellingen"),
+                                                                 ("logboek", "Logboek")))
     head = (f'<section class="hero"><p class="eyebrow">Eigenaar</p><h1>Operationeel overzicht</h1><p class="lede">Alles wat de openbare pagina’s niet tonen: versheid van daemons en timers, budgetten, de X-planner, de instellingen en het logboek. Alleen-lezen, ook voor jou.</p>'
             f'<div class="hero-meta"><span>gegevens van {esc(st["generated_label"])}</span><span>schema {esc(fmt(st.get("schema_version")))}</span><span>rules_version {esc(st.get("rules_version"))}</span></div></section>'
             f'<nav class="owner-nav" aria-label="Secties">{anchors}</nav>{note}')
@@ -875,9 +942,39 @@ def owner_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
     settings_card = card("Instellingen (alleen-lezen)", '<p class="small muted">Wat hier staat verandert alleen door een commit en een nieuwe uitrol; geheimen staan nooit op deze pagina.</p>' + sections, anchor="instellingen")
     logs = card("Logboek (samenvatting)", '<p class="small muted">De staart van elk logbestand: waarschuwingen en fouten geteld, de laatste fout benoemd. Nooit een cookie, sleutel of wachtwoord.</p>'
                 + table(LOG_COLS, _rowcls(lg.get("rows") or [], {"errors": "is-stale"}), empty="geen logbestanden", widths=("15", "10", "20", "10", "10", "35")), anchor="logboek", live="eigenaar-logboek")
+    views = views_card(v.get("views") or {})
     return (head + f'<div class="grid grid-2 section owner">{health}{decisions}{budgets}{report}</div><div class="section owner">{coverage}</div>'
             f'<div class="section owner">{xcard}</div><div class="section owner">{week}</div><div class="section owner">{reports_raw}</div>'
-            f'<div class="section owner">{settings_card}</div><div class="section owner">{logs}</div>')
+            f'<div class="section owner">{views}</div><div class="section owner">{settings_card}</div><div class="section owner">{logs}</div>')
+
+
+def secs_label(s: Any) -> str:
+    """'0.02 s', '0.4 s', '12 s': two significant digits under ten seconds, '0.00 s' under five milliseconds (the figure
+    `fart status` prints too)."""
+    try:
+        v = float(s)
+    except (TypeError, ValueError):
+        return "–"
+    if v < 0.005:
+        return "0.00 s"
+    return f"{v:.2g} s" if v < 10 else f"{v:.0f} s"
+
+
+def views_card(vs: dict[str, Any]) -> str:
+    """Milestone 10: what the background thread computes, how long every view took the last time, what failed."""
+    rows = []
+    for r in vs.get("rows") or []:
+        age = r.get("age_s")
+        rows.append({"view": r["view"], "seconds_label": secs_label(r.get("seconds")), "age_label": ("–" if age is None else f"{fmt_n(age)} s geleden"),
+                     "state_label": {"computed": "berekend", "computing": "wordt berekend", "failed": "mislukt"}.get(str(r.get("state")), str(r.get("state"))),
+                     "errors": fmt_n(r.get("errors") or 0), "last_error": r.get("last_error") or "geen",
+                     "_class": "is-stale" if (r.get("errors") or not r.get("ok", True)) else ""})
+    intro = (f'<p class="small muted">Eén achtergrondthread berekent de openbare onderdelen ({"draait" if vs.get("running") else "draait niet: alleen de testaanroep berekent"}): '
+             f'de live-onderdelen elke {esc(fmt_n(vs.get("live_ttl_s")))} s, de rest elke {esc(fmt_n(vs.get("ttl_s")))} s; een verzoek leest alleen en wacht nergens op. '
+             f'Een berekening langer dan {esc(fmt_n(vs.get("slow_s")))} s komt in het logboek (web.view_slow); dezelfde duren staan in logs/{esc(vs.get("file"))} voor fart status. '
+             f'Berekeningen {esc(fmt_n(vs.get("computes")))}, mislukt {esc(fmt_n(vs.get("failures")))}.</p>')
+    return card("Weergaven van de website (achtergrondberekening)", intro + table(VIEW_COLS, rows, empty="nog niets berekend", widths=("22", "12", "16", "14", "8", "28")),
+                anchor="weergaven", live="eigenaar-weergaven")
 
 
 def raw_report_page(ctx: dict[str, Any], body_html: str, name: str, public_href: str | None) -> str:

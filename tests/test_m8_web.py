@@ -129,6 +129,13 @@ def build_world(root: Path, now: float, password: str = PASSWORD, bind: str = "1
         conn.execute("INSERT INTO mcap_samples(mint, ts, src, mcap_usd, volume_h24_usd, sol_usd) VALUES(?,?,?,?,?,?)", (mints[0][0], ts, "dexscreener", 110000.0, 45000.0, 180.0))
         ts += 300
     conn.execute("INSERT INTO mcap_samples(mint, ts, src, mcap_usd, volume_h24_usd, sol_usd) VALUES(?,?,?,?,?,?)", (mints[1][0], now - 200, "dexscreener", 42000.0, 9000.0, 180.0))
+    # milestone 10: what the daemons leave behind for the website: the coverage rows of the last 24 hours (the ingest
+    # recomputes the current hour every minute; every hour was current once) and the engine's ranked themes (every tick)
+    for i in range(23, -1, -1):
+        coverage.write_hour(conn, hour_key(now - i * 3600), now)
+    from fart.engine import themes as engine_themes
+
+    engine_themes.write(conn, engine_themes.build(conn, settings, now, rules_version="test-rules-v1"), now)
     conn.commit()
     out = settings.out_dir / "recall"
     for days_back in (2, 1):  # the day before yesterday lies before the first start (NIET GEDEKT); yesterday is partly covered
@@ -215,6 +222,7 @@ class Client:
 def client(live):
     live["app"].guard = auth.LoginGuard(live["app"].clock)  # every test starts without a lock
     live["clock"][0] = NOW
+    live["app"].refresh_views()   # milestone 10: the public views are precomputed (by a thread in production; here by the test)
     return Client(live["port"])
 
 

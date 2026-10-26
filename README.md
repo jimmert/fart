@@ -1,5 +1,32 @@
 # fart
 
+## Voor Jim: wat milestone 10 toevoegt
+
+Mijlpaal 10 maakt het openbare dashboard snel en robuust zonder iets aan het ontwerp of de inhoud te veranderen. Direct na
+de uitrol van M9 deed `GET /` op de VPS twee keer een time-out na 60 seconden; koud duurde het thema-onderdeel meer dan
+150 seconden en `status`, `live` en `coverage` zo'n 7 seconden. Drie oorzaken, drie veranderingen; geen regel verandert (de
+vingerafdruk blijft `sha256:e3bf4320c45c`; dezelfde test bewaakt dat), geen nieuwe dependency, de website blijft
+alleen-lezen. De beslissingen staan in `docs/DECISIONS.md`, de uitrol stap voor stap in `deploy/DEPLOY.md` ("Milestone 10:
+performance"):
+
+1. **Thema's komen van de engine.** De engine schrijft elke tick de gerangschikte thema's die hij toch al berekent als JSON
+   in kv (`engine.metas_latest`); de thema-kaart leest alleen die waarde en rekent niets meer. Is de waarde ouder dan 5
+   minuten (engine uit of nog niet herstart), dan zegt de kaart "Thema's worden nu niet berekend" met de leeftijd, en toont
+   hij geen cijfer.
+2. **Indexen voor tijdvensters.** Schema v8 voegt `trades(received_at)` en `trades(block_time)` toe; elk tijdvenster van de
+   openbare onderdelen begint op de geïndexeerde ontvangsttijd en legt de eventtijd daar overheen, zodat geen venster meer
+   een tabel scant (een test bewijst het met `EXPLAIN QUERY PLAN`). De dekking van de laatste 24 uur komt uit de
+   `coverage`-tabel die de ingest elke minuut bijhoudt.
+3. **Een cache die nooit laat wachten.** Eén achtergrondthread in `fart web` berekent de openbare onderdelen op hun eigen
+   ritme (bij de start, daarna elke 15 s de live-onderdelen en elke 30 s de rest); een verzoek leest alleen de laatste
+   waarde en wacht nergens op. Een onderdeel dat nog nooit berekend is zegt "wordt berekend" (JSON: `{"state": "computing"}`).
+   Een berekening langer dan 10 s komt in het logboek; de laatste duur per onderdeel staat op `/eigenaar` en in `fart status`
+   (`web views: themes 0.02 s, live 0.4 s, ...`).
+
+Na de uitrol: `curl -s -o /dev/null -w '%{http_code} %{time_total}s\n' https://kingdegen.dev/` geeft `200` en een tijd onder
+een seconde, koud en warm; `fart status` toont `schema_version: 8` en de regel `web views:`. Zegt de thema-kaart de eerste
+minuut "nu niet berekend": dat klopt tot de herstarte engine één keer getikt heeft.
+
 ## Voor Jim: wat milestone 9 toevoegt
 
 Mijlpaal 9 maakt van de website een openbaar product: `https://kingdegen.dev` is nu het gezicht van de radar naar buiten, met
