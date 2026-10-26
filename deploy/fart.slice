@@ -1,0 +1,9 @@
+[Unit]
+Description=fart: Solana/pump.fun data machine (resource slice)
+Documentation=file:///opt/fart/app/deploy/DEPLOY.md
+
+[Slice]
+MemoryMax=1G
+MemoryHigh=768M
+CPUQuota=100%
+TasksMax=256

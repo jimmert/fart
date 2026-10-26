@@ -1,0 +1,11 @@
+[Unit]
+Description=Run fart measure report daily at 06:00 UTC
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=fart-measure-report.service
+
+[Install]
+WantedBy=timers.target
