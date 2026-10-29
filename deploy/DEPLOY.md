@@ -940,6 +940,94 @@ of design or content: every card shows what it showed, plus the state "wordt ber
 5. **Rollback:** a code rollback to M9 (`git checkout <M9 commit> && sudo deploy/install.sh`) works on the v8 database: the
    two indexes are harmless to M9, which never drops them, and M9 ignores the kv value `engine.metas_latest`.
 
+## 5j. Milestone 11: engine performance (M11)
+
+M11 brings the engine tick back from minutes to seconds without changing one outcome. Measured on the VPS after the M10
+rollout (26 Oct 2026, 22:58 to 23:19 UTC; 199,000 trades, 37,500 coins, about 7,100 coins in the three-hour window, about
+1,200 new coins per hour): `tick_s` in the `engine.tick` log line was 166 to 337 s (4 s at 14:00 UTC), the engine process
+sat at 97% CPU, the heartbeat aged up to 565 s, decisions and `engine.metas_latest` came every three minutes instead of every
+15 s, and the themes card of the website said "nu niet berekend" most of the time. `features_s` was 0.35 s; the time was in
+step 5 (the metas): `meta_features` fetched the baseline coins of every term (6 to 48 hours before `as_of`, tens of thousands
+of rows) and tokenized them again per term, hundreds of times per tick. Two changes, one proof:
+
+* **The baseline once per tick** (`fart/engine/features.py` → `meta_baseline`, `MetaBaseline`): the baseline coins are
+  fetched once per tick as an index range on the event time (the `coins_block_time` index serves both the rows with a chain
+  time and the received-only rows; the old form walked every coin through `coins_received_at`), tokenized once and counted
+  per term (`collections.Counter`); `meta_features` reads its `base_n` from that counter. The definition is unchanged: the
+  same window on the same event time `COALESCE(block_time, received_at)`, the same `tokenize` with the same stopwords and
+  `min_token_len`, the same `base_hours`, the same rounding. `recent_coins`, the clustering, the per-term trade aggregate
+  (through the mint index) and the ranking are what they were. On the fixture database of the proof (20,000 coins, 50,000
+  trades) step 5 goes from 13 s to 0.3 s; on the VPS database the whole meta step is expected under 5 s, linear in the number
+  of coins and no longer in coins times terms.
+* **A tick budget that is visible** (`fart/engine/service.py`): every tick logs the duration of each of its six steps
+  (`engine.tick_steps` with `expire_s`, `features_s`, `promote_s`, `rpc_s`, `metas_s`, `decisions_s` and `tick_s`; the
+  `engine.tick` summary carries them too), a tick longer than the loop interval (15 s) is counted in kv (`engine.tick_slow`,
+  `engine.tick_slow.<day>`, the last one in `engine.tick_slow.last`) and logged at most once per hour (`engine.tick_slow`,
+  with the number of slow ticks since the previous line), and the durations of the last completed tick go to kv
+  `engine.tick_last` inside the next tick's decision transaction (no write outside the existing ones). `fart status` prints
+  them and `/eigenaar` has the card "Engine-tick (stappen en budget)". No work is skipped when a tick is slow: it becomes
+  visible, never hidden.
+
+**The rules did not change, provably.** `features.py` is a rule file, so the fingerprint of the rule-defining files changes:
+from `sha256:e3bf4320c45c` (the frozen measurement week) to `sha256:d45c41793c64`. That is allowed only with proof and
+registration: `tests/test_m11_engine_performance.py::test_meta_step_old_and_new_implementation_are_byte_equal` runs the
+milestone-10 rule file (kept byte for byte as `tests/reference/features_m10.py`, its sha256 pinned) next to the new one on
+a fixture database of 20,000 coins over 48 hours and 50,000 trades and proves the same metas (every term, every field, the
+rounding, the order), the same coin features and the same verdicts of `decide`; the other rule files are byte-identical to
+the frozen week (their partial fingerprint is pinned). The new fingerprint is registered in `config/measure.json` →
+`community_gate.frozen_rules_equivalents` with the date, the PR and the name of that test; the week report pools its
+rules_versions with the frozen fingerprint and says so under the segment title ("Bewezen gelijkwaardige berekening in dit
+segment: ..."), and the website keeps calling the rules frozen and names the equivalence on `/methode` and `/eigenaar`. No
+schema migration, no new dependency, no change of the website's content. On the side: the public headline no longer fails
+on a day without coverage (it joins the parts it has instead of expecting three).
+
+1. **Pull and install:**
+   ```bash
+   cd /opt/fart-src && git pull --ff-only && sudo deploy/install.sh
+   ```
+   No migration (`user_version` stays 8). The installer restarts `fart-ingest`, `fart-engine` and the optional services; the
+   engine restart is the one that matters. By hand, or if the installer ran with `START_SERVICES=0`:
+   ```bash
+   sudo systemctl restart fart-engine
+   ```
+2. **Check the tick in the engine log** (within a minute; every tick writes one line):
+   ```bash
+   grep engine.tick_steps /opt/fart/logs/engine.log | tail -n 3
+   #   {"t": "...", "event": "engine.tick_steps", "as_of": ..., "tick_s": 1.8, "ok": true, "slow": false, "expire_s": 0.01, "features_s": 0.5,
+   #    "promote_s": 0.0, "rpc_s": 0.3, "metas_s": 0.9, "decisions_s": 0.1, "coins": 200, "metas": 50, "recent_coins": 7100, "baseline_coins": 50000, ...}
+   grep -c '"engine.tick_slow"' /opt/fart/logs/engine.log      # 0 after the restart
+   ```
+   `tick_s` must be seconds, well under 15, and `metas_s` under 5 s. A tick above 15 s carries `"slow": true`, is counted and
+   appears at most once per hour as `engine.tick_slow` (with the number of slow ticks since the previous line). The engine's
+   CPU share drops from 97% to a few percent: `top -b -n 1 -p "$(systemctl show -p MainPID --value fart-engine)"`.
+3. **Check the step durations and the fingerprint in `fart status`:**
+   ```bash
+   sudo -u fart /opt/fart/bin/fart status
+   #   freshness (s): ... engine.heartbeat=<under 30> ...
+   #   engine tick: last 1.8 s (expire 0.01 s, features 0.5 s, promote 0.00 s, rpc 0.3 s, metas 0.9 s, decisions 0.1 s; 200 watched coins, 7100 in the themes window,
+   #                50000 baseline coins; as_of 12 s ago); slow ticks (> 15 s): total=0 today=0
+   #   rules fingerprints (engine): ..., <new commit>=sha256:d45c41793c64   <- the registered equivalent of the frozen sha256:e3bf4320c45c
+   ```
+   The `engine tick:` line appears after the second tick (the engine writes the previous tick's durations in every decision
+   write); before that it says "no completed tick recorded yet". `/eigenaar` → "Engine-tick (stappen en budget)" shows the
+   same figures per step with their share of the tick; "Gezondheid en versheid" shows the engine heartbeat "vers" again.
+4. **Check the website:** the themes card on `https://kingdegen.dev/` says "berekend door de engine ... (N s geleden)" with N
+   under 30 instead of "nu niet berekend":
+   ```bash
+   curl -s https://kingdegen.dev/api/public/themes | head -c 200; echo     # "state": "fresh"
+   ```
+   `/methode` says the running code has a proven equivalent fingerprint (PR #11); the pill "regels bevroren" stays on `/meting`.
+5. **The week report:** the next `fart measure week` (06:30 UTC) pools the new rules_version with the frozen week. Under the
+   segment title ``## Regels `sha256:e3bf4320c45c` (bevroren meetweek) · method_version `m1.0` `` it prints the line
+   ```
+   Bewezen gelijkwaardige berekening in dit segment: rules_version(s) `<new commit>` met vingerafdruk `sha256:d45c41793c64` tellen mee bij de bevroren regels. De regels zijn niet veranderd, alleen de rekentijd (PR #11 van 2026-10-29; bewijs: `tests/test_m11_engine_performance.py::test_meta_step_old_and_new_implementation_are_byte_equal`).
+   ```
+   and "## Versies" lists the equivalent fingerprint. One segment, never two. To see it at once:
+   `sudo -u fart /opt/fart/bin/fart measure week --end $(date -u -d yesterday +%F) --days 2` and read `out/recall/week-<day>.md`.
+6. **Rollback:** a code rollback to M10 works on the same database (no migration); M10 ignores the kv keys `engine.tick_last`
+   and `engine.tick_slow*`. The tick is minutes again then, and the week report would open a second segment for a rules_version
+   running M10 only if its fingerprint were unknown (it is the frozen one, so no).
+
 ## 6. First-day checklist (docs/UNVERIFIED.md)
 
 1. `fart chain global`: reserves, supply, `fee_basis_points` 95 and `creator_fee_basis_points` 5 must
@@ -1064,6 +1152,7 @@ old rows stay, new rows get the old version string again.
 | `fart-backup.service` `Result=signal` (exit 159) | the M2 script's `gzip -f` was killed by the syscall filter (`fchown`) | upgrade to M3 (`deploy/backup.sh` uses `gzip -n -c`); the `.db` written before the kill is complete |
 | `fart-backup.service` `Result=exit-code` with `VERIFY FAILED` in the journal (M6) | the newest archive does not restore, or the live database has fewer rows than the archive in a table that only grows | `fart backup verify` by hand shows which; keep the older archives; a bad archive after a good backup line points at the disk, lost live rows at something that deleted (`decisions`/`outcomes` cannot be deleted: triggers) |
 | `x mode note: X_MODE=live refused` in `status` (M6) | `X_MODE=live` without `"x_live": true` in `config/engine.json` | expected during the measurement week: the watch runs in shadow; after the week the key is a commit (new fingerprint) |
+| `engine.tick_slow` in the engine log, `slow ticks (> 15 s): total=N` in `status` (M11) | a tick took longer than the loop interval: look at the step durations in the same line (`metas_s`: the themes window grew; `features_s`: the watchlist and its trades; `rpc_s`: the network; `decisions_s`: a busy database) | nothing is skipped; if `tick_s` stays above 15 s, the step named tells where to look (`engine.tick_steps` every tick, `/eigenaar` → Engine-tick) |
 | `x shadow: ... daemons report social=shadow engine=off` (M6) | the two daemons read different `.env` states (one was not restarted) | `sudo systemctl restart fart-social fart-engine`; both must report the same mode |
 | `x planner: ... deferred today: ca_counts N` growing through the peak hours (M7) | the envelope paces more than the morning: the day's plan is bigger than the cap allows (many keys, or a cap under 10.00) | `fart social dryrun`: compare `total` and `full load` with the cap; raise `X_DAILY_BUDGET_USD` within 10.00 to 20.00, or lower `planner.max_active_keys` in a commit; a deferred count is done later, never lost until the key's window ends |
 | a visitor gets 429 on `https://kingdegen.dev` (M9) | more than 120 requests per minute from one address on the public routes | expected for a scraper; a page refreshes itself twice a minute at most; the owner's session is never limited; `journalctl -u fart-web | grep rate_limited` names the address (once a minute) |

@@ -111,6 +111,24 @@ Rules: compute (features, clustering, decoding) and talk to the network outside 
 in milliseconds, count what still fails (`engine.tick_failed`, `ingest.handle_failed.<source>`, with a
 per-day twin for the report) and keep the raw line replayable.
 
+## The engine tick (milestone 11)
+
+The engine's step 5 clusters the coins of the last three hours and measures every term against its own baseline: the
+coins that carried the term between 6 and 48 hours before `as_of`. Until milestone 10 `features.meta_features` fetched and
+tokenized those tens of thousands of baseline coins again for every term, hundreds of times per tick: 166 to 337 s per
+tick on the VPS on 26 Oct 2026, the process at 97% CPU, decisions every three minutes. Since milestone 11
+`features.meta_baseline` fetches them once per tick as an index range on the event time (both cases of
+`COALESCE(block_time, received_at)` spelled out, so `coins_block_time` serves the window), tokenizes them once and counts
+every term (`collections.Counter`); `meta_features` reads its `base_n` from that counter. The definition is unchanged and a
+test proves it: the milestone-10 rule file is kept byte for byte under `tests/reference/` and run next to the new one on
+a fixture database of 20,000 coins and 50,000 trades (the same metas, features and verdicts, byte for byte). Because
+`features.py` is a rule file, its fingerprint changed; the new one is registered in `config/measure.json` →
+`community_gate.frozen_rules_equivalents` (date, PR, proof test), the week report pools it with the frozen fingerprint and
+says so under the segment title, and the website keeps calling the rules frozen. Every tick logs the duration of each of
+its six steps (`engine.tick_steps`), a tick longer than the loop interval is counted (`engine.tick_slow`) and logged at most
+once per hour, and the last completed tick's durations are in kv `engine.tick_last` (written in the next decision
+transaction) for `fart status` and `/eigenaar`. Nothing is skipped when a tick is slow.
+
 ## The budget gate (`fart/net/budget.py`)
 
 Every external call passes `Budget.acquire(source, method, cost)`:

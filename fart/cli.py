@@ -35,7 +35,9 @@
   chain global           decode the pump.fun Global account, compare with config/pumpfun.json (exit 1 on mismatch)
   chain pda <mint>       derive the bonding-curve PDA (and the unverified pump-amm pool PDA) for a mint
   status                 health, budgets, counts (works on an empty database); since milestone 10 also the last duration per
-                         public view of the website (logs/web-views.json, written by fart web)
+                         public view of the website (logs/web-views.json, written by fart web); since milestone 11 the duration
+                         of every step of the engine's last completed tick and the number of slow ticks (kv engine.tick_last,
+                         engine.tick_slow, written by the engine itself)
   coverage --hours N     per-hour creates/grads/gaps
   web                    daemon: the read-only website on FART_WEB_BIND (127.0.0.1:8792) behind the shared Caddy: the public
                          dashboard, observations, reports, method and tools pages plus /api/public/* (FART_WEB_PUBLIC=1, the
@@ -239,6 +241,8 @@ def cmd_status(settings, as_json: bool) -> int:
             out["x_shadow"] = status_counters(conn, t)
             out["engine_candidates_today"] = {r[0]: {"rows": int(r[1]), "with_trades": int(r[2] or 0), "passed_all": int(r[3] or 0)} for r in conn.execute(
                 "SELECT kind, COUNT(*), SUM(COALESCE(max_trades_total, 0) > 0), SUM(passed_all) FROM engine_candidates WHERE day=? GROUP BY kind", (day_key(t),))}
+            # milestone 11: the engine's tick budget (the last completed tick's step durations, the slow ticks)
+            out["engine_tick"] = engine_tick_status(kv, settings.config("engine"), t)
             out["backup_verify_last"] = json.loads(kv["backup.verify.last"]) if kv.get("backup.verify.last") else None
         finally:
             conn.close()
@@ -346,6 +350,7 @@ def cmd_status(settings, as_json: bool) -> int:
     cc, mc = ec.get("coin") or {}, ec.get("meta") or {}
     print(f"  engine candidates today: coins={cc.get('rows', 0)} (with trades {cc.get('with_trades', 0)}, passed all thresholds {cc.get('passed_all', 0)}),"
           f" metas={mc.get('rows', 0)} (passed all {mc.get('passed_all', 0)})  [fart engine explain --day {day_key(now())}]")
+    print("  " + engine_tick_line(out.get("engine_tick") or {}))
     bv = out.get("backup_verify_last")
     if bv:
         cts = bv.get("counts") or {}
@@ -361,6 +366,55 @@ def cmd_status(settings, as_json: bool) -> int:
     print(f"  last decision: {out['last_decision_at']}")
     print("  " + web_views_line(out["web_views"]))
     return 0
+
+
+ENGINE_STEPS = ("expire", "features", "promote", "rpc", "metas", "decisions")
+
+
+def _json_or_none(raw: Any) -> Any:
+    if not raw:
+        return None
+    try:
+        v = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def engine_tick_status(kv: dict[str, str], ecfg: dict[str, Any], t: float) -> dict[str, Any]:
+    """The engine's tick budget (milestone 11): kv `engine.tick_last` (the last completed tick, written by the engine in the
+    next tick's decision transaction), the slow-tick counters `engine.tick_slow` / `.<day>` and the last slow tick."""
+    last = _json_or_none(kv.get("engine.tick_last"))
+    slow_last = _json_or_none(kv.get("engine.tick_slow.last"))
+    try:
+        age = None if last is None else round(max(0.0, t - float(last.get("as_of"))))
+    except (TypeError, ValueError):
+        age = None
+    return {"interval_s": float(ecfg.get("loop_interval_s", 15)), "last": last, "last_age_s": age,
+            "slow_total": int(kv.get("engine.tick_slow", "0") or 0), "slow_today": int(kv.get(f"engine.tick_slow.{day_key(t)}", "0") or 0),
+            "slow_last": slow_last}
+
+
+def engine_tick_line(et: dict[str, Any]) -> str:
+    """`engine tick: last 1.8 s (expire 0.01 s, features 0.52 s, ...; as_of 21 s ago); slow ticks (> 15 s): total=0 today=0`."""
+    interval = et.get("interval_s", 15)
+    last = et.get("last")
+    slow = f"slow ticks (> {interval:g} s): total={et.get('slow_total', 0)} today={et.get('slow_today', 0)}"
+    sl = et.get("slow_last")
+    if isinstance(sl, dict) and sl.get("as_of") is not None:
+        try:
+            slow += f", last {utc_iso(float(sl['as_of']))} ({_secs(sl.get('tick_s'))})"
+        except (TypeError, ValueError):
+            pass
+    if not isinstance(last, dict):
+        return f"engine tick: no completed tick recorded yet (the engine writes the previous tick's durations in every decision write; milestone 11); {slow}"
+    steps = ", ".join(f"{s} {_secs(last.get(f'{s}_s'))}" for s in ENGINE_STEPS)
+    cnt = (lambda k: "?" if last.get(k) is None else last[k])  # noqa: E731
+    counts = f"{cnt('coins')} watched coins, {cnt('recent_coins')} in the themes window, {cnt('baseline_coins')} baseline coins"
+    age = et.get("last_age_s")
+    state = "" if last.get("ok", True) else " FAILED"
+    return (f"engine tick: last {_secs(last.get('tick_s'))}{state}{' SLOW' if last.get('slow') else ''} ({steps}; {counts}; as_of "
+            + ("?" if age is None else f"{age} s ago") + f"); {slow}")
 
 
 WEB_VIEWS_FILE = "web-views.json"

@@ -221,12 +221,28 @@ def test_gate_thresholds_in_config_match_the_frozen_decisions(settings):
 def test_the_working_tree_still_runs_the_frozen_rules():
     """Changing a rule-defining file (config/engine.json, decide.py, features.py, meta.py, curve.py, pumpfun.json,
     stopwords.json) is a rules change: describe it in docs/DECISIONS.md first and then update
-    community_gate.frozen_rules in config/measure.json on purpose. Never silently."""
-    from fart.util import load_json
-    from fart.version import REPO_ROOT
+    community_gate.frozen_rules in config/measure.json on purpose. Never silently.
 
-    frozen = load_json(REPO_ROOT / "config" / "measure.json")["community_gate"]["frozen_rules"]
-    assert rules_fingerprint() == frozen["rules_fingerprint"], "a rule-defining file changed: this is a new rules_version, not a silent edit"
+    Milestone 11: a rule file may change without the rules changing (features.py counts the baseline once per tick; a
+    test proves the outcomes byte-equal). Such a fingerprint is registered in community_gate.frozen_rules_equivalents
+    with the date, the PR and the proof test, and counts as the frozen rules; the frozen entry itself stays."""
+    from fart.util import load_json
+    from fart.version import REPO_ROOT, pooled_fingerprint, rules_equivalents
+
+    gate = load_json(REPO_ROOT / "config" / "measure.json")["community_gate"]
+    frozen = gate["frozen_rules"]
+    assert frozen["rules_fingerprint"] == "sha256:e3bf4320c45c7cd3c159bc045a66164ae1754637979ddacc759dc6bd59bbbd46" and frozen["rules_version"] == "150ca73cb354"
+    fp = rules_fingerprint()
+    assert pooled_fingerprint(fp, gate) == frozen["rules_fingerprint"], \
+        "a rule-defining file changed: this is a new rules_version, not a silent edit (or a proven equivalent to register in frozen_rules_equivalents)"
+    equivalents = rules_equivalents(gate)
+    assert fp == frozen["rules_fingerprint"] or fp in equivalents
+    for e in equivalents.values():   # every registered equivalent carries its proof
+        assert e["rules_fingerprint"].startswith("sha256:") and e["rules_fingerprint"] != frozen["rules_fingerprint"]
+        assert e["date"] >= "2026-10-26" and isinstance(e["pr"], int) and e["pr"] > 10
+        path, func = e["proof_test"].split("::")
+        assert (REPO_ROOT / path).exists() and f"def {func}(" in (REPO_ROOT / path).read_text(encoding="utf-8"), e["proof_test"]
+    assert list(equivalents) == ["sha256:d45c41793c64e055ef2958f69c621118dd84ff1e54e2f29e4285e3adfbb00fe4"]   # milestone 11, the one so far
 
 
 # ----- segments per rules group and method ----------------------------------------------------------------------
@@ -295,7 +311,10 @@ def test_week_cli_end_to_end_on_a_synthetic_world(settings, conn, capsys):
     assert rep["kind"] == "week" and rep["days"] == 2 and rep["end_day"] == end and rep["synthetic"] is False
     assert rep["method_versions"] == ["m1.0"] and len(rep["segments"]) == 1
     seg = rep["segments"][0]
-    assert seg["rules_versions"] == ["r1"] and seg["rules_group"] == rules_fingerprint() and seg["frozen"] is True  # r1 ran the frozen rules
+    # r1 ran the frozen rules (since milestone 11 through the proven-equivalent fingerprint, pooled under the frozen one)
+    from fart.version import pooled_fingerprint
+
+    assert seg["rules_versions"] == ["r1"] and seg["rules_group"] == pooled_fingerprint(rules_fingerprint(), settings.config("measure")["community_gate"]) and seg["frozen"] is True
     # build_world marks the PumpPortal source as started at epoch 1: both days are covered, the first one has no graduations
     assert seg["universe"]["covered_days"] == 2 and seg["universe"]["not_covered_days"] == []
     assert seg["universe"]["graduations"] == 5 and seg["hit_rate"]["decisions"] == 3 and seg["universe"]["winners"] == 2

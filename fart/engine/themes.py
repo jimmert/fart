@@ -31,17 +31,21 @@ EXAMPLES = 3             # example coin names per term (the youngest first)
 SNAPSHOT_VERSION = 1
 
 
-def compute_metas(conn: sqlite3.Connection, as_of: float, mcfg: dict[str, Any], stopwords: set[str]) -> tuple[list[dict[str, Any]], dict[str, list[dict]], list[dict[str, Any]]]:
-    """The engine's step 5: the recent coins, their clusters per term and the ranked metas (top `max_terms`)."""
+def compute_metas(conn: sqlite3.Connection, as_of: float, mcfg: dict[str, Any], stopwords: set[str]
+                  ) -> tuple[list[dict[str, Any]], dict[str, list[dict]], list[dict[str, Any]], features.MetaBaseline]:
+    """The engine's step 5: the recent coins, their clusters per term, the ranked metas (top `max_terms`) and the baseline
+    they were measured against. The baseline (the coins of 6 to 48 hours before `as_of`, tokenized) is computed once here
+    and handed to every `meta_features` call (milestone 11); the per-term values are the ones milestone 10 computed."""
     recent = features.recent_coins(conn, as_of, float(mcfg.get("window_s", 10800)))
     clusters = cluster(recent, stopwords, int(mcfg.get("min_token_len", 4)))
+    baseline = features.meta_baseline(conn, as_of, mcfg, stopwords)
     metas = []
     for term, members in clusters.items():
         if len(members) < int(mcfg.get("min_coins", 3)):
             continue
-        metas.append(features.meta_features(conn, term, members, as_of, mcfg, stopwords))
+        metas.append(features.meta_features(conn, term, members, as_of, mcfg, stopwords, baseline))
     metas = features.rank_metas(metas)[: int(mcfg.get("max_terms", 50))]
-    return recent, clusters, metas
+    return recent, clusters, metas, baseline
 
 
 def observed_terms_today(conn: sqlite3.Connection, as_of: float) -> set[str]:
@@ -74,7 +78,7 @@ def build(conn: sqlite3.Connection, settings: Any, as_of: float, watched_terms: 
 
     mcfg = settings.config("engine").get("meta") or {}
     stopwords = load_stopwords(settings.config("stopwords"))
-    recent, clusters, metas = compute_metas(conn, as_of, mcfg, stopwords)
+    recent, clusters, metas, _ = compute_metas(conn, as_of, mcfg, stopwords)
     if watched_terms is None:
         watched_terms = burst_set_terms(conn)
     return snapshot(metas, clusters, as_of, mcfg, len(recent), watched_terms, observed_terms_today(conn, as_of), rules_version or rv())

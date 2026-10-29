@@ -102,6 +102,11 @@ verdicts). Gelijke vingerafdruk = dezelfde regels; die rules_versions staan same
 allemaal genoemd. De bevroren regels van de meetweek (`150ca73cb354`, vingerafdruk in `config/measure.json`
 → `community_gate.frozen_rules`) zijn het eerste segment. Een echte regelwijziging opent een nieuw segment.
 Een andere `method_version` in `outcomes` geeft een eigen segment met eigen dagrapporten.
+Sinds mijlpaal 11 kan een regelbestand veranderen zonder dat de regels veranderen (de basislijn van de thema's wordt één keer
+per tick geteld in plaats van per term; een test bewijst byte-gelijke uitkomsten). Zo'n vingerafdruk staat in
+`config/measure.json` → `community_gate.frozen_rules_equivalents` met datum, PR-nummer en de naam van de bewijstest; het
+weekrapport telt die rules_versions bij het bevroren segment en zegt onder de segmenttitel dat het om een bewezen
+gelijkwaardige berekening gaat. Zonder die registratie blijft een andere vingerafdruk een eigen segment.
 
 **Universum per dag.** Creates per bron (PumpPortal, RPC, unie), graduaties, graduaties zonder bekende
 create (`coin_unknown`), winnaars (organisch / gebundeld / onbekend), geen winnaar, uitkomst onbekend (en
