@@ -35,6 +35,16 @@ inside the same short write; `fart engine explain --day` reads them.
 Milestone 10: the ranked metas of step 5 (the top `max_terms`, with the fields the website's themes card shows) are
 written as JSON in kv `engine.metas_latest` in the same decision transaction (`fart/engine/themes.py`), so the website
 reads the engine's themes instead of repeating the clustering per visit. Nothing else of the tick changes.
+
+Milestone 11: the tick is seconds again instead of minutes (166 to 337 s on the VPS on 26 Oct 2026, all of it in step 5:
+the baseline of every term was fetched and tokenized again per term; `features.meta_baseline` now does it once per tick,
+with the outcomes proven byte-equal by a test). The tick has a budget and is visible: every step's duration (`expire_s`,
+`features_s`, `promote_s`, `rpc_s`, `metas_s`, `decisions_s`) is logged per tick (`engine.tick_steps`) and kept in the
+summary; a tick longer than the loop interval is counted (kv `engine.tick_slow` and `engine.tick_slow.<day>`, with the
+last one in `engine.tick_slow.last`) and logged at most once per hour (`engine.tick_slow`, with the number of slow ticks
+since the previous line). The durations of the last completed tick go to kv `engine.tick_last` inside the next tick's
+decision transaction (no write outside the existing ones), where `fart status` and `/eigenaar` read them. No work is
+skipped when a tick is slow: it becomes visible, never hidden.
 """
 from __future__ import annotations
 
@@ -49,7 +59,7 @@ from ..chain.curve import CurveParams
 from ..chain.rpc import RpcClient
 from ..config import Settings
 from ..ingest import watch
-from ..log import get_logger
+from ..log import Throttle, get_logger
 from ..net.budget import Budget
 from ..util import now as wall_now
 from ..version import rules_fingerprint, rules_version
@@ -63,6 +73,12 @@ log = get_logger("engine")
 # In `off` and `shadow` mode the engine writes exactly these, whatever the social daemon stored (milestone 6).
 X_NEUTRAL: dict[str, Any] = {"x_mentions_1h": 0, "x_distinct_authors_1h": 0, "x_follower_weighted_1h": 0.0, "x_first_mention_ts": None,
                              "x_count_1h": None, "x_count_24h": None, "x_count_ts": None}
+
+# The six steps of a tick, in order; their durations are logged per tick and written to kv (milestone 11).
+STEPS = ("expire_s", "features_s", "promote_s", "rpc_s", "metas_s", "decisions_s")
+SLOW_LOG_PERIOD_S = 3600.0   # a slow tick (longer than the loop interval) is logged at most once per hour; every one is counted
+KV_TICK_LAST = "engine.tick_last"
+KV_TICK_SLOW = "engine.tick_slow"
 
 
 class Engine:
@@ -80,6 +96,16 @@ class Engine:
         self.x_live = settings.x_live
         self.stats: dict[str, int] = {}
         self.burst_sets: dict[str, dict[str, Any]] = self._load_burst_sets()
+        # milestone 11: the tick budget. The durations of the running tick (partial after a failure), the last completed
+        # tick (written to kv in the next decision write), the slow ticks not yet counted in kv, the hourly log throttle.
+        self.interval_s = float(self.cfg.get("loop_interval_s", 15))
+        self.steps: dict[str, float] = {}
+        self.last_tick: dict[str, Any] | None = None
+        self.slow_pending = 0
+        self.slow_total = 0
+        self.slow_since_log = 0
+        self.slow_last: dict[str, Any] | None = None
+        self.slow_log = Throttle(SLOW_LOG_PERIOD_S)
 
     def _bump(self, k: str, n: int = 1) -> None:
         self.stats[k] = self.stats.get(k, 0) + n
@@ -118,6 +144,7 @@ class Engine:
                                    "meta_burst_released": 0, "meta_burst_trimmed": 0, "candidates_written": 0}
         cap, reserve = watch.limits(wcfg)
         t_start = time.monotonic()
+        self.steps = {}
 
         # 1. expire and trim (short write): rows past their TTL or idle, then meta_burst rows above the bound
         #    that are not part of the frozen choice (milestone 5; a row that traded in the last 10 min stays)
@@ -130,8 +157,10 @@ class Engine:
             return expired, trimmed
 
         summary["expired"], summary["meta_burst_trimmed"] = db.write_tx(self.conn, _expire, what="engine.expire")
+        self.steps["expire_s"] = time.monotonic() - t_start
 
         # 2. features (read snapshot, no writes). X reaches a decision only in live mode (milestone 6).
+        t_step = time.monotonic()
         strong: list[dict[str, Any]] = []
         promotions: list[dict[str, Any]] = []
         coin_records: list[dict[str, Any]] = []
@@ -153,16 +182,19 @@ class Engine:
                 coin_records.append(candidates.coin_row(f, reasons.get(mint), ccfg, passes))
                 if passes or f["unique_buyers_5m"] >= int(ccfg["observe_min_unique_buyers_5m"]) // 2:
                     strong.append(f)
-        summary["features_s"] = round(time.monotonic() - t_start, 3)
+        self.steps["features_s"] = time.monotonic() - t_step
 
         # 3. promotions (short write; promote_watchlist re-checks the probation reason)
+        t_step = time.monotonic()
         if promotions:
             def _promote(c: sqlite3.Connection) -> int:
                 return sum(1 for f in promotions if decide.promote_watchlist(c, f, now, wcfg))
 
             summary["promoted"] = db.write_tx(self.conn, _promote, what="engine.promote")
+        self.steps["promote_s"] = time.monotonic() - t_step
 
         # 4. RPC enrichment for the strongest candidates only (network: outside every transaction)
+        t_step = time.monotonic()
         strong.sort(key=lambda f: (f["net_sol_5m"], f["unique_buyers_5m"]), reverse=True)
         if self.rpc is not None:
             h_budget = int(ccfg.get("max_holder_lookups_per_loop", 3))
@@ -176,10 +208,12 @@ class Engine:
                     f["creator_activity"] = creator_activity(self.rpc, f["creator"], as_of)
                     c_budget -= 1
                     summary["rpc_lookups"] += 1
+        self.steps["rpc_s"] = time.monotonic() - t_step
 
-        # 5. metas (read snapshot, no writes)
+        # 5. metas (read snapshot, no writes); the baseline of the terms is computed once here (milestone 11)
+        t_step = time.monotonic()
         with db.read_tx(self.conn):
-            recent, clusters, metas = themes.compute_metas(self.conn, as_of, mcfg, self.stopwords)
+            recent, clusters, metas, baseline = themes.compute_metas(self.conn, as_of, mcfg, self.stopwords)
             bursting = [m for m in metas if decide.is_bursting(m, mcfg)]
             meta_records = [candidates.meta_row(m, decide.is_bursting(m, mcfg), decide.meta_verdict(m, mcfg)[0]) for m in metas]
             # the stable meta_burst choice (pure, computed here so the write below stays milliseconds)
@@ -198,8 +232,12 @@ class Engine:
         summary["metas"] = len(metas)
         summary["top_metas"] = [(m["term"], m["sol_inflow"], m["unique_buyers"], m["n_coins"]) for m in metas[:5]]
         summary["meta_burst_sets"], summary["meta_burst_mints"], summary["meta_burst_released"] = len(new_sets), len(burst_mints), len(released)
+        summary["recent_coins"], summary["baseline_coins"] = len(recent), baseline.n_coins
+        self.steps["metas_s"] = time.monotonic() - t_step
 
         # 6. decisions, meta_burst watchlist entries, heartbeat (short write)
+        t_step = time.monotonic()
+
         def _write(c: sqlite3.Connection) -> tuple[int, int, int]:
             n_coin = n_meta = n_added = 0
             for f in strong:
@@ -225,12 +263,52 @@ class Engine:
             db.kv_set(c, "engine.rules_version", self.rules_version, now)
             db.kv_set(c, f"engine.rules_fingerprint.{self.rules_version}", self.rules_fingerprint, now)
             db.kv_set(c, "engine.x_mode", self.x_mode, now)
+            # milestone 11: the previous tick's durations and the slow ticks since the last write, in this same transaction
+            self._write_tick_stats(c, now)
             return n_coin, n_meta, n_added
 
         summary["coin_decisions"], summary["meta_decisions"], summary["meta_burst_watched"] = db.write_tx(self.conn, _write, what="engine.decisions")
+        self.slow_pending = 0
         self.burst_sets = new_sets
-        summary["tick_s"] = round(time.monotonic() - t_start, 3)
+        self.steps["decisions_s"] = time.monotonic() - t_step
+        tick_s = time.monotonic() - t_start
+        summary.update({k: round(self.steps.get(k, 0.0), 3) for k in STEPS})
+        summary["tick_s"] = round(tick_s, 3)
+        summary["slow"] = tick_s > self.interval_s
+        self.record_tick(as_of, tick_s, True, summary)
         return summary
+
+    # ----- the tick budget (milestone 11) ---------------------------------------------------------------------------
+    def record_tick(self, as_of: float, tick_s: float, ok: bool, summary: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The tick that just ended: its durations are logged (`engine.tick_steps`), kept for the next decision write
+        (`engine.tick_last`) and, when the tick took longer than the loop interval, counted as slow (kv in the next
+        decision write; `engine.tick_slow` logged at most once per hour with the number of slow ticks since the previous
+        line). A failed tick is recorded too, with the durations of the steps it completed."""
+        s = summary or {}
+        rec: dict[str, Any] = {"as_of": float(as_of), "tick_s": round(float(tick_s), 3), "ok": bool(ok), "interval_s": self.interval_s,
+                               "slow": float(tick_s) > self.interval_s, **{k: round(self.steps.get(k, 0.0), 3) for k in STEPS},
+                               "coins": s.get("coins"), "metas": s.get("metas"), "recent_coins": s.get("recent_coins"), "baseline_coins": s.get("baseline_coins"),
+                               "coin_decisions": s.get("coin_decisions"), "meta_decisions": s.get("meta_decisions")}
+        self.last_tick = rec
+        log.info("engine.tick_steps", **rec)
+        if rec["slow"]:
+            self.slow_pending += 1
+            self.slow_total += 1
+            self.slow_since_log += 1
+            self.slow_last = rec
+            if self.slow_log.allow("tick_slow"):
+                log.warning("engine.tick_slow", slow_since_last_log=self.slow_since_log, slow_total=self.slow_total, **rec)
+                self.slow_since_log = 0
+        return rec
+
+    def _write_tick_stats(self, c: sqlite3.Connection, now: float) -> None:
+        """Inside the decision transaction: the last completed tick and the slow ticks not yet counted."""
+        if self.last_tick is not None:
+            db.kv_set(c, KV_TICK_LAST, json.dumps(self.last_tick, sort_keys=True), now)
+        if self.slow_pending and self.slow_last is not None:
+            db.counter_bump_daily(c, KV_TICK_SLOW, self.slow_pending, now)
+            db.kv_set(c, f"{KV_TICK_SLOW}.last", json.dumps(self.slow_last, sort_keys=True), now)
+            db.kv_set(c, f"{KV_TICK_SLOW}.last_at", str(self.slow_last["as_of"]), now)
 
 
 def run_engine(settings: Settings) -> int:
@@ -254,14 +332,16 @@ def run_engine(settings: Settings) -> int:
     failures = 0
     while not stopping["v"]:
         t0 = time.monotonic()
+        as_of = wall_now()
         try:
-            s = eng.tick(wall_now())
+            s = eng.tick(as_of)
             if s["coin_decisions"] or s["meta_decisions"] or time.monotonic() - last_log > 300:
                 last_log = time.monotonic()
                 log.info("engine.tick", **s)
         except Exception as e:
             failures += 1
             log.error("engine.tick_failed", exc_info=True, failures=failures)
+            eng.record_tick(as_of, time.monotonic() - t0, False)   # the steps it completed; counted as slow when it was
             db.record_failure(conn, "engine.tick_failed", wall_now(), detail=f"{type(e).__name__}: {str(e)[:150]}")
         elapsed = time.monotonic() - t0
         for _ in range(int(max(0.0, interval - elapsed) * 10)):

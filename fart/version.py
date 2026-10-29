@@ -11,6 +11,13 @@ files (`RULE_FILES`): two rules_versions with the same fingerprint ran the same 
 its fingerprint next to its rules_version in kv (`engine.rules_fingerprint.<rules_version>`), and
 `config/measure.json` -> `community_gate.frozen_rules` carries the fingerprint of the frozen measurement
 week; a test pins the working tree to it, so changing a rule means changing that config entry on purpose.
+
+Milestone 11: a rule file can change without the rules changing (the engine's baseline is counted once per tick
+instead of once per term; the outcomes are proven byte-equal by a test). Such a fingerprint is registered in
+`community_gate.frozen_rules_equivalents` with the date, the PR and the name of the proof test; `pooled_fingerprint`
+maps it to the frozen fingerprint, so the week report pools its rules_versions with the frozen week (and says so under
+the segment title) and the website keeps calling the rules frozen. The fingerprint itself stays what it is: nothing
+is hidden, the pooling is declared in the config and provable by the named test.
 """
 from __future__ import annotations
 
@@ -74,3 +81,30 @@ def rules_fingerprint(root: Path | None = None) -> str:
         h.update(b"\n")
     _CACHE[key] = "sha256:" + h.hexdigest()
     return _CACHE[key]
+
+
+def rules_equivalents(gate_cfg: dict | None) -> dict[str, dict]:
+    """fingerprint -> its entry of `community_gate.frozen_rules_equivalents` (milestone 11): the fingerprints of rule files
+    that a named test (in a named PR, on a date) proved to compute exactly the outcomes of the frozen rules."""
+    out: dict[str, dict] = {}
+    for e in (gate_cfg or {}).get("frozen_rules_equivalents") or []:
+        if isinstance(e, dict) and e.get("rules_fingerprint"):
+            out[str(e["rules_fingerprint"])] = e
+    return out
+
+
+def pooled_fingerprint(fp: str | None, gate_cfg: dict | None) -> str | None:
+    """The fingerprint `fp` is pooled under: the frozen one when `fp` is the frozen fingerprint or a proven equivalent of
+    it, otherwise `fp` itself (a real rules change stays its own group)."""
+    frozen = ((gate_cfg or {}).get("frozen_rules") or {}).get("rules_fingerprint")
+    if fp and frozen and (fp == frozen or fp in rules_equivalents(gate_cfg)):
+        return str(frozen)
+    return fp
+
+
+def runs_frozen_rules(gate_cfg: dict | None, fp: str | None = None) -> bool:
+    """Whether `fp` (the working tree's fingerprint by default) is the frozen fingerprint or a proven equivalent of it."""
+    frozen = ((gate_cfg or {}).get("frozen_rules") or {}).get("rules_fingerprint")
+    if not frozen:
+        return False
+    return pooled_fingerprint(rules_fingerprint() if fp is None else fp, gate_cfg) == str(frozen)

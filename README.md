@@ -1,5 +1,34 @@
 # fart
 
+## Voor Jim: wat milestone 11 toevoegt
+
+Mijlpaal 11 brengt de engine-tick terug van minuten naar seconden zonder dat ook maar één uitkomst verandert, en registreert
+dat bewijsbaar. Na de uitrol van M10 duurde een tick op de VPS 166 tot 337 seconden (om 14:00 UTC nog 4): het engine-proces zat
+op 97% CPU, beslissingen en thema's kwamen elke drie minuten in plaats van elke 15 seconden en de thema-kaart stond meestal op
+"nu niet berekend". De oorzaak zat in één stap: per thema werden alle coins van 6 tot 48 uur geleden opnieuw opgehaald en
+getokeniseerd om de basislijn te tellen, honderden keren per tick. De beslissingen staan in `docs/DECISIONS.md`, de uitrol in
+`deploy/DEPLOY.md` ("Milestone 11: engine performance"):
+
+1. **De basislijn één keer per tick.** De engine haalt de basislijncoins één keer per tick op (als indexbereik), tokeniseert
+   ze één keer en telt per term; elk thema leest zijn basislijn uit die teller. De definitie is exact gelijk gebleven: dezelfde
+   tijdgrenzen, dezelfde eventtijd, dezelfde tokenizer, dezelfde afronding. Op de testdatabase gaat de thema-stap van 13 s naar
+   0,3 s.
+2. **Een zichtbare tick-begroting.** Elke tick logt de duur van elke stap (`engine.tick_steps`); een tick langer dan 15 s wordt
+   geteld (`engine.tick_slow`) en één keer per uur gelogd; `fart status` toont de laatste voltooide tick per stap
+   (`engine tick: last 1,8 s (expire ..., features ..., metas ...); slow ticks (> 15 s): total=0 today=0`) en `/eigenaar` heeft
+   de kaart "Engine-tick (stappen en budget)". Er wordt nooit werk overgeslagen: traag wordt zichtbaar, niet verborgen.
+3. **Bewijs in plaats van vertrouwen.** `fart/engine/features.py` is een regelbestand, dus de vingerafdruk van de regels
+   verandert (`sha256:e3bf4320c45c` → `sha256:d45c41793c64`). Een test draait de oude implementatie (byte voor byte bewaard in
+   `tests/reference/`) naast de nieuwe op een database van 20.000 coins en 50.000 trades en bewijst dezelfde thema's, dezelfde
+   munt-features en dezelfde verdicts, byte voor byte. De nieuwe vingerafdruk staat in `config/measure.json` →
+   `community_gate.frozen_rules_equivalents` met datum, PR en de naam van die test; het weekrapport telt hem bij de bevroren
+   regels en zegt dat onder de segmenttitel; de website blijft "regels bevroren" tonen. **De regels zijn niet veranderd, alleen
+   de rekentijd.**
+
+Na de uitrol: `grep engine.tick_steps /opt/fart/logs/engine.log | tail -n 3` toont `tick_s` in seconden; `fart status` toont de
+regel `engine tick:` na de tweede tick en de nieuwe vingerafdruk bij `rules fingerprints (engine)`; de thema-kaart zegt weer
+"berekend door de engine ... geleden" met een leeftijd onder 30 s.
+
 ## Voor Jim: wat milestone 10 toevoegt
 
 Mijlpaal 10 maakt het openbare dashboard snel en robuust zonder iets aan het ontwerp of de inhoud te veranderen. Direct na
@@ -345,7 +374,7 @@ fart/          package: config, db (schema v7, write_tx), log, util, version (ru
 fart/net/      budget gate (rate, daily caps, health, backoff) + urllib JSON client
 fart/chain/    base58, PDA derivation, Anchor event decoder (pump.fun + pump-amm), tx parsing, curve math, Global account, RPC client
 fart/ingest/   raw store, normalization, PumpPortal + RPC log + RPC per-mint trade clients, sweep, coverage, retention
-fart/engine/   meta clustering, as-of features (incl. X), decisions, RPC enrichment, daemon
+fart/engine/   meta clustering, as-of features (incl. X; the metas' baseline once per tick), decisions, RPC enrichment, daemon with a visible tick budget
 fart/social/   X budget planner (USD), confirmation planner (keys, schedule, stop reasons), X client (mega/KOL/refresh/confirmation/fast posts), dry run, console calibration, daemon
 fart/notify/   outbox, Telegram sender, Dutch formatting (owner + community), daemon with the chat guard
 fart/measure/  prices, outcomes, paper trades, daily report, week report (bootstrap, go/no-go)

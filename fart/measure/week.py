@@ -48,7 +48,7 @@ from .. import db
 from ..config import Settings
 from ..log import get_logger
 from ..util import atomic_write_json, atomic_write_text, day_bounds, day_key, now as wall_now, utc_iso
-from ..version import rules_fingerprint, rules_version
+from ..version import pooled_fingerprint, rules_equivalents, rules_fingerprint, rules_version
 from .report import CU_NOTE, build_report
 
 log = get_logger("week")
@@ -91,12 +91,25 @@ def rules_fingerprint_map(conn: sqlite3.Connection, gate_cfg: dict[str, Any], rv
     return out
 
 
-def rules_groups(rules_versions: Iterable[str], fp_map: dict[str, str]) -> dict[str, list[str]]:
-    """group key (the fingerprint, or `unknown:<rv>`) -> sorted rules_versions."""
+def rules_groups(rules_versions: Iterable[str], fp_map: dict[str, str], gate_cfg: dict[str, Any] | None = None) -> dict[str, list[str]]:
+    """group key (the fingerprint, or `unknown:<rv>`) -> sorted rules_versions. A fingerprint listed in the config's
+    `frozen_rules_equivalents` (milestone 11: proven to compute the frozen rules' outcomes) is pooled under the frozen one."""
     groups: dict[str, list[str]] = {}
     for rv in sorted({str(v) for v in rules_versions}):
-        groups.setdefault(fp_map.get(rv) or f"unknown:{rv}", []).append(rv)
+        fp = fp_map.get(rv)
+        groups.setdefault(pooled_fingerprint(fp, gate_cfg) if fp else f"unknown:{rv}", []).append(rv)
     return groups
+
+
+def segment_equivalents(rvs: Iterable[str], fp_map: dict[str, str], gate_cfg: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The proven-equivalent fingerprints among the rules_versions of a segment, each with the rules_versions that ran it
+    (the config entry: fingerprint, date, PR, proof test), so the report can name them under the segment title."""
+    out: list[dict[str, Any]] = []
+    for fp, entry in rules_equivalents(gate_cfg).items():
+        mine = [rv for rv in rvs if fp_map.get(rv) == fp]
+        if mine:
+            out.append({**entry, "rules_versions": mine})
+    return out
 
 
 # ----- statistics --------------------------------------------------------------------------------------
@@ -282,7 +295,8 @@ def _sum(blocks: list[dict[str, Any]], *path: str) -> int:
     return tot
 
 
-def build_segment(reps: list[dict[str, Any]], rvs: list[str], group_key: str, mv: str, cfg: dict[str, Any], frozen_fp: str | None) -> dict[str, Any]:
+def build_segment(reps: list[dict[str, Any]], rvs: list[str], group_key: str, mv: str, cfg: dict[str, Any], frozen_fp: str | None,
+                  fp_map: dict[str, str] | None = None) -> dict[str, Any]:
     wcfg = cfg.get("week") or {}
     bcfg = wcfg.get("bootstrap") or {}
     draws, seed, alpha = int(bcfg.get("draws", 9999)), int(bcfg.get("seed", 20261026)), float(bcfg.get("alpha", 0.05))
@@ -361,6 +375,8 @@ def build_segment(reps: list[dict[str, Any]], rvs: list[str], group_key: str, mv
     seg = {
         "rules_group": group_key,
         "rules_versions": list(rvs),
+        "rules_fingerprints": {rv: (fp_map or {}).get(rv) for rv in rvs},
+        "equivalents": segment_equivalents(rvs, fp_map or {}, cfg.get("community_gate") or {}),
         "frozen": frozen_fp is not None and group_key == frozen_fp,
         "method_version": mv,
         "days": blocks,
@@ -434,8 +450,8 @@ def aggregate(day_reports_by_mv: dict[str, list[dict[str, Any]]], fp_map: dict[s
                 rvs |= set((w.get("earliest_by_rules_version") or {}).keys())
         if not rvs:
             rvs = {rv_now}
-        for key, group in rules_groups(rvs, fp_map).items():
-            segments.append(build_segment(reps, group, key, mv, cfg, frozen_fp))
+        for key, group in rules_groups(rvs, fp_map, gate_cfg).items():
+            segments.append(build_segment(reps, group, key, mv, cfg, frozen_fp, fp_map))
     # the frozen rules group first, then the rest
     segments.sort(key=lambda s: (not s["frozen"], s["rules_group"], s["method_version"]))
     any_reps = next(iter(day_reports_by_mv.values()), [])
@@ -483,6 +499,7 @@ def aggregate(day_reports_by_mv: dict[str, list[dict[str, Any]]], fp_map: dict[s
         "rules_version_now": rv_now,
         "rules_fingerprint_now": fp_now,
         "frozen_rules": frozen,
+        "frozen_rules_equivalents": list(rules_equivalents(gate_cfg).values()),
         "method_versions": sorted(day_reports_by_mv),
         "rules_fingerprints": fp_map,
         "costs": {"per_day": costs, "rpc_cu_estimate_total": sum(int(c.get("rpc_cu_estimate") or 0) for c in costs),
@@ -548,6 +565,14 @@ def _bin_label(b: dict[str, Any]) -> str:
     return f"{lo / 60:.0f} tot {hi / 60:.0f} min"
 
 
+def equivalence_line(e: dict[str, Any]) -> str:
+    """Under a segment title (milestone 11): the rules_versions whose fingerprint is a proven equivalent of the frozen rules."""
+    rvs = ", ".join(f"`{v}`" for v in e.get("rules_versions") or [])
+    return (f"Bewezen gelijkwaardige berekening in dit segment: rules_version(s) {rvs} met vingerafdruk `{str(e.get('rules_fingerprint'))[:19]}` "
+            f"tellen mee bij de bevroren regels. De regels zijn niet veranderd, alleen de rekentijd (PR #{e.get('pr')} van {e.get('date')}; "
+            f"bewijs: `{e.get('proof_test')}`).")
+
+
 def render_markdown(r: dict[str, Any]) -> str:
     kind = "hele kalenderweek (maandag t/m zondag)" if r.get("calendar_week") else "rollend venster"
     lines = [
@@ -566,11 +591,10 @@ def render_markdown(r: dict[str, Any]) -> str:
     for seg in r.get("segments") or []:
         u, hit, rec, lt, obs, g = seg["universe"], seg["hit_rate"], seg["recall"], seg["lead_time"], seg["observations"], seg["gate"]
         title = f"## Regels `{seg['rules_group'][:19]}`" + (" (bevroren meetweek)" if seg.get("frozen") else "") + f" · method_version `{seg['method_version']}`"
+        lines += ["", title, "", f"rules_versions in dit segment: {', '.join(f'`{v}`' for v in seg['rules_versions'])}"]
+        for e in seg.get("equivalents") or []:
+            lines += ["", equivalence_line(e)]
         lines += [
-            "",
-            title,
-            "",
-            f"rules_versions in dit segment: {', '.join(f'`{v}`' for v in seg['rules_versions'])}",
             "",
             "### Samenvatting",
             "",
@@ -744,6 +768,9 @@ def render_markdown(r: dict[str, Any]) -> str:
         f"- rules_version nu: `{r['rules_version_now']}` (vingerafdruk `{r.get('rules_fingerprint_now')}`)",
         f"- method_version(s): {', '.join(f'`{m}`' for m in (r.get('method_versions') or []))}",
         "- Vingerafdrukken per rules_version: " + ("; ".join(f"`{rv}` → `{str(fp)[:19]}`" for rv, fp in sorted((r.get("rules_fingerprints") or {}).items())) or "geen"),
+        "- Bewezen gelijkwaardige vingerafdrukken (gepoold met de bevroren regels, alleen de rekentijd veranderde): "
+        + ("; ".join(f"`{str(e.get('rules_fingerprint'))[:19]}` (PR #{e.get('pr')}, {e.get('date')}, `{e.get('proof_test')}`)"
+                     for e in (r.get("frozen_rules_equivalents") or [])) or "geen"),
         "",
     ]
     return "\n".join(lines)

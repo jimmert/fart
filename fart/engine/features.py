@@ -1,10 +1,16 @@
 """Event-time features. Every function takes `as_of` and only reads rows knowable at that time:
 received_at <= as_of and (block_time IS NULL OR block_time <= as_of). See db.asof_clause.
 Missing data is None, never 0, unless a count of nothing is genuinely zero.
+
+Milestone 11 changes nothing of what is computed, only how often: the baseline of the metas (the coins of 6 to 48 hours
+before `as_of`) is fetched and tokenized once per tick (`meta_baseline`) instead of once per term (`meta_features`
+reads its `base_n` from it). The values, their rounding and their order are unchanged; a test runs the milestone-10
+implementation next to this one on a fixture database and proves it byte for byte.
 """
 from __future__ import annotations
 
 import sqlite3
+from collections import Counter
 from typing import Any
 
 from ..chain.curve import CurveParams, CurveState, dev_buy_fraction_of_curve, graduation_progress
@@ -201,9 +207,59 @@ def recent_coins(conn: sqlite3.Connection, as_of: float, window_s: float) -> lis
     return [dict(r) for r in rows]
 
 
+# ----- metas: the baseline once per tick (milestone 11) -------------------------------------------------------------
+# The baseline of a term is the number of coins that carried the term between `baseline_from_s` and `baseline_to_s`
+# before `as_of`. Up to milestone 10 `meta_features` fetched those coins and tokenized them again for every term:
+# hundreds of terms per tick times tens of thousands of coins, 166 to 337 s per tick on the VPS (26 Oct 2026). Now
+# one query and one tokenization per tick count every term at once. The definition is unchanged: the same window on
+# the same event time COALESCE(block_time, received_at), the same `tokenize` with the same stopwords and
+# `min_token_len`, a coin counted once per term it carries (a set), the same `base_hours` and the same rounding. The
+# window is spelled out per case of the event time, so it is an index range (`coins_block_time`: the NULL rows and
+# the block_time range) instead of a walk over every coin; the two forms select exactly the same rows.
+BASELINE_SQL = (
+    f"SELECT name, symbol FROM coins WHERE {ASOF}"
+    " AND ((block_time IS NULL AND received_at > ? AND received_at <= ?) OR (block_time IS NOT NULL AND block_time > ? AND block_time <= ?))"
+)
+
+
+class MetaBaseline:
+    """The term counts of the baseline coins of one tick: `count(term)` is the number of coins created between
+    `b_from` and `b_to` seconds before `as_of` (and knowable at `as_of`) whose name or symbol carries the term."""
+
+    __slots__ = ("as_of", "b_from", "b_to", "min_len", "n_coins", "counts")
+
+    def __init__(self, as_of: float, b_from: float, b_to: float, min_len: int, n_coins: int, counts: Counter[str]):
+        self.as_of = as_of
+        self.b_from = b_from
+        self.b_to = b_to
+        self.min_len = min_len
+        self.n_coins = n_coins
+        self.counts = counts
+
+    def count(self, term: str) -> int:
+        return int(self.counts.get(term, 0))
+
+    def matches(self, as_of: float, b_from: float, b_to: float, min_len: int) -> bool:
+        return self.as_of == as_of and self.b_from == b_from and self.b_to == b_to and self.min_len == min_len
+
+
+def meta_baseline(conn: sqlite3.Connection, as_of: float, cfg: dict[str, Any], stopwords: set[str]) -> MetaBaseline:
+    """The baseline coins of the tick, fetched and tokenized once; every term's count at once."""
+    b_from = float(cfg.get("baseline_from_s", 172800))
+    b_to = float(cfg.get("baseline_to_s", 21600))
+    min_len = int(cfg.get("min_token_len", 4))
+    counts: Counter[str] = Counter()
+    n = 0
+    for r in conn.execute(BASELINE_SQL, (as_of, as_of, as_of - b_from, as_of - b_to, as_of - b_from, as_of - b_to)):
+        counts.update(meta_mod.tokenize(r["name"], r["symbol"], stopwords, min_len))
+        n += 1
+    return MetaBaseline(as_of, b_from, b_to, min_len, n, counts)
+
+
 def meta_features(conn: sqlite3.Connection, term: str, members: list[dict[str, Any]], as_of: float, cfg: dict[str, Any],
-                  stopwords: set[str]) -> dict[str, Any]:
-    """Money and wallets behind a term over the window, versus the term's own earlier baseline."""
+                  stopwords: set[str], baseline: MetaBaseline | None = None) -> dict[str, Any]:
+    """Money and wallets behind a term over the window, versus the term's own earlier baseline. `baseline` is the tick's
+    `meta_baseline(...)`; without it the function computes one for this call alone (the same value, at the old cost)."""
     window_s = float(cfg.get("window_s", 10800))
     mints = [m["mint"] for m in members]
     et = _event_time()
@@ -217,15 +273,15 @@ def meta_features(conn: sqlite3.Connection, term: str, members: list[dict[str, A
         f" FROM trades WHERE mint IN ({marks}) AND {ASOF} AND {et} > ? AND {et} <= ?",
         (*mints, as_of, as_of, as_of - window_s, as_of),
     ).fetchone() if mints else {"buy_sol": 0, "sell_sol": 0, "buyers": 0, "mints_with_trades": 0}
-    # baseline: coins/hour with this term between baseline_from and baseline_to seconds ago
+    # baseline: coins/hour with this term between baseline_from and baseline_to seconds ago (counted once per tick)
     b_from = float(cfg.get("baseline_from_s", 172800))
     b_to = float(cfg.get("baseline_to_s", 21600))
-    base_rows = conn.execute(
-        f"SELECT name, symbol FROM coins WHERE {ASOF} AND {et} > ? AND {et} <= ?",
-        (as_of, as_of, as_of - b_from, as_of - b_to),
-    ).fetchall()
     min_len = int(cfg.get("min_token_len", 4))
-    base_n = sum(1 for r in base_rows if term in meta_mod.tokenize(r["name"], r["symbol"], stopwords, min_len))
+    if baseline is None:
+        baseline = meta_baseline(conn, as_of, cfg, stopwords)
+    elif not baseline.matches(as_of, b_from, b_to, min_len):
+        raise ValueError("meta baseline of another tick or configuration")
+    base_n = baseline.count(term)
     base_hours = max(1e-9, (b_from - b_to) / 3600.0)
     base_rate = base_n / base_hours
     cur_rate = len(mints) / (window_s / 3600.0)

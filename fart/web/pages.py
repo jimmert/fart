@@ -753,11 +753,24 @@ def week_report_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
     boot = (f'<p class="caption section">Bootstrap: {esc(fmt_n(bs.get("draws")))} trekkingen met de gedekte dagen als blokken; een interval pas vanaf '
             f'{esc(fmt_n(bs.get("min_days")))} gedekte dagen en {esc(fmt_n(bs.get("min_winners")))} winnaars'
             + (f' (nu: {esc(bs.get("reason"))})' if bs.get("reason") else "") + f'. Regels {esc(v["fingerprint_short"])} ({esc(", ".join(v["rules_versions"]))}), meetmethode {esc(v["method_version"])}.'
+            + (f' {esc(v["equivalence_note"])}' if v.get("equivalence_note") else "")
             + (f' Andere regels in dit venster: {esc(", ".join(s["rules_group_short"] for s in v["other_segments"]))} (apart getoetst, niet op deze pagina).' if v.get("other_segments") else "") + "</p>")
     return head + f'<div class="section">{gate}</div><div class="grid grid-2 section">{hit}{recall}</div><div class="section">{universe}</div><div class="section">{per_day}</div>' + boot
 
 
 # ----- the method page --------------------------------------------------------------------------------------------------
+def fingerprint_now_sentence(fr: dict[str, Any]) -> str:
+    """The method page's sentence about the running code: the same fingerprint, a proven equivalent (milestone 11) or another one."""
+    now_short = esc(fr.get("fingerprint_now_short"))
+    if fr.get("same"):
+        return f"De code van nu heeft dezelfde vingerafdruk ({now_short})."
+    if fr.get("equivalent"):
+        e = fr.get("equivalent_entry") or {}
+        return (f"De code van nu heeft vingerafdruk {now_short}: een bewezen gelijkwaardige berekening van dezelfde regels, alleen de rekentijd veranderde "
+                f"(PR #{esc(e.get('pr'))} van {esc(e.get('date'))}, bewijs {esc(e.get('proof_test'))}); de rapporten tellen haar bij de bevroren regels.")
+    return f"De code van nu heeft een ANDERE vingerafdruk ({now_short})."
+
+
 def method_page(ctx: dict[str, Any], m: dict[str, Any]) -> str:
     if is_computing(m):
         return computing_page("Methode", "Hoe de radar werkt en wat de cijfers betekenen")
@@ -796,7 +809,7 @@ def method_page(ctx: dict[str, Any], m: dict[str, Any]) -> str:
         '<li><strong>Meten.</strong> Na 1, 6 en 24 uur wordt van elke observatie én van elke graduatie (ook die zonder observatie) de piek-marktkapitalisatie en het volume gemeten. Winnaar of niet; onbekend blijft onbekend. Elke ochtend komt een dagrapport, elke ochtend ook een weekrapport over de laatste zeven dagen.</li></ol>'
         '<h2 id="regels">Welke regels bevroren zijn</h2>'
         f'<p>Sinds {esc(fr["since_label"])} draait de radar op bevroren regels (versie <code>{esc(fr["rules_version"])}</code>, vingerafdruk <code>{esc(fr["fingerprint_short"])}</code>); '
-        f'de eerste volle meetdag is {esc(fr["first_full_day_label"])}. De code van nu heeft {"dezelfde" if fr["same"] else "een ANDERE"} vingerafdruk ({esc(fr["fingerprint_now_short"])}).</p>'
+        f'de eerste volle meetdag is {esc(fr["first_full_day_label"])}. {fingerprint_now_sentence(fr)}</p>'
         f'<p><strong>Een munt wordt een observatie</strong> bij: {esc(m["coin_rules"])}. Daarna geldt per munt een pauze van {esc(m["cooldown_label"])} voordat dezelfde munt opnieuw een observatie kan worden.</p>'
         f'<p><strong>Een thema wordt een observatie</strong> bij: {esc(m["meta_rules"])}.</p>'
         '<p>Meer dan dit is er niet: geen machine learning, geen geheime score, geen handmatige keuze. Wie de regels wil nalezen vindt ze in de broncode van de motor (fart) en in elk rapport bij “Versies”.</p>'
@@ -873,6 +886,7 @@ LOG_COLS: list[Col] = [("name", "log"), ("size_label", "grootte", "num"), ("modi
                        ("errors", "fouten (staart)", "num"), ("last_error", "laatste fout", "wide")]
 VIEW_COLS: list[Col] = [("view", "onderdeel"), ("seconds_label", "laatste duur", "num"), ("age_label", "berekend", "num"), ("state_label", "stand"),
                         ("errors", "fouten", "num"), ("last_error", "laatste fout", "wide")]
+TICK_COLS: list[Col] = [("step", "stap", "wide"), ("kind", "soort"), ("seconds_label", "duur", "num"), ("share_label", "aandeel", "num")]
 
 
 def _rowcls(rows: list[dict[str, Any]], mapping: dict[str, str]) -> list[dict[str, Any]]:
@@ -882,7 +896,7 @@ def _rowcls(rows: list[dict[str, Any]], mapping: dict[str, str]) -> list[dict[st
 def owner_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
     st, cv, x, rp, wk, sv, lg = v["status"], v["coverage"], v["x"], v["report"], v["week"], v["settings"], v["logs"]
     note = f'<p class="notice">{esc(st["note"])}</p>' if st.get("note") else ""
-    anchors = "".join(f'<a href="#{a}">{t}</a>' for a, t in (("gezondheid", "Gezondheid"), ("dekking", "Dekking"), ("beslissingen", "Beslissingen"), ("budgetten", "Budgetten"),
+    anchors = "".join(f'<a href="#{a}">{t}</a>' for a, t in (("gezondheid", "Gezondheid"), ("engine", "Engine-tick"), ("dekking", "Dekking"), ("beslissingen", "Beslissingen"), ("budgetten", "Budgetten"),
                                                                  ("x", "X en planner"), ("rapport", "Rapporten"), ("weergaven", "Weergaven"), ("instellingen", "Instellingen"),
                                                                  ("logboek", "Logboek")))
     head = (f'<section class="hero"><p class="eyebrow">Eigenaar</p><h1>Operationeel overzicht</h1><p class="lede">Alles wat de openbare pagina’s niet tonen: versheid van daemons en timers, budgetten, de X-planner, de instellingen en het logboek. Alleen-lezen, ook voor jou.</p>'
@@ -943,7 +957,8 @@ def owner_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
     logs = card("Logboek (samenvatting)", '<p class="small muted">De staart van elk logbestand: waarschuwingen en fouten geteld, de laatste fout benoemd. Nooit een cookie, sleutel of wachtwoord.</p>'
                 + table(LOG_COLS, _rowcls(lg.get("rows") or [], {"errors": "is-stale"}), empty="geen logbestanden", widths=("15", "10", "20", "10", "10", "35")), anchor="logboek", live="eigenaar-logboek")
     views = views_card(v.get("views") or {})
-    return (head + f'<div class="grid grid-2 section owner">{health}{decisions}{budgets}{report}</div><div class="section owner">{coverage}</div>'
+    engine = engine_tick_card(st.get("engine_tick") or {})
+    return (head + f'<div class="grid grid-2 section owner">{health}{engine}{decisions}{budgets}{report}</div><div class="section owner">{coverage}</div>'
             f'<div class="section owner">{xcard}</div><div class="section owner">{week}</div><div class="section owner">{reports_raw}</div>'
             f'<div class="section owner">{views}</div><div class="section owner">{settings_card}</div><div class="section owner">{logs}</div>')
 
@@ -958,6 +973,21 @@ def secs_label(s: Any) -> str:
     if v < 0.005:
         return "0.00 s"
     return f"{v:.2g} s" if v < 10 else f"{v:.0f} s"
+
+
+def engine_tick_card(et: dict[str, Any]) -> str:
+    """Milestone 11: the duration per step of the engine's last completed tick and the slow ticks, as the engine wrote them."""
+    intro = (f'<p class="small muted">Elke tick van de engine (elke {esc(et.get("interval_label", "15 s"))}) heeft zes stappen; hier staat de duur per stap van de '
+             f'laatste voltooide tick, zoals de engine die in de beslissingstransactie van de volgende tick opschreef (kv engine.tick_last). '
+             f'Een tick langer dan het loopinterval telt als traag (engine.tick_slow) en staat hoogstens één keer per uur in het logboek; er wordt nooit werk overgeslagen.</p>')
+    state = str(et.get("state") or "none")
+    head_pill = pill({"ok": "fresh", "slow": "not_covered", "failed": "not_covered"}.get(state, "unknown"), et.get("state_label") or "nog geen tick opgeslagen")
+    body = kv([("laatste voltooide tick", esc(fmt(et.get("tick_label")))), ("as_of", esc(fmt(et.get("as_of_label")))), ("omvang", esc(fmt(et.get("counts_label")))),
+               ("trage ticks (totaal / vandaag)", f'{esc(fmt_n(et.get("slow_total") or 0))} / {esc(fmt_n(et.get("slow_today") or 0))}'),
+               ("laatste trage tick", esc(fmt(et.get("slow_last_label"))))])
+    rows = [{**r, "_class": ""} for r in et.get("rows") or []]
+    return card("Engine-tick (stappen en budget)", intro + body + table(TICK_COLS, rows, empty="nog geen voltooide tick opgeslagen", widths=("50", "14", "18", "18")),
+                pill_html=head_pill, anchor="engine", live="eigenaar-engine")
 
 
 def views_card(vs: dict[str, Any]) -> str:

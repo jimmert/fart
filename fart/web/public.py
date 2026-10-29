@@ -29,7 +29,7 @@ from ..config import Settings
 from ..engine import themes as engine_themes
 from ..notify.format import age as age_label, fmt_day, fmt_time, n as fmt_n
 from ..util import day_bounds, day_key, day_start, hour_bounds, hour_key, utc_iso
-from ..version import rules_fingerprint, rules_version
+from ..version import rules_equivalents, rules_fingerprint, rules_version, runs_frozen_rules
 from . import data
 
 H24 = 86400
@@ -177,8 +177,8 @@ def week_position(settings: Settings, now: float) -> dict[str, Any]:
     today = day_key(now)
     out: dict[str, Any] = {"first_full_day": first, "first_full_day_label": fmt_day(first) if first else "onbekend", "today": today,
                            "days_total": WEEK_DAYS, "frozen_since": fr.get("since"), "frozen_rules_version": fr.get("rules_version"),
-                           "rules_frozen": rules_fingerprint() == fr.get("rules_fingerprint"), "fingerprint_short": rules_fingerprint()[:19],
-                           "rules_version": rules_version()}
+                           "rules_frozen": runs_frozen_rules(gate), "rules_equivalent": runs_frozen_rules(gate) and rules_fingerprint() != fr.get("rules_fingerprint"),
+                           "fingerprint_short": rules_fingerprint()[:19], "rules_version": rules_version()}
     try:
         start = _dt.datetime.strptime(first, "%Y-%m-%d").date()
         cur = _dt.datetime.strptime(today, "%Y-%m-%d").date()
@@ -289,7 +289,8 @@ def headline(st: dict[str, Any]) -> str:
     o = live.get("observations_today") or 0
     parts.append(f"{fmt_n(o)} {'observatie' if o == 1 else 'observaties'}")
     lead = "De radar ziet" if fr.get("status") == "fresh" else "De radar zag"
-    return f"{lead} {parts[0]}, {parts[1]} en {parts[2]}."
+    # two or three parts (the graduations are only counted on a covered day): "a, b en c." or "a en c.", never an index error
+    return f"{lead} {parts[0]}." if len(parts) == 1 else f"{lead} {', '.join(parts[:-1])} en {parts[-1]}."
 
 
 def warning_text(settings: Settings) -> str:
@@ -797,10 +798,17 @@ def week_public(r: dict[str, Any], name: str, now: float) -> dict[str, Any]:
     rb = (rec.get("before_graduation") or {})
     others = [{"rules_group_short": str(s.get("rules_group") or "")[:19], "frozen": bool(s.get("frozen")), "method_version": s.get("method_version"),
                "rules_versions": s.get("rules_versions") or [], "verdict": (s.get("gate") or {}).get("verdict")} for s in segs[1:]]
+    # milestone 11: rules_versions pooled into the frozen segment through a proven-equivalent fingerprint are named as such
+    equivalents = [{"fingerprint_short": str(e.get("rules_fingerprint") or "")[:19], "rules_versions": e.get("rules_versions") or [], "pr": e.get("pr"), "date": e.get("date")}
+                   for e in first.get("equivalents") or [] if isinstance(e, dict)]
+    equivalence_note = ("; ".join(f"rules_version(s) {', '.join(e['rules_versions'])} (vingerafdruk {e['fingerprint_short']}) tellen mee bij de bevroren regels als bewezen "
+                                  f"gelijkwaardige berekening: dezelfde regels, alleen de rekentijd veranderde (PR #{e['pr']}, {fmt_day(str(e['date'] or ''))})"
+                                  for e in equivalents) + ".") if equivalents else None
     return {
         **data.stamp(now), "kind": "week", "name": name, "start_day": r.get("start_day"), "end_day": r.get("end_day"), "days_total": r.get("days"),
         "window_label": window_label(r), "calendar_week": bool(r.get("calendar_week")), "generated_label": fmt_time(_iso_ts(r.get("generated_at"))),
         "frozen": bool(first.get("frozen")), "rules_versions": first.get("rules_versions") or [], "method_version": first.get("method_version"),
+        "equivalents": equivalents, "equivalence_note": equivalence_note,
         "fingerprint_short": str(first.get("rules_group") or "")[:19], "key_points": kp["items"], "verdict": kp["verdict"], "verdict_short": kp["verdict_short"],
         "verdict_kind": kp["verdict_kind"], "verdict_plain": verdict_plain(kp["verdict_kind"], criteria), "gate_note": gate.get("note"), "criteria": criteria,
         "bootstrap": {"enough_data": bool(bs.get("enough_data")), "reason": bs.get("reason"), "draws": bs.get("draws"), "min_days": bs.get("min_days"),
@@ -920,7 +928,10 @@ def method_view(settings: Settings) -> dict[str, Any]:
                       "draws_label": fmt_n(bs.get("draws"))},
         "frozen": {"rules_version": fr.get("rules_version"), "since_label": fmt_time(_iso_ts(fr.get("since"))) if fr.get("since") else "onbekend",
                    "first_full_day_label": fmt_day(str(fr.get("first_full_day") or "")), "fingerprint_short": str(fr.get("rules_fingerprint") or "")[:19],
-                   "fingerprint_now_short": rules_fingerprint()[:19], "same": rules_fingerprint() == fr.get("rules_fingerprint"), "rules_version_now": rules_version()},
+                   "fingerprint_now_short": rules_fingerprint()[:19], "same": rules_fingerprint() == fr.get("rules_fingerprint"), "rules_version_now": rules_version(),
+                   # milestone 11: a fingerprint proven to compute the frozen rules' outcomes (config: frozen_rules_equivalents)
+                   "equivalent": runs_frozen_rules(gate) and rules_fingerprint() != fr.get("rules_fingerprint"),
+                   "equivalent_entry": {k: v for k, v in (rules_equivalents(gate).get(rules_fingerprint()) or {}).items() if k in ("date", "pr", "proof_test")}},
         "criteria": gate_criteria_from_config(settings), "method_version": m.get("method_version"),
         "warning": warning_text(settings), "banner": banner_text(settings),
     }

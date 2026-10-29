@@ -20,7 +20,7 @@ from ..config import Settings
 from ..ingest import coverage as cov
 from ..notify.format import age as age_label, fmt_day, fmt_time, n as fmt_n
 from ..util import day_key, day_start, utc_iso
-from ..version import rules_fingerprint, rules_version
+from ..version import rules_equivalents, rules_fingerprint, rules_version
 
 H24 = 86400
 DECISIONS_LIMIT = 200
@@ -143,7 +143,7 @@ def status_view(conn: sqlite3.Connection | None, settings: Settings, now: float)
     if conn is None:
         out.update({"note": "Er is nog geen database (ingest heeft nog nooit gedraaid).", "schema_version": None, "daemons": [], "counts": {},
                     "open_gaps": [], "failures": {}, "decisions_today": {"observe": None, "observe_meta": None, "total": None, "last": "nooit"},
-                    "budgets": {}, "x": {}})
+                    "budgets": {}, "x": {}, "engine_tick": engine_tick_view({}, settings, now)})
         return out
     kv = _kv(conn, ("ingest.", "engine.", "measure.", "social.", "notify.", "backup.", "rpc_trades.", "x."))
     out["schema_version"] = db.schema_version(conn)
@@ -181,6 +181,7 @@ def status_view(conn: sqlite3.Connection | None, settings: Settings, now: float)
             fails[k] = v
     out["failures"] = dict(sorted(fails.items()))
     out["failures_label"] = ", ".join(f"{k} {v}" for k, v in out["failures"].items()) or "geen"
+    out["engine_tick"] = engine_tick_view(kv, settings, now)
     t0 = day_start(now)
     dec = {str(r[0]): int(r[1]) for r in conn.execute(
         "SELECT kind, COUNT(*) FROM decisions WHERE verdict='observe' AND as_of >= ? GROUP BY kind", (t0,))}
@@ -210,6 +211,76 @@ def status_view(conn: sqlite3.Connection | None, settings: Settings, now: float)
                 "note": settings.x_mode_note, "social_daemon": kv.get("social.x_mode"), "engine_daemon": kv.get("engine.x_mode"),
                 "token": "configured" if settings.x_configured else "not configured"}
     return out
+
+
+# the six steps of an engine tick (fart/engine/service.py STEPS), in Dutch, with what each one does to the database
+ENGINE_STEPS_NL = (("expire_s", "1. verlopen en trimmen van de watchlist", "schrijven"), ("features_s", "2. features van de gevolgde munten", "lezen"),
+                   ("promote_s", "3. promoties naar early_buyers", "schrijven"), ("rpc_s", "4. RPC-verrijking van de sterkste kandidaten", "netwerk"),
+                   ("metas_s", "5. thema’s: clustering, basislijn, metas", "lezen"), ("decisions_s", "6. beslissingen, thema’s, hartslag", "schrijven"))
+
+
+def _json_dict(raw: Any) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        v = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def engine_tick_view(kv: dict[str, str], settings: Settings, now: float) -> dict[str, Any]:
+    """The engine's tick budget (milestone 11): the duration per step of the last completed tick (kv `engine.tick_last`,
+    written by the engine in the next tick's decision transaction), the slow ticks (longer than the loop interval; kv
+    `engine.tick_slow`, `.<day>`, `.last`). Nothing is computed here; what the engine did not write is "nog niet"."""
+    interval = float((settings.config("engine") or {}).get("loop_interval_s", 15))
+    last = _json_dict(kv.get("engine.tick_last"))
+    slow_last = _json_dict(kv.get("engine.tick_slow.last"))
+    out: dict[str, Any] = {"interval_s": interval, "interval_label": f"{interval:g} s", "found": last is not None, "rows": [], "last": last,
+                           "slow_total": int(kv.get("engine.tick_slow", "0") or 0), "slow_today": int(kv.get(f"engine.tick_slow.{day_key(now)}", "0") or 0),
+                           "slow_last": slow_last, "slow_last_label": "geen", "tick_label": "nog niet", "as_of_label": "nog geen voltooide tick opgeslagen",
+                           "age_s": None, "state": "none", "state_label": "nog geen tick opgeslagen", "counts_label": "–"}
+    if isinstance(slow_last, dict) and slow_last.get("as_of") is not None:
+        try:
+            out["slow_last_label"] = f"{fmt_time(float(slow_last['as_of']))} ({_secs_nl(slow_last.get('tick_s'))})"
+        except (TypeError, ValueError):
+            pass
+    if last is None:
+        return out
+    for key, label, kind in ENGINE_STEPS_NL:
+        v = last.get(key)
+        out["rows"].append({"step": label, "kind": kind, "seconds": v, "seconds_label": _secs_nl(v), "share_label": _share_label(v, last.get("tick_s"))})
+    try:
+        as_of = float(last.get("as_of"))
+        out["age_s"] = round(max(0.0, now - as_of))
+        out["as_of_label"] = f"{fmt_time(as_of)} ({age_label(now - as_of)} geleden)"
+    except (TypeError, ValueError):
+        pass
+    out["tick_label"] = _secs_nl(last.get("tick_s"))
+    ok = bool(last.get("ok", True))
+    slow = bool(last.get("slow"))
+    out["state"] = "failed" if not ok else ("slow" if slow else "ok")
+    out["state_label"] = "MISLUKT" if not ok else (f"TRAAG (langer dan {interval:g} s)" if slow else f"binnen het loopinterval van {interval:g} s")
+    out["counts_label"] = (f"{fmt_n(last.get('coins'))} gevolgde munten, {fmt_n(last.get('recent_coins'))} munten in het themavenster, "
+                           f"{fmt_n(last.get('baseline_coins'))} basislijnmunten, {fmt_n(last.get('metas'))} thema’s")
+    return out
+
+
+def _secs_nl(s: Any) -> str:
+    try:
+        v = float(s)
+    except (TypeError, ValueError):
+        return "–"
+    if v < 0.005:
+        return "0,00 s"
+    return (f"{v:.2g} s" if v < 10 else f"{v:.0f} s").replace(".", ",")
+
+
+def _share_label(v: Any, total: Any) -> str:
+    try:
+        return pct(float(v) / float(total)) if float(total) > 0 else "–"
+    except (TypeError, ValueError, ZeroDivisionError):
+        return "–"
 
 
 def _fresh_row(key: str, label: str, ts: float | None, expect_s: float, now: float) -> dict[str, Any]:
@@ -545,7 +616,8 @@ def week_latest_view(settings: Settings, now: float) -> dict[str, Any]:
         group = str(seg.get("rules_group") or "")
         segs.append({"rules_group": group, "rules_group_short": group[:19], "frozen": bool(seg.get("frozen")), "method_version": seg.get("method_version"),
                      "rules_versions": seg.get("rules_versions") or [],
-                     "title": f"Regels {group[:19]}" + (" (bevroren meetweek)" if seg.get("frozen") else "") + f" · method_version {seg.get('method_version')}",
+                     "title": f"Regels {group[:19]}" + (" (bevroren meetweek)" if seg.get("frozen") else "") + f" · method_version {seg.get('method_version')}"
+                     + "".join(f" · gelijkwaardige berekening gepoold: {', '.join(e.get('rules_versions') or [])} (PR #{e.get('pr')})" for e in seg.get("equivalents") or []),
                      "verdict": g.get("verdict"), "note": g.get("note"), "criteria": crit,
                      "covered_days": u.get("covered_days"), "days_total": len(seg.get("days") or []), "complete_days": u.get("complete_days"),
                      "not_covered_days": u.get("not_covered_days") or [], "hours_not_covered": u.get("hours_not_covered"), "winners": u.get("winners"),
@@ -582,7 +654,9 @@ def settings_view(settings: Settings) -> dict[str, Any]:
             {"label": "rules_version (deze uitrol)", "value": rules_version()},
             {"label": "Vingerafdruk van de regelbestanden", "value": rules_fingerprint()},
             {"label": "Bevroren regels van de meetweek", "value": f"rules_version {fr.get('rules_version')} sinds {fr.get('since')}, vingerafdruk {fr.get('rules_fingerprint')}, eerste volle dag {fr.get('first_full_day')}"},
-            {"label": "Vingerafdruk gelijk aan de bevroren meetweek", "value": "ja" if rules_fingerprint() == fr.get("rules_fingerprint") else "NEE (andere regels dan de meetweek)"},
+            {"label": "Vingerafdruk gelijk aan de bevroren meetweek", "value": _frozen_label(gate)},
+            {"label": "Bewezen gelijkwaardige vingerafdrukken (milestone 11)", "value": "; ".join(
+                f"{e.get('rules_fingerprint')} (PR #{e.get('pr')}, {e.get('date')}, bewijs {e.get('proof_test')})" for e in rules_equivalents(gate).values()) or "geen"},
             {"label": "method_version (meetmethode)", "value": m.get("method_version")},
             {"label": "Regelbestanden", "value": ", ".join(_rule_files())},
         ]},
@@ -637,6 +711,18 @@ def settings_view(settings: Settings) -> dict[str, Any]:
         ]},
     ]
     return {"sections": sections}
+
+
+def _frozen_label(gate: dict[str, Any]) -> str:
+    """ja / gelijkwaardig (a proven equivalent of the frozen rules, milestone 11) / NEE."""
+    fp = rules_fingerprint()
+    if fp == (gate.get("frozen_rules") or {}).get("rules_fingerprint"):
+        return "ja"
+    e = rules_equivalents(gate).get(fp)
+    if e is not None:
+        return (f"gelijkwaardig: bewezen dezelfde uitkomsten, alleen de rekentijd veranderde (PR #{e.get('pr')} van {e.get('date')}, test {e.get('proof_test')}); "
+                "de rapporten tellen deze vingerafdruk bij de bevroren regels")
+    return "NEE (andere regels dan de meetweek)"
 
 
 def _rule_files() -> list[str]:

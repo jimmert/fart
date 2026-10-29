@@ -1078,3 +1078,96 @@ fart-engine en fart-web, de `curl`-controle koud en warm onder 1 s en de `fart s
     "never waits" test is a computation blocked on an event, released by the test: the request must come back within a
     second with the placeholder the first time and with the last value afterwards.
 153. **Branch and PR**: all work on the harness branch `claude/eloquent-mayer-acz0cg`; the PR targets `main`.
+
+## Milestone 11 (29 oktober 2026)
+
+**Samenvatting (Nederlands).** Gemeten op de VPS op 26 oktober 2026 tussen 22:58 en 23:19 UTC (199.000 trades, 37.500 coins,
+7.100 coins in het venster van 3 uur, circa 1.200 nieuwe coins per uur) duurde de engine-tick 166 tot 337 s (`tick_s` in de
+`engine.tick`-logregel; om 14:00 UTC nog 4 s): het engine-proces zat op 97% CPU, de heartbeat liep op tot 565 s, beslissingen en
+`engine.metas_latest` kwamen elke drie minuten in plaats van elke 15 s en de thema-kaart van de website stond meestal op "nu niet
+berekend". `features_s` was 0,35 s; de tijd zat in stap 5 (de metas): `meta_features` haalde per term alle coins van 6 tot 48 uur
+vóór `as_of` op (tienduizenden rijen) en tokeniseerde ze opnieuw om te tellen hoe vaak de term voorkwam, honderden keren per
+tick. M11 brengt de tick terug naar seconden zonder dat één uitkomst verandert.
+**De regels zijn niet veranderd, alleen de rekentijd.** (1) **Basislijn één keer per tick** (`features.meta_baseline`, `MetaBaseline`): de basislijncoins worden één keer
+per tick opgehaald als indexbereik op de eventtijd (`coins_block_time`; beide gevallen van `COALESCE(block_time, received_at)`
+uitgeschreven, exact dezelfde rijen als de oude query), één keer getokeniseerd en per term geteld (`collections.Counter`);
+`meta_features` leest `base_n` uit die teller. Dezelfde tijdgrenzen op dezelfde eventtijd, dezelfde `tokenize` met dezelfde
+stopwoorden en `min_token_len`, dezelfde `base_hours`, dezelfde afronding; `recent_coins`, de clustering, de tradesaggregatie
+per term (via de mint-index) en de rangschikking zijn ongewijzigd. Op de fixture van het bewijs (20.000 coins, 50.000 trades)
+gaat stap 5 van 13 s naar 0,3 s. (2) **Tick-begroting en zichtbaarheid**: elke tick logt de duur van elke stap
+(`engine.tick_steps`: `expire_s`, `features_s`, `promote_s`, `rpc_s`, `metas_s`, `decisions_s`, `tick_s`), een tick langer dan
+het loopinterval (15 s) wordt geteld (kv `engine.tick_slow`, `engine.tick_slow.<dag>`, de laatste in `engine.tick_slow.last`)
+en één keer per uur gelogd, en de duren van de laatste voltooide tick staan in kv `engine.tick_last`, geschreven in de
+beslissingstransactie van de volgende tick (geen schrijfactie buiten de bestaande); `fart status` toont ze
+(`engine tick: ...`) en `/eigenaar` heeft de kaart "Engine-tick (stappen en budget)". Er wordt nooit werk overgeslagen: een
+trage tick wordt zichtbaar, niet verborgen. (3) **Bewijs en registratie**: `features.py` is een regelbestand, dus de
+vingerafdruk verandert (van `sha256:e3bf4320c45c` naar `sha256:d45c41793c64`). Dat mag alleen met bewijs:
+`tests/test_m11_engine_performance.py::test_meta_step_old_and_new_implementation_are_byte_equal` draait de M10-implementatie
+(byte voor byte bewaard als `tests/reference/features_m10.py`, sha256 vastgepind) naast de nieuwe op een fixture-database van
+20.000 coins over 48 uur en 50.000 trades en bewijst dezelfde metas (elke term, elk veld, de afronding, de volgorde), dezelfde
+coin-features en dezelfde `decide.coin_verdict`/`meta_verdict`; de overige regelbestanden zijn byte-gelijk aan de meetweek
+(hun deelvingerafdruk is vastgepind). De nieuwe vingerafdruk staat in `config/measure.json` →
+`community_gate.frozen_rules_equivalents` met datum, PR-nummer en de naam van die test; het weekrapport neemt die vingerafdruk
+samen met de bevroren en zet onder de segmenttitel dat het om een bewezen gelijkwaardige berekening gaat; de website blijft
+"regels bevroren" tonen en benoemt de gelijkwaardigheid op `/methode` en `/eigenaar`. (4) **Website**: met een snelle tick is
+`engine.metas_latest` weer vers (≤ 30 s oud) en toont de thema-kaart "fresh"; de ouderdomsgrens van 5 minuten blijft.
+(5) **Uitrol**: `deploy/DEPLOY.md`, "Milestone 11: engine performance": herstart van fart-engine, `tick_s` in het engine-log
+(< 15 s), de stapduren in `fart status`, de nieuwe vingerafdruk in `rules fingerprints (engine)` en de regel over de
+gelijkwaardigheid in het weekrapport. Geen schemamigratie, geen nieuwe dependency, stdlib-only. Terzijde: de openbare kopregel
+(`public.headline`) faalde op een dag zonder dekking (drie delen verwacht, twee aanwezig); hij voegt nu de delen samen die er
+zijn.
+
+154. **The baseline once per tick, by construction the same count** (`features.meta_baseline`, `MetaBaseline`,
+    `BASELINE_SQL`; `themes.compute_metas` builds it once and hands it to every `meta_features`): the milestone-10 `base_n`
+    was `sum(1 for r in base_rows if term in tokenize(r.name, r.symbol, stopwords, min_len))`, a membership test in a set per
+    row; a `Counter` updated with every row's token set gives, for every term, exactly that sum (a set counts a term once per
+    coin, whether it occurs in the name, the symbol or both). The window query is rewritten as
+    `(block_time IS NULL AND received_at > X AND received_at <= Y) OR (block_time IS NOT NULL AND block_time > X AND block_time <= Y)`,
+    the two cases of `COALESCE(block_time, received_at)` spelled out: logically the same rows, served by `coins_block_time`
+    (a MULTI-INDEX OR: the NULL rows and the range) instead of a walk over every coin through `coins_received_at`. A
+    baseline of another tick or configuration is refused (`ValueError`), never used silently; without a baseline
+    `meta_features` computes one for the call (the same value, the old cost), so direct callers and the milestone-5 tests
+    keep working. `recent_coins` is deliberately untouched, SQL included: its row order feeds `sample_mints` and the tie
+    order of the youngest-first sorts, and an identical statement on the same database gives an identical order.
+155. **Why only the baseline, and no shared trade aggregate** (the per-term `migrations` and `trades` queries stay as
+    they were): on the proof fixture the per-term queries of 131 terms take 0.14 s and the clustering milliseconds; the
+    baseline was 12.7 of the 12.9 s. Combining per-mint sums into per-term sums in Python would change the order of
+    floating-point additions (SQLite sums the rows of the IN-list in one pass) and could move a value across a rounding
+    boundary: not byte-equal by construction, and not needed. The step is linear in the coins of the baseline and of the
+    window, plus a cheap index lookup per member mint.
+156. **The tick budget is visible, never enforced by skipping** (`Engine.record_tick`, `STEPS`, `engine.tick_steps`,
+    `engine.tick_slow`, kv `engine.tick_last` and `engine.tick_slow*`): the durations are measured per step with the
+    monotonic clock, logged every tick in one compact line (about 300 bytes; the `engine.tick` summary keeps its cadence
+    and carries them too), and written to kv in the next tick's decision transaction: the engine has no write outside its
+    existing transactions, and the previous tick is the last one whose write step has a duration. A tick longer than the
+    loop interval is counted the moment it ends (in memory, then kv at the next write) and logged at most once per hour
+    with the number of slow ticks since the previous line, so a slow night is one line per hour in the log and a counter
+    in `fart status`, never silence and never a skipped step. A failed tick is recorded with the steps it completed. The
+    counters are not failures (`engine.tick_failed` stays what it is): they are a budget signal.
+157. **A changed rule file with unchanged rules is registered, not hidden** (`config/measure.json` →
+    `community_gate.frozen_rules_equivalents`, `version.pooled_fingerprint`, `version.runs_frozen_rules`,
+    `week.segment_equivalents`, `week.equivalence_line`): the fingerprint mechanism of milestone 5 stays exactly what it
+    is (the hash of the rule files; the engine records it per rules_version). What is new is a declared, bounded exception:
+    a fingerprint listed in the config with a date, a PR and the name of the test that proves the equivalence is pooled
+    under the frozen one by the week report (which prints the pooling under the segment title and in "Versies") and
+    counts as "regels bevroren" on the website (which names it on `/methode` and `/eigenaar`). Without the entry the same
+    rules_versions are two segments, as before; a real rules change never goes into the list, and the fingerprint test of
+    milestone 5 now checks both the pooled equality and that every entry carries its proof (the test file and function
+    exist). The frozen entry itself (`150ca73cb354`, `sha256:e3bf4320c45c`) is untouched.
+158. **The proof is a frozen copy, not a re-derivation** (`tests/reference/features_m10.py`, `tests/reference/README.md`,
+    `tests/test_m11_engine_performance.py`): the milestone-10 rule file is kept verbatim (its sha256 is pinned in the
+    test; it is loaded as a module of the `fart.engine` package so its relative imports resolve) and run next to the new
+    implementation on a fixture of 20,000+ coins over 48 hours (vocabulary names, camelCase, stopwords, unicode, digits,
+    no name, 5% received-only, clock skew, rows at every window boundary, late backfills) and 50,000+ trades (the themes
+    window, the watched coins' windows, whales, creator sells, boundary rows, late rows), with graduations, the watchlist
+    and X rows. Compared as JSON without sorting: the metas of every term (values, rounding, field order, list order and
+    ranking) at three ticks (a full tick, a sampled one four hours earlier, one where the baseline is empty), the coin
+    features of 300 mints at two ticks with their verdicts and promotions, `x_features` and `mega_post_feature`. The
+    other rule files are pinned by a partial fingerprint, so the proof covers exactly the file that changed. The test also
+    proves one baseline query per tick as an index range, the step under 5 s and at least five times faster than the
+    reference, the tick summary, the slow-tick accounting, and the fresh themes card.
+159. **The public headline joins what it has** (`public.headline`): the dashboard's sentence assumed three parts, but the
+    graduations are only counted on a covered day, so a day without coverage gave an `IndexError` and the status view
+    failed (the page then said "wordt berekend" forever). Found by the test suite on a day after the fixture date; fixed by
+    joining the parts present ("a, b en c." stays "a, b en c."). Not a rule and not a design change.
+160. **Branch and PR**: all work on the harness branch `claude/loving-davinci-3rsdh3`; the PR targets `main`.

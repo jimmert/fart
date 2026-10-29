@@ -602,8 +602,10 @@ def test_deploy_files_and_docs_for_milestone_10():
     assert "milestone 10" in readme.lower() and "web views" in readme
     arch = (ROOT / "docs" / "ARCHITECTURE.md").read_text()
     assert "ViewStore" in arch
-    # the rule files are untouched: the fingerprint of the frozen measurement week still holds (the same test as milestone 5)
-    from fart.version import RULE_FILES, rules_fingerprint
+    # the rules are untouched: the fingerprint of the frozen measurement week still holds (the same test as milestone 5; since milestone 11
+    # through the proven-equivalent fingerprint of features.py, pooled with the frozen one)
+    from fart.version import RULE_FILES, pooled_fingerprint, rules_fingerprint
 
-    frozen = json.loads((ROOT / "config" / "measure.json").read_text())["community_gate"]["frozen_rules"]["rules_fingerprint"]
-    assert rules_fingerprint() == frozen and "fart/engine/themes.py" not in RULE_FILES and "fart/engine/service.py" not in RULE_FILES
+    gate = json.loads((ROOT / "config" / "measure.json").read_text())["community_gate"]
+    assert pooled_fingerprint(rules_fingerprint(), gate) == gate["frozen_rules"]["rules_fingerprint"]
+    assert "fart/engine/themes.py" not in RULE_FILES and "fart/engine/service.py" not in RULE_FILES

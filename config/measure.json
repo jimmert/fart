@@ -57,13 +57,22 @@
     }
   },
   "community_gate": {
-    "_comment": "Go/no-go criteria for community alerts, frozen BEFORE the measurement week (docs/DECISIONS.md, milestone 5, 26 Oct 2026). Start values chosen by the builder; Jim may adjust them before the week ends, never afterwards. The week report prints every criterion as voldaan / niet voldaan / te weinig data and an overall verdict; nothing is decided or sent by it. complete day = a day of the window in which every peak hour (peak_hours_utc, 12:00-02:00 UTC as the hours 12..23 and 0..1 of that UTC day) was covered. hit rate = observe (coin) decisions that became a winner within 24 h, over the decisions whose 24 h have elapsed: an unknown outcome stays in the denominator (not a demonstrated hit), a pending one is listed apart. recall = winners with an observe or observe_meta decision before graduation. lead time = graduation minus the earliest observe/observe_meta decision. observations per day = observe + observe_meta decisions per covered day. frozen_rules: the rules_version that started the measurement week and the fingerprint of the rule-defining files at that commit (fart/version.py RULE_FILES); every later rules_version with the same fingerprint ran the same rules and is pooled with it.",
+    "_comment": "Go/no-go criteria for community alerts, frozen BEFORE the measurement week (docs/DECISIONS.md, milestone 5, 26 Oct 2026). Start values chosen by the builder; Jim may adjust them before the week ends, never afterwards. The week report prints every criterion as voldaan / niet voldaan / te weinig data and an overall verdict; nothing is decided or sent by it. complete day = a day of the window in which every peak hour (peak_hours_utc, 12:00-02:00 UTC as the hours 12..23 and 0..1 of that UTC day) was covered. hit rate = observe (coin) decisions that became a winner within 24 h, over the decisions whose 24 h have elapsed: an unknown outcome stays in the denominator (not a demonstrated hit), a pending one is listed apart. recall = winners with an observe or observe_meta decision before graduation. lead time = graduation minus the earliest observe/observe_meta decision. observations per day = observe + observe_meta decisions per covered day. frozen_rules: the rules_version that started the measurement week and the fingerprint of the rule-defining files at that commit (fart/version.py RULE_FILES); every later rules_version with the same fingerprint ran the same rules and is pooled with it. frozen_rules_equivalents (milestone 11): fingerprints of rule files that a named test proved to compute exactly the outcomes of the frozen rules (the same metas, features and verdicts, byte for byte); the week report pools their rules_versions with the frozen fingerprint and says so under the segment title, the website keeps calling the rules frozen. An entry needs the fingerprint, the date, the PR and the proof test; a real rules change never goes here.",
     "frozen_rules": {
       "rules_version": "150ca73cb354",
       "rules_fingerprint": "sha256:e3bf4320c45c7cd3c159bc045a66164ae1754637979ddacc759dc6bd59bbbd46",
       "since": "2026-10-26T12:18:00Z",
       "first_full_day": "2026-10-27"
     },
+    "frozen_rules_equivalents": [
+      {
+        "rules_fingerprint": "sha256:d45c41793c64e055ef2958f69c621118dd84ff1e54e2f29e4285e3adfbb00fe4",
+        "date": "2026-10-29",
+        "pr": 11,
+        "proof_test": "tests/test_m11_engine_performance.py::test_meta_step_old_and_new_implementation_are_byte_equal",
+        "note": "milestone 11: the baseline of the metas is counted once per tick instead of once per term (fart/engine/features.py: meta_baseline); the same rules and the same outcomes, only the computation time changed (166 to 337 s per tick on the VPS on 26 Oct 2026, seconds now). The proof test runs the milestone-10 rule file (tests/reference/features_m10.py, byte for byte) next to the new one on a fixture database of 20,000 coins over 48 hours and 50,000 trades: the same terms, field values and order, the same coin features, the same verdicts."
+      }
+    ],
     "min_complete_days": 5,
     "peak_hours_utc": [
       12,
