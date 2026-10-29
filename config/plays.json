@@ -1,0 +1,10 @@
+{
+  "_comment": "Milestone 12: the proven plays the plays layer (fart/plays, fart-plays.service) tests every tick and the Terminal shows. `rules` is EMPTY until `fart research promote <hypothesis> <variant>` writes a rule here from a research report in which that variant was proven (lower bound of the 95% bootstrap interval of the expected value after costs > 0 outside the selection half, at least 100 cases, unknown share under 20%, median lead time at least 2 minutes). Every rule carries its version, the date, the report name and the measured figures; a promoted rule is never edited in place: a change is a new version. size_sol is the paper position of every play; entry_delay_s the assumed human delay between the signal and the fill; alerts.max_per_hour bounds the Telegram alerts (kind play, owner chat only; the community channel stays behind the go/no-go test). Not a rule file of the engine: the observation rules (fart/version.py RULE_FILES) are untouched by anything here.",
+  "version": 1,
+  "size_sol": 0.5,
+  "entry_delay_s": 20,
+  "alerts": {
+    "max_per_hour": 6
+  },
+  "rules": []
+}

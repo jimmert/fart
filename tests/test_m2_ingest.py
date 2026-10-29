@@ -172,7 +172,7 @@ def test_migration_v1_to_v2_preserves_milestone1_data(tmp_path):
     c.close()
     conn = db.connect(path)
     try:
-        assert db.schema_version(conn) == db.SCHEMA_VERSION == 8  # v1 -> v2 -> ... -> v8 in one go
+        assert db.schema_version(conn) == db.SCHEMA_VERSION >= 8  # v1 -> v2 -> ... -> the current version in one go
         counts = db.table_counts(conn, ("coins", "migrations", "trades", "decisions", "outcomes", "coverage", "coverage_gaps", "raw_undecoded"))
         assert all(v == 1 for v in counts.values()), counts
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}

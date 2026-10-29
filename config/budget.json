@@ -64,8 +64,8 @@
       "backoff_max_s": 600
     },
     "geckoterminal": {
-      "_comment": "assumed 10 calls per minute shared",
-      "rate_per_s": 0.16667,
+      "_comment": "GeckoTerminal's public API documents 30 calls per minute (read 29 Oct 2026); milestone 12 sets the gate to that figure, shared between the SOL/USD fallback and the candle queue (fart/measure/candles.py: at most candles.max_fetches_per_run per tracker run). A 429 arms the backoff.",
+      "rate_per_s": 0.5,
       "burst": 5,
       "daily_requests": 10000,
       "daily_cost": null,

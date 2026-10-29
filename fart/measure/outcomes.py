@@ -241,6 +241,25 @@ def run_track(settings: Settings) -> int:
     try:
         budget = Budget.from_settings(conn, settings)
         Tracker(conn, settings, budget).run()
+        # milestone 12: two bounded steps of their own next to the tracker (never by the engine): the creator statistics and the
+        # minute candles after graduation. Each one is isolated: a failure is logged and counted and never stops the tracker.
+        run_extra_steps(conn, budget, settings, wall_now())
     finally:
         conn.close()
     return 0
+
+
+def run_extra_steps(conn: sqlite3.Connection, budget: Budget, settings: Settings, now: float) -> dict[str, Any]:
+    """The milestone-12 steps of the track timer: `creator_stats` (fart/measure/creators.py) and the candle queue
+    (fart/measure/candles.py), each bounded per run and visible in `fart status`."""
+    from . import candles, creators
+
+    out: dict[str, Any] = {}
+    for name, fn in (("creator_stats", lambda: creators.update(conn, settings, now)), ("candles", lambda: candles.run(conn, budget, settings, now))):
+        try:
+            out[name] = fn()
+        except Exception as e:  # noqa: BLE001  one step must never take the tracker down
+            log.error(f"track.{name}_failed", exc_info=True)
+            db.record_failure(conn, f"measure.{name}_failed", now, detail=f"{type(e).__name__}: {str(e)[:150]}")
+            out[name] = {"error": f"{type(e).__name__}: {str(e)[:120]}"}
+    return out

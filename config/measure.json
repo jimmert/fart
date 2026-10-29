@@ -95,5 +95,64 @@
     "min_recall_before_graduation_ci_low": 0.25,
     "min_median_lead_s_before_graduation": 600,
     "max_observations_per_day": 12
+  },
+  "candles": {
+    "_comment": "Milestone 12 (B.5): the 1-minute OHLCV candles of a graduated coin's PumpSwap pool from GeckoTerminal, fetched ONCE per graduation, after_graduation_s after it (one hour: the candles then cover the first hour on the pool), through the shared `geckoterminal` budget source (config/budget.json: 30 requests per minute, shared with the SOL/USD fallback). The queue is `candle_jobs` (one row per graduation with a known pool address; a graduation without a pool address is marked `pool_unknown` and never fetched); a run of `fart measure track` fetches at most max_fetches_per_run due jobs, oldest first, and gives up on a job after max_attempts errors. `limit` is the number of candles asked for (GeckoTerminal caps a call at 1000). A missing candle stays missing: nothing is interpolated. `fart status` shows the backlog (pending, fetched today, errors).",
+    "enabled": true,
+    "after_graduation_s": 3600,
+    "max_fetches_per_run": 20,
+    "limit": 90,
+    "max_attempts": 3,
+    "timeout_s": 10
+  },
+  "creator_stats": {
+    "_comment": "Milestone 12 (B.4): the `creator_stats` table (per creator wallet: coins, graduations, winners, bundled coins, early dev sells, first and last coin) is recomputed by a step of `fart measure track` for the creators of coins created since the previous run and the creators of coins whose 24 h outcome was written since then, at most max_creators_per_run per run (the rest follows in the next run; the backlog is in `fart status`). dev_sell_window_s: a creator sell within this many seconds after the create counts as an early dev sell. The research harness does not read the table: it computes the same figures as-of the entry time (fart/research/features.py).",
+    "max_creators_per_run": 2000,
+    "dev_sell_window_s": 600
+  },
+  "research": {
+    "_comment": "Milestone 12 (B.1): the backtest harness `fart research` (fart/research). Execution: entry entry_delay_s after the signal (the human), filled with buy_quote on the curve state of the first trade after that delay, size_sol per trade; costs: the curve fee of config/pumpfun.json per side (1%), priority_fee_sol per transaction, the curve's own price impact, after graduation pumpswap_fee_bps and an impact estimated from the DexScreener liquidity. entry_delays_s and sizes_sol are the sensitivity grid. bootstrap: a block bootstrap with the UTC days as blocks over the mean result per trade (draws, fixed seed, two-sided alpha). proven: the lower bound of that interval over the TEST half of the days (walk-forward: parameters chosen on the first half) is above 0 after costs, at least min_cases cases in the test half, an unknown share under max_unknown_share and a median lead time (signal to peak) of at least min_lead_s. tick_s is the engine cadence the replay evaluates the rules at. peak_hours_utc: the conditioning split of the reports.",
+    "entry_delay_s": 20,
+    "entry_delays_s": [
+      5,
+      20,
+      60,
+      120
+    ],
+    "size_sol": 0.5,
+    "sizes_sol": [
+      0.1,
+      0.5,
+      1.0
+    ],
+    "priority_fee_sol": 0.0005,
+    "pumpswap_fee_bps": 25,
+    "tick_s": 15,
+    "default_days": 7,
+    "bootstrap": {
+      "draws": 9999,
+      "seed": 20261029,
+      "alpha": 0.05
+    },
+    "proven": {
+      "min_cases": 100,
+      "max_unknown_share": 0.2,
+      "min_lead_s": 120
+    },
+    "peak_hours_utc": [
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      0,
+      1
+    ]
   }
 }

@@ -46,6 +46,17 @@
                          but logs/web.log (milestones 8 and 9; the brand is config/web.json)
   web hash-password      ask for the owner's password invisibly (twice) and print only its scrypt hash for .env
   web new-secret         print a fresh cookie-signing secret for .env (a new secret logs every browser out)
+  research run --hypothesis H [--days N] [--end D] [--delay S] [--size SOL] [--limit N]
+                         milestone 12: the backtest harness on our own data for one pre-registered hypothesis (H1..H7; `--hypothesis all`
+                         runs them in the pre-registered order); writes out/research/<date>-<H>.md|json (Dutch, every variant, the
+                         rejected included); reads the database, writes only under out/research/
+  research autopsy [--days N] [--end D]
+                         the organic winners' first five minutes next to the non-winners (out/research/<date>-autopsy.md|json)
+  research promote H VARIANT [--report NAME]
+                         write a PROVEN variant of a report into config/plays.json as a new rule version; refuses anything not proven
+  research list          the hypotheses with their grids and the reports written so far
+  plays [--once]         daemon: the plays layer (15 s loop): tests the rules of config/plays.json on the live data, paper positions,
+                         outcomes after costs, one Telegram alert per play to the owner (kind play, 6 per hour); idles without a rule
 """
 from __future__ import annotations
 
@@ -117,6 +128,26 @@ def _parser() -> argparse.ArgumentParser:
     c.add_argument("--hours", type=int, default=24)
     w = sub.add_parser("web")
     w.add_argument("wcmd", nargs="?", choices=["hash-password", "new-secret"], help="hash-password | new-secret (default: run the server)")
+    rs = sub.add_parser("research")
+    rss = rs.add_subparsers(dest="rcmd", required=True)
+    rr = rss.add_parser("run")
+    rr.add_argument("--hypothesis", required=True, help="H1..H7, or `all` for the pre-registered order H4, H5, H1, H3, H7, H2, H6")
+    rr.add_argument("--days", type=int, help="number of UTC days in the window (default: config/measure.json -> research.default_days = 7)")
+    rr.add_argument("--end", help="last UTC day of the window, YYYY-MM-DD (default: yesterday)")
+    rr.add_argument("--delay", type=float, help="entry delay in seconds (default 20)")
+    rr.add_argument("--size", type=float, help="size per trade in SOL (default 0.5)")
+    rr.add_argument("--limit", type=int, help="at most this many candidate coins (a smoke test; the report says so)")
+    ra = rss.add_parser("autopsy")
+    ra.add_argument("--days", type=int, help="number of UTC days (default 7)")
+    ra.add_argument("--end", help="last UTC day, YYYY-MM-DD (default: yesterday)")
+    ra.add_argument("--limit", type=int, help="at most this many graduations (a smoke test)")
+    rp = rss.add_parser("promote")
+    rp.add_argument("hypothesis")
+    rp.add_argument("variant")
+    rp.add_argument("--report", help="the report name (default: the newest report of the hypothesis)")
+    rss.add_parser("list")
+    pl = sub.add_parser("plays")
+    pl.add_argument("--once", action="store_true", help="run one tick and print the summary")
     return p
 
 
@@ -244,8 +275,20 @@ def cmd_status(settings, as_json: bool) -> int:
             # milestone 11: the engine's tick budget (the last completed tick's step durations, the slow ticks)
             out["engine_tick"] = engine_tick_status(kv, settings.config("engine"), t)
             out["backup_verify_last"] = json.loads(kv["backup.verify.last"]) if kv.get("backup.verify.last") else None
+            # milestone 12: the disk (with the trades retention estimate), the candle queue, the creator statistics, the plays layer
+            out["disk"] = disk_status(settings, conn, t)
+            from .measure import candles as _candles
+            from .measure import creators as _creators
+            from .plays import service as _plays
+
+            out["candles"] = _candles.status(conn, t)
+            out["creator_stats"] = _creators.status(conn, t)
+            out["plays"] = _plays.status(conn, settings, t)
         finally:
             conn.close()
+    from .research.report import list_reports
+
+    out["research_reports"] = list_reports(settings)[:3]
     # milestone 10: the last duration per public view, as the website wrote it next to its log (never from the database)
     out["web_views"] = web_views_status(settings, now())
     if as_json:
@@ -365,7 +408,73 @@ def cmd_status(settings, as_json: bool) -> int:
         print(f"  pumpportal last HTTP refusal: {out['pumpportal_last_http_status']}")
     print(f"  last decision: {out['last_decision_at']}")
     print("  " + web_views_line(out["web_views"]))
+    for line in m12_lines(out):
+        print("  " + line)
     return 0
+
+
+# ----- milestone 12: the disk, the candle queue, the creator statistics, the plays layer, the research reports ------------
+DISK_WARN_FREE_GB = 20.0
+TRADE_ROW_BYTES = 180          # an estimate of one `trades` row with its share of the three indexes (docs/UNVERIFIED.md)
+
+
+def disk_status(settings, conn, t: float) -> dict[str, Any]:
+    """Free space of the data disk, the database size and the growth the trades retention implies (an estimate from the
+    rows of the last 24 hours x the retention days x TRADE_ROW_BYTES; the dbstat virtual table is not assumed)."""
+    import shutil
+
+    out: dict[str, Any] = {"warn_free_gb": DISK_WARN_FREE_GB}
+    try:
+        u = shutil.disk_usage(str(settings.data_dir))
+        out.update({"total_gb": round(u.total / 1e9, 1), "free_gb": round(u.free / 1e9, 1), "used_pct": round(100 * (u.total - u.free) / u.total) if u.total else None})
+        out["warning"] = u.free / 1e9 < DISK_WARN_FREE_GB
+    except OSError as e:
+        out.update({"error": f"{type(e).__name__}: {str(e)[:80]}", "warning": False})
+    try:
+        out["db_gb"] = round(sum(p.stat().st_size for p in (settings.db_path, settings.db_path.with_name(settings.db_path.name + "-wal")) if p.exists()) / 1e9, 2)
+    except OSError:
+        out["db_gb"] = None
+    try:
+        rows_24h = int(conn.execute("SELECT COUNT(*) FROM trades WHERE received_at >= ?", (t - 86400,)).fetchone()[0])
+        total = int(conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0])
+        days = int((settings.config("ingest").get("retention") or {}).get("trades_days", 30))
+        out.update({"trades_rows": total, "trades_rows_24h": rows_24h, "trades_retention_days": days, "trade_row_bytes": TRADE_ROW_BYTES,
+                    "trades_projected_gb": round(rows_24h * days * TRADE_ROW_BYTES / 1e9, 2), "trades_now_gb": round(total * TRADE_ROW_BYTES / 1e9, 2)})
+    except Exception as e:  # noqa: BLE001  the status must never die on an estimate
+        out["trades_error"] = f"{type(e).__name__}: {str(e)[:80]}"
+    return out
+
+
+def m12_lines(out: dict[str, Any]) -> list[str]:
+    lines = []
+    d = out.get("disk") or {}
+    if d:
+        if d.get("error"):
+            lines.append(f"disk: unknown ({d['error']})")
+        else:
+            lines.append(f"disk: {d.get('free_gb')} GB free of {d.get('total_gb')} GB ({d.get('used_pct')}% used); database {d.get('db_gb')} GB; trades {d.get('trades_rows', '?'):,} rows"
+                         f" (~{d.get('trades_now_gb')} GB est.), {d.get('trades_rows_24h', '?'):,} rows in the last 24 h -> ~{d.get('trades_projected_gb')} GB at {d.get('trades_retention_days')} days retention"
+                         f" (estimate: {d.get('trade_row_bytes')} bytes per row incl. indexes)" + (f"  WARNING: less than {d.get('warn_free_gb'):.0f} GB free" if d.get("warning") else ""))
+    c = out.get("candles") or {}
+    if c.get("exists"):
+        lines.append(f"candles (GeckoTerminal, 1-minute, once per graduation an hour after it): pending {c['pending']} (due now {c['due']}"
+                     + (f", oldest due {c['oldest_due_age_s']} s ago" if c.get("oldest_due_age_s") is not None else "") + f"), done {c['done_ok']} with candles, {c['done_empty']} empty,"
+                     f" {c['failed']} failed, {c['pool_unknown']} without pool address; {c['candles']:,} candle rows; today fetched {c['fetched_today']}, failed {c['failed_today']}, gate blocked {c['blocked_today']}"
+                     + (f"; last run {c['last_run_age_s']} s ago" if c.get("last_run_age_s") is not None else "; never run"))
+    else:
+        lines.append("candles: no candle_jobs table yet (schema v9: start a daemon or the track timer once)")
+    cs = out.get("creator_stats") or {}
+    if cs.get("exists"):
+        lines.append(f"creator stats: {cs['rows']:,} creators ({cs['with_track_record']:,} with a graduation or winner), updated today {cs['updated_today']}, backlog {'yes' if cs['backlog'] else 'no'}"
+                     + (f"; last run {cs['last_run_age_s']} s ago" if cs.get("last_run_age_s") is not None else "; never run"))
+    p = out.get("plays") or {}
+    if p.get("exists"):
+        hb = "never ticked" if p.get("heartbeat_age_s") is None else f"heartbeat {p['heartbeat_age_s']} s ago"
+        lines.append(f"plays: {p['rules']} active rule(s) in config/plays.json" + (f" ({', '.join(p['rule_ids'])})" if p.get("rule_ids") else " (nothing proven yet: the layer idles)")
+                     + f"; {hb}; open {p['open']}, closed {p['closed']} (pnl {float(p.get('pnl_sol_closed') or 0):+.4f} SOL), unknown {p['unknown']}, no fill {p['no_fill']}; alerts today {p['alerts_today']}")
+    reps = out.get("research_reports") or []
+    lines.append("research: " + (", ".join(f"{r['name']} (gekozen {r.get('selected')}, bewezen {'ja' if r.get('selected_proven') else 'nee'})" for r in reps) if reps else "no reports yet (fart research run --hypothesis H5 --days 3)"))
+    return lines
 
 
 ENGINE_STEPS = ("expire", "features", "promote", "rpc", "metas", "decisions")
@@ -772,12 +881,72 @@ def cmd_budget_calibrate(settings, day: str, dashboard_cu: float, as_json: bool)
     return 0
 
 
+def cmd_research(settings, args) -> int:
+    """`fart research run | autopsy | promote | list` (milestone 12): the database is opened read-only; the reports go to out/research/."""
+    from .research import autopsy as ra
+    from .research import harness as rh
+    from .research import hypotheses as hyps
+    from .research import report as rr
+
+    if args.rcmd == "list":
+        for h in hyps.catalogue():
+            print(f"{h['id']}  {h['title']}: {h['variants']} varianten ({', '.join(h['groups'])}; uitstap {', '.join(h['exits'])})")
+        reps = rr.list_reports(settings)
+        print(f"rapporten in {rr.report_dir(settings)}: {len(reps)}")
+        for r in reps:
+            print(f"  {r['name']}  {r['kind']}  gekozen={r.get('selected')}  bewezen={'ja' if r.get('selected_proven') else 'nee'}  varianten={r.get('variants_tested')}")
+        return 0
+    if args.rcmd == "promote":
+        try:
+            rule = rr.promote(settings, args.hypothesis, args.variant, now(), report=args.report)
+        except (rr.PromoteError, KeyError) as e:
+            print(f"research promote: {e}")
+            return 1
+        print(f"gepromoveerd: {rule['id']} ({rule['label']}) uit rapport {rule['report']} -> config/plays.json; de plays-daemon leest het binnen een minuut (commit the file: a rule is a config change)")
+        return 0
+    if not settings.db_path.exists():
+        print("no database yet")
+        return 2
+    rcfg = (settings.config("measure") or {}).get("research") or {}
+    n_days = int(args.days or rcfg.get("default_days", 7))
+    end = args.end or day_key(now() - 86400)
+    try:
+        day_bounds_check(end)
+    except ValueError:
+        print(f"bad day: {end} (YYYY-MM-DD)")
+        return 2
+    days = rh.window_days(end, n_days)
+    conn = db.connect_ro(settings.db_path)
+    try:
+        t = now()
+        if args.rcmd == "autopsy":
+            res = ra.build_autopsy(conn, settings, days, t, limit=args.limit)
+            md, js = ra.write_autopsy(settings, res)
+            print(f"autopsie geschreven: {md} ({res['groups']['organic_winner']} organische winnaars, {res['groups']['bundled_winner']} gebundelde, {res['groups']['not_winner']} geen winnaar; {res['seconds']} s)")
+            return 0
+        ids = hyps.ORDER if str(args.hypothesis).lower() == "all" else [str(args.hypothesis).upper()]
+        for hid in ids:
+            try:
+                hyps.get(hid)
+            except KeyError as e:
+                print(f"research run: {e}")
+                return 2
+            res = rh.run_hypothesis(conn, settings, hid, days, entry_delay_s=args.delay, size_sol=args.size, limit_coins=args.limit)
+            md, js = rr.write_report(settings, res, t)
+            st = res["stats"]
+            print(f"{hid}: {md}  signalen={st['signals']} munten={st['coins_evaluated']}/{st['coins_with_trades']} gekozen={res['selected']} bewezen={'ja' if res['selected_proven'] else 'nee'} ({st['seconds']} s)")
+    finally:
+        conn.close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     settings = load_settings(root=args.root)
     settings.ensure_dirs()
     daemon = ((args.cmd == "ingest" and not args.icmd) or (args.cmd == "engine" and not args.ecmd) or (args.cmd == "social" and not args.scmd)
-              or (args.cmd == "measure") or (args.cmd == "notify" and not args.ncmd) or (args.cmd == "web" and not args.wcmd))
+              or (args.cmd == "measure") or (args.cmd == "notify" and not args.ncmd) or (args.cmd == "web" and not args.wcmd)
+              or (args.cmd == "plays" and not args.once) or (args.cmd == "research" and args.rcmd in ("run", "autopsy")))
     setup_logging(settings.logs_dir if daemon else None, args.cmd if args.cmd != "measure" else f"measure-{args.mcmd}", stderr=not args.quiet)
     if args.cmd == "status":
         return cmd_status(settings, args.json)
@@ -831,6 +1000,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.wcmd == "new-secret":
             return ws.cmd_new_secret()
         return ws.run_web(settings)
+    if args.cmd == "research":
+        return cmd_research(settings, args)
+    if args.cmd == "plays":
+        from .plays.service import run_plays
+
+        return run_plays(settings, once=args.once)
     if args.cmd == "measure":
         if args.mcmd == "track":
             from .measure.outcomes import run_track

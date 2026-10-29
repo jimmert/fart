@@ -272,9 +272,9 @@ def test_retention_archives_and_prunes(settings, conn):
     from fart.ingest.retention import maybe_run_retention, run_retention
 
     now = 1_761_480_000.0
-    conn.execute("INSERT INTO trades(mint, received_at, signature, is_buy, sol, tokens, source) VALUES('OLD', ?, 's1', 1, 1, 1, 'pumpportal')", (now - 20 * 86400,))
+    conn.execute("INSERT INTO trades(mint, received_at, signature, is_buy, sol, tokens, source) VALUES('OLD', ?, 's1', 1, 1, 1, 'pumpportal')", (now - 35 * 86400,))   # older than trades_days (30 since milestone 12)
     conn.execute("INSERT INTO trades(mint, received_at, signature, is_buy, sol, tokens, source) VALUES('NEW', ?, 's2', 1, 1, 1, 'pumpportal')", (now - 86400,))
-    conn.execute("INSERT INTO trades(mint, received_at, signature, is_buy, sol, tokens, source) VALUES('W', ?, 's3', 1, 1, 1, 'pumpportal')", (now - 20 * 86400,))
+    conn.execute("INSERT INTO trades(mint, received_at, signature, is_buy, sol, tokens, source) VALUES('W', ?, 's3', 1, 1, 1, 'pumpportal')", (now - 35 * 86400,))
     conn.execute("INSERT INTO watchlist(mint, since, reason, active) VALUES('W', ?, 'observe', 1)", (now - 20 * 86400,))
     conn.execute("INSERT INTO api_ledger(ts, source, method, cost) VALUES(?, 'rpc', 'x', 1)", (now - 40 * 86400,))
     conn.execute("INSERT INTO decisions(as_of, created_at, kind, features_json, rules_version, verdict, reasons_json) VALUES(?, ?, 'observe', '{}', 'r', 'observe', '[]')", (now - 100 * 86400, now - 100 * 86400))

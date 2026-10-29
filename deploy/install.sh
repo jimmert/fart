@@ -99,7 +99,9 @@ chmod 0640 "$FART_ROOT/.env"
 # (user_version 6) only creates the tables shadow_decisions, shadow_confirmations and engine_candidates;
 # milestone 7 (user_version 7) adds the planner table x_keys and the column x_spend.unit; milestone 8 adds no migration
 # (the website reads only); milestone 10 (user_version 8) adds the indexes trades(received_at) and trades(block_time)
-# (seconds on the VPS; the time windows of the public dashboard); a second run changes nothing.
+# (seconds on the VPS; the time windows of the public dashboard); milestone 12 (user_version 9) adds the tables
+# creator_stats, pool_candles, candle_jobs and plays (research and the plays layer; the engine's tables are untouched);
+# a second run changes nothing.
 if [ -f "$FART_ROOT/data/fart.db" ]; then
   if STATUS_JSON="$(sudo -u "$FART_USER" "$FART_ROOT/bin/fart" --quiet --json status 2>/dev/null)"; then
     log "database schema: $(printf '%s' "$STATUS_JSON" | "$VENV/bin/python" -c 'import json,sys
@@ -123,7 +125,7 @@ systemctl daemon-reload
 if command -v systemd-analyze >/dev/null 2>&1; then
   systemd-analyze verify /etc/systemd/system/fart-*.service /etc/systemd/system/fart-*.timer 2>&1 | grep -v -e 'is not loaded properly' || true
 fi
-systemctl enable fart-ingest.service fart-engine.service fart-measure-track.timer fart-measure-report.timer fart-measure-week.timer fart-backup.timer >/dev/null
+systemctl enable fart-ingest.service fart-engine.service fart-plays.service fart-measure-track.timer fart-measure-report.timer fart-measure-week.timer fart-backup.timer >/dev/null
 OPTIONAL_SERVICES=""
 for u in fart-social.service fart-notify.service; do
   if [ -f "/etc/systemd/system/$u" ]; then
@@ -150,9 +152,10 @@ fi
 if [ "$START_SERVICES" = "1" ]; then
   systemctl restart fart-ingest.service
   systemctl restart fart-engine.service
+  systemctl restart fart-plays.service
   for u in $OPTIONAL_SERVICES; do systemctl restart "$u"; done
   systemctl start fart-measure-track.timer fart-measure-report.timer fart-measure-week.timer fart-backup.timer
-  log "services (re)started:$OPTIONAL_SERVICES fart-ingest fart-engine + timers"
+  log "services (re)started:$OPTIONAL_SERVICES fart-ingest fart-engine fart-plays + timers"
 fi
 
 # --- verification -------------------------------------------------------------------------------
@@ -172,9 +175,15 @@ echo "  sudo -u $FART_USER $FART_ROOT/bin/fart social calibrate --day <day> --co
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart engine explain --day $(date -u +%F)             # why (no) observations today (M6)"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart measure week --end $(date -u -d yesterday +%F 2>/dev/null || date -u +%F) --days 1   # week report smoke test (M5), sends nothing"
 echo "  systemctl list-timers 'fart-*' --no-pager                          # fart-measure-week.timer daily 06:30 UTC"
+echo "  sudo -u $FART_USER $FART_ROOT/bin/fart research run --hypothesis H5 --days 3 --limit 300   # M12: the harness on real data (a bounded smoke run; the report says so), out/research/"
+echo "  sudo -u $FART_USER $FART_ROOT/bin/fart research list                                  # M12: the research reports and their verdicts"
+echo "  sudo -u $FART_USER $FART_ROOT/bin/fart plays --once                                   # M12: one tick of the plays layer (empty config: 0 rules, nothing fires)"
+echo "  journalctl -u fart-plays -n 20 --no-pager                                             # M12: plays.started ... rules=0"
 if [ "$WEB_READY" = "1" ]; then
   echo "  curl -s -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8792/login   # 200: fart-web answers on the loopback (M8); the site itself: https://kingdegen.dev"
   echo "  journalctl -u fart-web -n 20 --no-pager                              # web.started ... readonly=true"
+  echo "  curl -s -o /dev/null -w '%{http_code}\\n' http://127.0.0.1:8792/terminal   # 200: the Terminal page (M12)"
+  echo "  curl -s -N -m 3 http://127.0.0.1:8792/api/public/stream | head -c 600       # M12: 'retry: 3000', then 'event: snapshot' with the rows (through Caddy: curl -N https://kingdegen.dev/api/public/stream)"
 else
   echo "  sudo -u $FART_USER $FART_ROOT/bin/fart web hash-password                # M8: the owner's password hash for .env (asked invisibly, hash only)"
   echo "  sudo -u $FART_USER $FART_ROOT/bin/fart web new-secret                   # M8: the cookie secret for .env; then: systemctl enable --now fart-web"

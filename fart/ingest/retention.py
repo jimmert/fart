@@ -1,6 +1,6 @@
-"""Retention: raw gz 30 days, trades only for watched mints and only for N days, samples and
-api_ledger pruned, weekly archive of pruned rows to data/archive/*.jsonl.gz. The append-only
-ledgers (decisions, outcomes) are never touched.
+"""Retention: raw gz 30 days, trades only for watched mints and only for N days (14 until milestone 11, 30 since milestone 12
+so the research harness has a month of trade paths), samples, api_ledger and pool candles pruned, weekly archive of pruned
+rows to data/archive/*.jsonl.gz. The append-only ledgers (decisions, outcomes) are never touched.
 """
 from __future__ import annotations
 
@@ -71,6 +71,13 @@ def run_retention(conn: sqlite3.Connection, raw_dir: Path, archive_dir: Path, cf
     _archive_rows(archive_dir, "engine_candidates", rows, now)
     conn.execute("DELETE FROM engine_candidates WHERE day < ?", (cutoff_day,))
     out["candidates_archived"] = len(rows)
+    # milestone 12: the minute candles after graduation (one hour per graduation; the jobs table stays as the record of what was fetched)
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='pool_candles'").fetchone() is not None:
+        cutoff_candles = now - int(cfg.get("candles_days", 60)) * 86400
+        rows = conn.execute("SELECT * FROM pool_candles WHERE fetched_at < ?", (cutoff_candles,)).fetchall()
+        _archive_rows(archive_dir, "pool_candles", rows, now)
+        conn.execute("DELETE FROM pool_candles WHERE fetched_at < ?", (cutoff_candles,))
+        out["candles_archived"] = len(rows)
     kv_set(conn, "retention.last_run", str(now), now)
     log.info("retention.done", **out)
     return out

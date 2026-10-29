@@ -197,10 +197,10 @@ def _views(conn, settings, now):
 
 # ----- the schema and the engine ---------------------------------------------------------------------------------------------
 def test_schema_v8_adds_the_trade_indexes_idempotently(conn, settings):
-    assert db.schema_version(conn) == db.SCHEMA_VERSION == 8
+    assert db.schema_version(conn) == db.SCHEMA_VERSION >= 8   # v8 ran (milestone 12 adds v9 on top)
     idx = {r[1] for r in conn.execute("PRAGMA index_list(trades)")}
     assert {"trades_received_at", "trades_block_time", "trades_mint_received"} <= idx
-    assert db.migrate(conn) == 8 and {r[1] for r in conn.execute("PRAGMA index_list(trades)")} == idx
+    assert db.migrate(conn) == db.SCHEMA_VERSION and {r[1] for r in conn.execute("PRAGMA index_list(trades)")} == idx
     # a v7 database (the VPS before the upgrade) gets the two indexes and keeps every row
     path = settings.data_dir / "v7.db"
     c = sqlite3.connect(str(path), isolation_level=None)
@@ -217,7 +217,7 @@ def test_schema_v8_adds_the_trade_indexes_idempotently(conn, settings):
     c.close()
     c2 = db.connect(path)
     try:
-        assert db.schema_version(c2) == 8 and {"trades_received_at", "trades_block_time"} <= {r[1] for r in c2.execute("PRAGMA index_list(trades)")}
+        assert db.schema_version(c2) == db.SCHEMA_VERSION >= 8 and {"trades_received_at", "trades_block_time"} <= {r[1] for r in c2.execute("PRAGMA index_list(trades)")}
         assert c2.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 50
         plan = " ".join(str(r[3]) for r in c2.execute("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM trades WHERE received_at >= ? AND COALESCE(block_time, received_at) >= ?", (40.0, 41.0)))
         assert "SEARCH trades USING INDEX trades_received_at" in plan and "SCAN trades" not in plan
