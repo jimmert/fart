@@ -237,7 +237,7 @@ def test_the_working_tree_still_runs_the_frozen_rules():
     assert gate["frozen_rules"]["rules_fingerprint"] == FROZEN_FP and gate["frozen_rules"]["rules_version"] == "150ca73cb354"
     assert rules_fingerprint() == M11_FP, "a rule-defining file changed: this is a new rules_version, not a silent edit (or a new, unproven equivalent)"
     equivalents = frozen_rules_equivalents(gate)
-    assert list(equivalents) == [M11_FP] and gate["frozen_rules_equivalents"][0]["pr"] == 11 and gate["frozen_rules_equivalents"][0]["date"] == "2026-10-29"
+    assert list(equivalents) == [M11_FP] and gate["frozen_rules_equivalents"][0]["pr"] == 12 and gate["frozen_rules_equivalents"][0]["date"] == "2026-10-29"
     for e in equivalents.values():
         assert e["rules_fingerprint"].startswith("sha256:") and len(e["rules_fingerprint"]) == 71 and e["date"] and int(e["pr"]) > 0
         path, _, func = str(e["test"]).partition("::")
@@ -315,7 +315,7 @@ def test_week_cli_end_to_end_on_a_synthetic_world(settings, conn, capsys):
     seg = rep["segments"][0]
     # r1 ran the working tree's rules: since milestone 11 a proven-equivalent fingerprint, pooled into the frozen segment and named there
     assert seg["rules_versions"] == ["r1"] and seg["rules_group"] == FROZEN_FP and seg["frozen"] is True
-    assert seg["rules_fingerprints"] == [rules_fingerprint()] == [M11_FP] and seg["equivalents"][0]["pr"] == 11
+    assert seg["rules_fingerprints"] == [rules_fingerprint()] == [M11_FP] and seg["equivalents"][0]["pr"] == 12
     # build_world marks the PumpPortal source as started at epoch 1: both days are covered, the first one has no graduations
     assert seg["universe"]["covered_days"] == 2 and seg["universe"]["not_covered_days"] == []
     assert seg["universe"]["graduations"] == 5 and seg["hit_rate"]["decisions"] == 3 and seg["universe"]["winners"] == 2
@@ -326,7 +326,7 @@ def test_week_cli_end_to_end_on_a_synthetic_world(settings, conn, capsys):
     for heading in ("### Samenvatting", "### Universum per dag", "### Trefkans van munt-observaties", "### Recall", "### Lead time",
                     "### Betrouwbaarheidsintervallen", "### Go/no-go community-alerts (bevroren criteria)", "## Kosten per dag", "## Versies"):
         assert heading in md, heading
-    assert "## Regels `sha256:e3bf4320c45c` (bevroren meetweek)" in md and "bewezen gelijkwaardige berekening** `sha256:147aa831c90d` (PR #11, 2026-10-29" in md
+    assert "## Regels `sha256:e3bf4320c45c` (bevroren meetweek)" in md and "bewezen gelijkwaardige berekening** `sha256:147aa831c90d` (PR #12, 2026-10-29" in md
     assert main(["--root", str(settings.root), "--quiet", "status"]) == 0
     out = capsys.readouterr().out
     assert f"week report: last end day {end}" in out and "rules fingerprints (engine): r1=" in out

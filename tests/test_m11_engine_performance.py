@@ -373,7 +373,7 @@ def test_only_features_py_changed_among_the_rule_files_and_the_equivalence_is_re
     gate = load_json(REPO_ROOT / "config" / "measure.json")["community_gate"]
     assert gate["frozen_rules"]["rules_fingerprint"] == FROZEN_FP      # the frozen entry is untouched
     [entry] = gate["frozen_rules_equivalents"]
-    assert entry["rules_fingerprint"] == M11_FP and entry["date"] == "2026-10-29" and entry["pr"] == 11 and entry["test"] == PROOF_TEST
+    assert entry["rules_fingerprint"] == M11_FP and entry["date"] == "2026-10-29" and entry["pr"] == 12 and entry["test"] == PROOF_TEST
     assert entry["changed_files"] == ["fart/engine/features.py"] and "once per tick" in entry["note"]
     assert canonical_fingerprint(M11_FP, gate) == FROZEN_FP and runs_frozen_rules(gate) is True
     # the frozen reference is the old code: the provenance in its header, the per-term scan in its body, gone from the live module
@@ -388,7 +388,7 @@ def test_only_features_py_changed_among_the_rule_files_and_the_equivalence_is_re
 def test_week_report_pools_a_proven_equivalent_fingerprint_with_the_frozen_segment(m5_cfg):
     cfg = m5_cfg
     EQ = "sha256:equivalent-computation"
-    cfg["community_gate"]["frozen_rules_equivalents"] = [{"rules_fingerprint": EQ, "date": "2026-10-29", "pr": 11, "test": PROOF_TEST}]
+    cfg["community_gate"]["frozen_rules_equivalents"] = [{"rules_fingerprint": EQ, "date": "2026-10-29", "pr": 12, "test": PROOF_TEST}]
     hit = {"decisions": 4, "hits": 2, "misses": 2, "unknown": 0, "pending": 0}
     days = []
     for i, d in enumerate(DAYS):
@@ -402,12 +402,12 @@ def test_week_report_pools_a_proven_equivalent_fingerprint_with_the_frozen_segme
     assert frozen_seg["rules_fingerprints"] == [EQ, FP] and [e["rules_fingerprint"] for e in frozen_seg["equivalents"]] == [EQ]
     assert frozen_seg["hit_rate"]["decisions"] == 24 and frozen_seg["recall"]["before_graduation"]["coin"]["n"] == 30   # six days pooled
     assert other["rules_group"] == "sha256:other" and other["equivalents"] == [] and other["frozen"] is False
-    assert rep["frozen_rules_equivalents"][0]["pr"] == 11
+    assert rep["frozen_rules_equivalents"][0]["pr"] == 12
     md = wk.render_markdown(rep)
     title = md.index(f"## Regels `{FP[:19]}` (bevroren meetweek)")
-    sentence = md.index(f"Dit segment bevat ook de **bewezen gelijkwaardige berekening** `{EQ[:19]}` (PR #11, 2026-10-29, test `{PROOF_TEST}`)")
+    sentence = md.index(f"Dit segment bevat ook de **bewezen gelijkwaardige berekening** `{EQ[:19]}` (PR #12, 2026-10-29, test `{PROOF_TEST}`)")
     assert title < sentence < md.index("### Samenvatting") and "alleen de rekentijd veranderde" in md
-    assert "`rv-m11`, `rv-old`" in md and f"Bewezen gelijkwaardige berekeningen (gepoold met de bevroren vingerafdruk): `{EQ[:19]}` (PR #11" in md
+    assert "`rv-m11`, `rv-old`" in md and f"Bewezen gelijkwaardige berekeningen (gepoold met de bevroren vingerafdruk): `{EQ[:19]}` (PR #12" in md
     # without the list the same fingerprint is a segment of its own, as before milestone 11
     cfg["community_gate"]["frozen_rules_equivalents"] = []
     rep2 = run_aggregate(days, cfg, fp_map=fp_map, rv_now="rv-m11")
@@ -417,11 +417,11 @@ def test_week_report_pools_a_proven_equivalent_fingerprint_with_the_frozen_segme
 def test_website_and_settings_call_the_equivalent_fingerprint_frozen(world):
     settings = world["settings"]
     pos = public.week_position(settings, NOW)
-    assert pos["rules_frozen"] is True and pos["rules_equivalent"]["pr"] == 11 and pos["fingerprint_short"] == M11_FP[:19]
+    assert pos["rules_frozen"] is True and pos["rules_equivalent"]["pr"] == 12 and pos["fingerprint_short"] == M11_FP[:19]
     sv = data.settings_view(settings)
     rows = {r["label"]: r["value"] for r in sv["sections"][0]["rows"]}
     assert rows["Vingerafdruk van de regelbestanden"] == M11_FP
-    assert rows["Vingerafdruk gelijk aan de bevroren meetweek"].startswith("ja: bewezen gelijkwaardige berekening (PR #11, 2026-10-29, test tests/test_m11")
+    assert rows["Vingerafdruk gelijk aan de bevroren meetweek"].startswith("ja: bewezen gelijkwaardige berekening (PR #12, 2026-10-29, test tests/test_m11")
     assert rows["Bewezen gelijkwaardige berekeningen (gepoold met de bevroren regels)"].startswith(M11_FP[:19])
     assert "sha256:e3bf4320c45c" in rows["Bevroren regels van de meetweek"]
     # a fingerprint outside the list is not frozen: the public pill would say "regels niet bevroren"

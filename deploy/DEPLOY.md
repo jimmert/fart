@@ -955,7 +955,7 @@ test runs the frozen old implementation next to the new one and proves byte-equa
 
 Because `fart/engine/features.py` is a rule file, the fingerprint changes: `sha256:147aa831c90d...` instead of
 `sha256:e3bf4320c45c...`. `config/measure.json` → `community_gate.frozen_rules_equivalents` records the new fingerprint with
-the date, the PR number (#11) and the test that proves the equivalence; the frozen entry itself is untouched. The week report
+the date, the PR number (#12) and the test that proves the equivalence; the frozen entry itself is untouched. The week report
 pools the two fingerprints in one segment and says under the segment title that it contains a **bewezen gelijkwaardige
 berekening**; the website and `fart status` call the rules frozen. Every tick now logs the duration of every step
 (`expire_s`, `features_s`, `promote_s`, `rpc_s`, `metas_s`, `decisions_s`, `tick_s`), the previous tick's record goes to kv
@@ -994,11 +994,11 @@ once per hour. No schema migration, no new dependency, no change of any threshol
    ```
    Both belong to the frozen measurement week: `config/measure.json` → `community_gate.frozen_rules_equivalents` says so with
    the proof. `/eigenaar` → Instellingen → "Vingerafdruk gelijk aan de bevroren meetweek" reads `ja: bewezen gelijkwaardige
-   berekening (PR #11, 2026-10-29, test tests/test_m11_engine_performance.py::...)`; the public measurement page keeps the
+   berekening (PR #12, 2026-10-29, test tests/test_m11_engine_performance.py::...)`; the public measurement page keeps the
    pill "regels bevroren".
 5. **The week report** (the next 06:30 UTC run, or by hand: `sudo -u fart /opt/fart/bin/fart measure week`): one segment
    titled "Regels `sha256:e3bf4320c45c` (bevroren meetweek)" with every rules_version of the week, and directly under its title
-   the line "Dit segment bevat ook de **bewezen gelijkwaardige berekening** `sha256:147aa831c90d` (PR #11, 2026-10-29, test
+   the line "Dit segment bevat ook de **bewezen gelijkwaardige berekening** `sha256:147aa831c90d` (PR #12, 2026-10-29, test
    `tests/test_m11_engine_performance.py::test_meta_step_equals_the_frozen_reference_byte_for_byte`): dezelfde regels en
    dezelfde uitkomsten als de bevroren vingerafdruk, alleen de rekentijd veranderde." Never a second segment for the M11
    commits. The "Versies" section lists the equivalence too.

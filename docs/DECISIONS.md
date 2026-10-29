@@ -1111,7 +1111,7 @@ stap lineair is in het aantal coins (venster + basislijn) en niet in coins × te
 
 Omdat `features.py` een regelbestand is, verandert de vingerafdruk: `sha256:147aa831c90d` in plaats van `sha256:e3bf4320c45c`.
 Dat is uitsluitend toegestaan met dit bewijs en deze registratie: `config/measure.json` → `community_gate.frozen_rules_equivalents`
-krijgt de nieuwe vingerafdruk met de datum (2026-10-29), het PR-nummer (#11), het gewijzigde bestand en de naam van de
+krijgt de nieuwe vingerafdruk met de datum (2026-10-29), het PR-nummer (#12), het gewijzigde bestand en de naam van de
 bewijstest; de bevroren vingerafdruk zelf blijft onaangeroerd. Het weekrapport neemt vingerafdrukken uit die lijst samen met de
 bevroren vingerafdruk in één segment (`week.rules_groups` met `version.canonical_fingerprint`) en zegt onder de segmenttitel
 dat het om een **bewezen gelijkwaardige berekening** gaat (PR, datum, test); de website (`regels bevroren`, `/eigenaar` →
@@ -1173,11 +1173,11 @@ niet aangepast. Uitrol: `deploy/DEPLOY.md`, "Milestone 11: engine performance".
     fingerprint, the date, the PR number, the changed file and the test that proves byte-equal outcomes. The week report
     maps an equivalent fingerprint to the frozen one when grouping (`week.rules_groups(..., canonical)`), lists every
     fingerprint of the segment (`rules_fingerprints`) and the proof entries (`equivalents`), and prints under the segment
-    title "Dit segment bevat ook de bewezen gelijkwaardige berekening `...` (PR #11, 2026-10-29, test `...`): dezelfde
+    title "Dit segment bevat ook de bewezen gelijkwaardige berekening `...` (PR #12, 2026-10-29, test `...`): dezelfde
     regels en dezelfde uitkomsten als de bevroren vingerafdruk, alleen de rekentijd veranderde"; the "Versies" section
     lists the equivalents too; without the list the same fingerprint is a segment of its own, as before. The public
     measurement pages say "regels bevroren" for a listed equivalent (`public.week_position` → `runs_frozen_rules`), the
-    owner's settings page says "ja: bewezen gelijkwaardige berekening (PR #11, ...)" instead of "NEE", and
+    owner's settings page says "ja: bewezen gelijkwaardige berekening (PR #12, ...)" instead of "NEE", and
     `test_the_working_tree_still_runs_the_frozen_rules` now pins the new fingerprint, checks that the listed test exists
     and that the frozen entry still reads `150ca73cb354` / `sha256:e3bf4320c45c`. An entry is added only together with
     its proof and its DECISIONS entry; a real rules change never goes into this list.
@@ -1205,4 +1205,4 @@ niet aangepast. Uitrol: `deploy/DEPLOY.md`, "Milestone 11: engine performance".
     the public status view fail (seen as `test_sigterm_stops_the_server_and_the_views_thread` failing on 29 Oct against the
     fixture world of 26 Oct, because that test runs the real clock). The uncovered case is now named ("vandaag is nog geen
     uur gedekt, dus geen telling van graduaties"), never a zero, and the sentence always has its three parts.
-160. **Branch and PR**: all work on the harness branch `claude/beautiful-sagan-uedb2q`; the PR (#11) targets `main`.
+160. **Branch and PR**: all work on the harness branch `claude/beautiful-sagan-uedb2q`; the PR (#12) targets `main`.

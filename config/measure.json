@@ -68,7 +68,7 @@
       {
         "rules_fingerprint": "sha256:147aa831c90d545ca8cd73f45c3772f854a1ec399cee961b7513b0c6ab253ace",
         "date": "2026-10-29",
-        "pr": 11,
+        "pr": 12,
         "test": "tests/test_m11_engine_performance.py::test_meta_step_equals_the_frozen_reference_byte_for_byte",
         "changed_files": [
           "fart/engine/features.py"
