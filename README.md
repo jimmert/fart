@@ -1,5 +1,48 @@
 # fart
 
+## Voor Jim: wat milestone 12 toevoegt
+
+Mijlpaal 12 geeft je twee dingen naast de bevroren engine: een **Terminal** om live te kijken en te handelen via je eigen
+knoppen, en een **edge-fabriek** die op onze eigen data uitzoekt welke regels geld opleveren na kosten, voordat één regel
+ooit een alert mag geven. Het platform plaatst nog altijd nooit een order en kent geen wallet; de beslissingen staan in
+`docs/DECISIONS.md` ("Milestone 12"), de uitrol in `deploy/DEPLOY.md` ("Milestone 12: terminal and research"):
+
+1. **De Terminal (`/terminal`).** Eén live tabel van alle munten in beeld: de watchlist plus alles wat de laatste 30 minuten
+   gemaakt is, elke trade binnen een seconde zichtbaar via één stroom per tabblad. Per munt: leeftijd, naam en ticker,
+   marktwaarde, hoe ver de curve naar de 85 SOL is, unieke kopers en netto SOL van de laatste 5 minuten, kopers tegenover
+   verkopers, de grootste koper, de dev-buy en of de dev al verkocht, een bundelvlag (ja / nee / onbekend), de maker en zijn
+   track record, het thema en of het brandt, X-vermeldingen waar we die meten, de laatste trade, de status van de engine en de
+   plays die vuren. Sorteren per kolom, kolommen aan en uit, drie dichtheden, toetsen (`j`/`k`, `enter` opent pump.fun, `c`
+   kopieert het adres, `f` volgt, `1` tot `4` openen Axiom, Photon, BullX en GMGN, `/` zoekt), presets ("nieuw < 5 min",
+   "momentum", "bijna gegradueerd", "organisch", "thema brandt", "makers met track record"), je eigen filters als URL om te
+   delen, een volglijst en notities die alleen in je browser staan, en geluid bij een nieuwe play (standaard uit). De
+   linkpatronen van de vier handelsterminals zijn nog niet met de hand geverifieerd (`docs/UNVERIFIED.md`); een verkeerde is
+   één regel in `config/web.json`.
+2. **De edge-fabriek (`fart research`).** Zeven vooraf vastgelegde hypotheses (maker met track record, organische vroege
+   kopers, vroege-kopersmomentum, themaleider, dev-verkoop, graduatiemoment, na graduatie; 145 varianten van instap × uitstap)
+   worden teruggerekend op onze eigen trades met de kosten die jij zou betalen: 1% curvefee per kant, priority fee, de
+   prijsimpact van jouw grootte, na graduatie de PumpSwap-fee en de impact uit de liquiditeit. Instap 20 s na het signaal op de
+   eerste trade daarna, uitstappen met doelen, trailing stops, tijdstops, een harde stop, bij graduatie of bij de eerste
+   dev-verkoop. Wat niet te meten is, heet onbekend en telt nooit als resultaat. **Bewezen** heet een regel pas als op de
+   tweede helft van de dagen (gekozen op de eerste helft) de ondergrens van het 95%-interval van de verwachte waarde na kosten
+   boven nul ligt, met minstens 100 gevallen, minder dan 20% onbekend en een lead time van minstens 2 minuten. Het rapport
+   (`out/research/<dag>-<H>.md`, Nederlands) zegt dat eerlijk, ook als het "Niet bewezen" is: dan heeft de fabriek gewerkt
+   en de edge niet. `fart research promote` zet alleen een bewezen variant in `config/plays.json` en weigert de rest met de
+   reden. **Het eerste echte rapport moet op de VPS draaien**: deze sandbox heeft geen kopie van de database; de tests draaien
+   het harnas op een synthetische wereld met bekende uitkomsten.
+3. **De Plays-laag (`fart plays`).** Een eigen daemon die alleen bewezen regels elke 15 s tegen de live stroom toetst, een
+   papierpositie opent met hetzelfde rekenmodel als het onderzoek, de uitkomst bijhoudt en jou een Telegram-bericht stuurt
+   (hoogstens 6 per uur: de regel, de gemeten trefkans en verwachte waarde, de munt, de instapstand, de uitstapregel in
+   gewone woorden en een link naar onze eigen Terminal; nooit een link naar een handelsplatform). `/plays` toont per regel
+   de papierposities en de cijfers uit het onderzoek ernaast. Bij oplevering is `config/plays.json` leeg en vuurt er niets.
+   De community krijgt uit deze laag niets vóór de go/no-go van de meetweek.
+
+Erbij: makerstatistieken (`creator_stats`) en minuutcandles na graduatie (`pool_candles`, GeckoTerminal, 30 per minuut
+gedeeld met de tracker) als begrensde stappen van de track-timer, de retentie van trades van 14 naar 30 dagen voor het harnas,
+en een schijfregel in `fart status` die waarschuwt onder 20 GB vrij (de schijf staat op 91%). De bevroren regels zijn byte
+voor byte gelijk gebleven; het Alchemy-plafond ook. Na de uitrol: open `/terminal`, draai
+`fart research run --hypothesis H5 --days 3 --limit 300` en lees het rapport.
+
 ## Voor Jim: wat milestone 11 toevoegt
 
 Mijlpaal 11 brengt de engine-tick terug van minuten naar seconden zonder dat ook maar één uitkomst verandert, en registreert

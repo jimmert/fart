@@ -41,6 +41,7 @@ import json
 import math
 import re
 import signal
+import select
 import socket
 import sys
 import threading
@@ -56,7 +57,7 @@ from ..config import Settings
 from ..log import Throttle, get_logger
 from ..notify.format import fmt_time
 from ..util import atomic_write_json, now as wall_now, utc_iso
-from . import auth, data, markdown, pages, public, theme
+from . import auth, data, markdown, pages, public, terminal, theme
 
 log = get_logger("web")
 
@@ -75,7 +76,7 @@ VIEWS_LOG_EVERY_S = 300.0  # the durations of a cycle are logged at most this of
 RATE_LIMIT = 120           # public requests per IP per window
 RATE_WINDOW_S = 60
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-STATIC_TYPES = {"app.css": "text/css; charset=utf-8", "app.js": "text/javascript; charset=utf-8", "icon.svg": "image/svg+xml"}
+STATIC_TYPES = {"app.css": "text/css; charset=utf-8", "app.js": "text/javascript; charset=utf-8", "terminal.js": "text/javascript; charset=utf-8", "icon.svg": "image/svg+xml"}
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; font-src 'self'; "
        "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 SECURITY_HEADERS = (
@@ -129,6 +130,18 @@ class Response:
         out = list(merged.items())
         out += [("Set-Cookie", c) for c in self.cookies]
         return out
+
+
+@dataclass
+class StreamResponse(Response):
+    """Milestone 12: a server-sent-events answer. `events` yields the encoded events (the socket layer writes them chunked
+    as they come and keeps the connection open); `on_close` runs when the client went away or the server stops."""
+    events: Any = None
+    on_close: Callable[[], None] | None = None
+
+
+STREAM_WAIT_S = 1.0   # milestone 12: how long a stream waits for an event before it checks that the client is still connected
+SSE_HEADERS = (("Cache-Control", "no-cache, no-store"), ("X-Accel-Buffering", "no"), ("Connection", "close"))
 
 
 def html_response(status: int, body: str, **kw: Any) -> Response:
@@ -433,13 +446,16 @@ class App:
 
     PUBLIC_API = {"/api/public/status": "status", "/api/public/coverage": "coverage", "/api/public/observations": "observations",
                   "/api/public/reports": "reports", "/api/public/week": "week", "/api/public/live": "live", "/api/public/hot": "hot",
-                  "/api/public/new": "new", "/api/public/themes": "themes", "/api/public/graduations": "graduations", "/api/public/social": "social"}
+                  "/api/public/new": "new", "/api/public/themes": "themes", "/api/public/graduations": "graduations", "/api/public/social": "social",
+                  "/api/public/plays": "plays"}
     LIVE_VIEWS = ("live", "hot", "new", "themes", "graduations", "social", "today")
-    REST_VIEWS = ("status", "coverage", "week", "reports", "observations", "method")     # every 30 s; "reports" also computes every report page
+    REST_VIEWS = ("status", "coverage", "week", "reports", "observations", "method", "plays")     # every 30 s; "reports" also computes every report page
     DASHBOARD_VIEWS = ("live", "hot", "new", "themes", "graduations", "social", "today", "week", "coverage")
     OWNER_API = {"/api/status": "status", "/api/coverage": "coverage", "/api/decisions": "decisions", "/api/x": "x",
                  "/api/report/latest": "report", "/api/week/latest": "week"}
-    PUBLIC_PAGES = ("/", "/observaties", "/meting", "/rapporten", "/methode", "/tools")
+    PUBLIC_PAGES = ("/", "/observaties", "/meting", "/rapporten", "/methode", "/tools", "/terminal", "/plays")
+    STREAM_PATH = "/api/public/stream"          # milestone 12: the Terminal's server-sent events
+    SNAPSHOT_PATH = "/api/public/terminal"      # milestone 12: the feed's last snapshot as JSON
 
     def __init__(self, settings: Settings, clock: Callable[[], float] = wall_now):
         problems = auth.check_config(settings.web_password_hash, settings.web_secret)
@@ -455,6 +471,9 @@ class App:
                      "accent": str(ws.get("accent") or ""), "refresh_s": int(ws.get("refresh_s") or 30), "live_refresh_s": int(ws.get("live_refresh_s") or LIVE_TTL_S)}
         self.store = ViewStore(self.compute_public, self.view_schedule, clock, open_db=self.db, children=self.view_children,
                                status_path=settings.logs_dir / VIEWS_FILE)
+        # milestone 12: the Terminal's feed (one incremental computation per second, shared by every viewer)
+        self.feed = terminal.TerminalFeed(settings, self.db, clock)
+        self.terminal_cfg = terminal.terminal_config(settings)
         self.limiter = RateLimiter()
         self.limit_log = Throttle(RATE_WINDOW_S)
         self.static: dict[str, bytes] = {}
@@ -490,8 +509,9 @@ class App:
                 "refresh_label": f"Ververst elke {int(self.site.get('refresh_s', 30))} s zolang dit tabblad open staat."}
 
     def page(self, title: str, body: str, sess: dict[str, Any] | None, now: float, active: str, *, script: bool = True, status: int = 200,
-             robots: str | None = None, cacheable: bool = False, req: Request | None = None, refresh_s: int | None = None, computing: bool = False) -> Response:
-        html = pages.layout(self.ctx(sess, now), title, body, active=active, script=script, robots=robots, refresh_s=refresh_s)
+             robots: str | None = None, cacheable: bool = False, req: Request | None = None, refresh_s: int | None = None, computing: bool = False,
+             terminal_script: bool = False) -> Response:
+        html = pages.layout(self.ctx(sess, now), title, body, active=active, script=script, robots=robots, refresh_s=refresh_s, terminal_script=terminal_script)
         resp = html_response(status, html)
         if cacheable and sess is None and status == 200:
             self.public_headers(resp, req, max_age=COMPUTING_MAX_AGE_S if computing else refresh_s)
@@ -564,6 +584,10 @@ class App:
                 r = self.page("Even wachten", pages.error_page(429, "Te veel verzoeken van dit adres; probeer het over een minuut opnieuw."), None, now, "", status=429, script=False)
                 r.headers += headers
                 return r
+        if path == self.STREAM_PATH:
+            return self.stream_response(req)
+        if path == self.SNAPSHOT_PATH:
+            return self.snapshot_response(req, sess)
         if path.startswith("/api/public/"):
             return self.public_api(path, req, now, sess)
         if path.startswith("/api/"):
@@ -589,6 +613,13 @@ class App:
             return self.page("Methode", pages.method_page(self.ctx(sess, now), v), sess, now, "/methode", script=False, cacheable=True, req=req, computing=public.is_computing(v))
         if path == "/tools":
             return self.page("Tools", pages.tools_page(self.ctx(sess, now)), sess, now, "/tools", script=False, cacheable=True, req=req)
+        if path == "/terminal":
+            v = self.public_view("plays", now)
+            return self.page("Terminal", pages.terminal_page(self.ctx(sess, now), self.terminal_cfg, v), sess, now, "/terminal", script=False, cacheable=True, req=req,
+                             terminal_script=True)
+        if path == "/plays":
+            v = self.public_view("plays", now)
+            return self.page("Plays", pages.plays_page(self.ctx(sess, now), v), sess, now, "/plays", cacheable=True, req=req, computing=public.is_computing(v))
         if path == "/instellingen":
             return redirect(OWNER_PATH + "#instellingen")
         if path == OWNER_PATH:
@@ -624,9 +655,69 @@ class App:
 
     def start_views(self) -> None:
         self.store.start()
+        self.feed.start()
 
     def stop_views(self, timeout: float = VIEWS_STOP_S) -> bool:
-        return self.store.stop(timeout)
+        ok = self.store.stop(timeout)
+        return self.feed.stop(timeout) and ok
+
+    # ----- milestone 12: the Terminal's stream and snapshot --------------------------------------------------------------
+    def stream_response(self, req: Request) -> Response:
+        """`/api/public/stream`: subscribe the viewer to the feed; the socket layer writes the events as they come."""
+        follow = terminal.parse_follow(req.query.get("follow"))
+        last_raw = req.headers.get("last-event-id") or req.query.get("last")
+        try:
+            last_id = int(last_raw) if last_raw not in (None, "") else None
+        except ValueError:
+            last_id = None
+        got = self.feed.subscribe(follow, last_id)
+        if got is None:
+            return json_response(503, {"error": "too many live connections", "retry_after_s": 30}, headers=[("Retry-After", "30")])
+        sub, initial = got
+        feed = self.feed
+
+        def events():
+            idle = 0.0
+            try:
+                yield b"retry: 3000\n\n"
+                for ev in initial:
+                    yield ev.encode()
+                while not feed._stop.is_set():
+                    ev = sub.get(timeout=STREAM_WAIT_S)
+                    if sub.dropped:
+                        yield b"event: dropped\ndata: {\"reason\": \"client too slow\"}\n\n"
+                        return
+                    if ev is None:
+                        idle += STREAM_WAIT_S
+                        if idle >= feed.heartbeat_s + 5.0:
+                            idle = 0.0
+                            yield b": keep-alive\n\n"
+                        else:
+                            yield b""          # nothing to send: the socket layer checks whether the client is still there
+                        continue
+                    idle = 0.0
+                    yield ev.encode()
+            finally:
+                feed.unsubscribe(sub)
+
+        return StreamResponse(200, b"", "text/event-stream; charset=utf-8", headers=list(SSE_HEADERS), close=True, events=events(), on_close=lambda: feed.unsubscribe(sub))
+
+    def snapshot_response(self, req: Request, sess: dict[str, Any] | None) -> Response:
+        snap = self.feed.snapshot()
+        if snap is None:
+            resp = json_response(200, {**public.computing("terminal"), "rows": [], "n": 0})
+            if sess is None:
+                self.public_headers(resp, req, max_age=COMPUTING_MAX_AGE_S)
+            return resp
+        resp = json_response(200, snap)
+        if sess is None:
+            self.public_headers(resp, req, max_age=1)
+        return resp
+
+    def feed_status(self) -> dict[str, Any]:
+        f = self.feed
+        return {"running": f.running, "cycles": f.cycles, "errors": f.errors, "viewers": f.connections, "coins": len(f.coins), "last_cycle_s": round(f.last_cycle_s, 3),
+                "max_connections": f.max_connections, "heartbeat_s": f.heartbeat_s}
 
     def public_view(self, name: str, now: float, arg: str | None = None) -> Any:
         """The last value of a view, at once; the placeholder "wordt berekend" while it was never computed; None for a
@@ -682,6 +773,8 @@ class App:
             return public.graduations_view(conn, self.settings, now)
         if name == "social":
             return public.social_view(conn, self.settings, now)
+        if name == "plays":
+            return public.plays_view(conn, self.settings, now)
         raise KeyError(key)
 
     def public_api(self, path: str, req: Request, now: float, sess: dict[str, Any] | None) -> Response:
@@ -746,10 +839,10 @@ class App:
                 conn.close()
 
     def views_status(self, now: float) -> dict[str, Any]:
-        """The background computation of the public views, for /eigenaar and /api/status (milestone 10)."""
+        """The background computation of the public views, for /eigenaar and /api/status (milestone 10); the Terminal feed (milestone 12)."""
         rows = self.store.stats(now)
         return {"rows": rows, "running": self.store.running, "computes": self.store.computes, "failures": self.store.failures, "slow_s": SLOW_VIEW_S,
-                "live_ttl_s": self.site["live_refresh_s"], "ttl_s": CACHE_TTL_S, "file": VIEWS_FILE}
+                "live_ttl_s": self.site["live_refresh_s"], "ttl_s": CACHE_TTL_S, "file": VIEWS_FILE, "terminal": self.feed_status()}
 
     def views(self, now: float, names: tuple[str, ...]) -> dict[str, Any]:
         conn = self.db()
@@ -926,6 +1019,9 @@ class Handler(BaseHTTPRequestHandler):
         log.info("web.request", method=self.command, path=path, status=resp.status, ms=round((time.monotonic() - t0) * 1000), ip=ip)
 
     def _write(self, resp: Response, head: bool) -> None:
+        if isinstance(resp, StreamResponse):
+            self._stream(resp, head)
+            return
         if resp.close:
             self.close_connection = True
         try:
@@ -940,6 +1036,59 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(resp.body)
         except (BrokenPipeError, ConnectionResetError, socket.timeout):
             self.close_connection = True
+
+
+    def _stream(self, resp: StreamResponse, head: bool) -> None:
+        """Milestone 12: a server-sent-events answer: the headers, then every event as its own chunk (HTTP/1.1 chunked
+        transfer, flushed at once), until the generator ends or the client goes away."""
+        self.close_connection = True
+        try:
+            self.send_response(resp.status)
+            for k, v in resp.all_headers():
+                if k.lower() in ("content-length",):
+                    continue
+                self.send_header(k, v)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.wfile.flush()
+            if head or resp.events is None:
+                self.wfile.write(b"0\r\n\r\n")
+                return
+            for chunk in resp.events:
+                if not chunk:
+                    if self._client_gone():
+                        break
+                    continue
+                self.wfile.write(f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, socket.timeout, OSError):
+            pass
+        finally:
+            try:
+                close = getattr(resp.events, "close", None)
+                if close is not None:
+                    close()
+            except Exception:  # noqa: BLE001
+                pass
+            if resp.on_close is not None:
+                try:
+                    resp.on_close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+    def _client_gone(self) -> bool:
+        """A streaming client sends nothing after its request: a readable socket means it closed (EOF) or broke."""
+        try:
+            r, _, _ = select.select([self.connection], [], [], 0)
+            if not r:
+                return False
+            data = self.connection.recv(1, socket.MSG_PEEK)
+            return data == b""
+        except (OSError, ValueError):
+            return True
 
 
 class Server(ThreadingHTTPServer):

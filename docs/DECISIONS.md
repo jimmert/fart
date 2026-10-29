@@ -1171,3 +1171,197 @@ zijn.
     failed (the page then said "wordt berekend" forever). Found by the test suite on a day after the fixture date; fixed by
     joining the parts present ("a, b en c." stays "a, b en c."). Not a rule and not a design change.
 160. **Branch and PR**: all work on the harness branch `claude/loving-davinci-3rsdh3`; the PR targets `main`.
+
+## Milestone 12 (29 oktober 2026)
+
+**Samenvatting (Nederlands).** Mijlpaal 12 bouwt twee dingen naast de bevroren engine, niet erin. **Deel A, de Terminal**
+(`/terminal`): één live tabel van alle munten in beeld (de watchlist plus de creates van de laatste 30 minuten), gevoed door
+één server-sent-events-stroom (`/api/public/stream`, één verbinding per tabblad, hartslag elke 15 s, hervatten met
+`Last-Event-ID`, een update binnen een seconde na een nieuwe trade), met per munt leeftijd, naam/ticker, marktwaarde,
+graduatievoortgang (SOL van 85), unieke kopers en netto SOL in 5 minuten, kopers/verkopers, grootste koper, dev-buy en
+dev-verkoop, bundelvlag, makerstatistiek (B.4), thema en burst, X-vermeldingen waar gemeten, laatste trade, status en de
+plays die vuren; sorteren, kolommen, dichtheid, toetsen (j/k, enter, c, f, 1 tot 5, /), presets ("nieuw < 5 min", "momentum",
+"bijna gegradueerd", "organisch", "thema brandt", "makers met track record"), eigen filters in de URL en in de browser, een
+volglijst en notities per bezoeker (localStorage), geluid bij een nieuwe play (standaard uit) en een Plays-paneel. Elke actie is
+kopiëren of een link in een nieuw tabblad naar pump.fun, DexScreener, Solscan of een handelsterminal uit `config/web.json`
+(Axiom, Photon, BullX, GMGN; de linkpatronen zijn niet handmatig geverifieerd, `docs/UNVERIFIED.md`). Er is geen koopknop,
+geen wallet, geen order. **Deel B, de edge-fabriek** (`fart research`): een backtest-harnas dat vooraf vastgelegde hypotheses
+toetst op onze eigen trades met de kosten die een mens betaalt, een autopsie van de organische winnaars, makerstatistieken en
+minuutcandles na graduatie als nieuwe, begrensde dataverzameling, en een Plays-laag (`fart plays`, `fart-plays.service`) die
+alleen **bewezen** regels uit `config/plays.json` elke tick tegen de live stroom toetst, papierposities bijhoudt, `/plays`
+vult en de eigenaar waarschuwt (Telegram, soort `play`, hoogstens 6 per uur; de community pas na de go/no-go). Bij oplevering
+is `config/plays.json` leeg: niets is bewezen, dus niets vuurt. De bevroren regelbestanden zijn byte-gelijk gebleven
+(vingerafdruk `sha256:d45c41793c64`, de bewezen gelijkwaardige van `sha256:e3bf4320c45c`); alles van M12 leeft in eigen
+modules (`fart/web/terminal.py`, `fart/research/`, `fart/plays/`, `fart/measure/creators.py`, `fart/measure/candles.py`,
+`fart/measure/paper.py` → het uitvoeringsmodel) en eigen tabellen (schema v9: `creator_stats`, `pool_candles`, `candle_jobs`,
+`plays`). **Het eerste echte rapport moet op de VPS draaien**: de sandbox heeft geen kopie van de database; de tests draaien
+het harnas op een synthetische wereld met bekende uitkomsten.
+
+**De vooraf vastgelegde hypotheses (B.2), getoetst in deze volgorde:** **H4** maker met track record (de maker had eerder een
+graduatie of winnaar in onze data, zonder bundel en zonder vroege dev-verkoop; groepen goed / slecht / geen / neutraal);
+**H5** organische vroege kopers (minstens 10 unieke kopers in de eerste 3 minuten; de drie bundeldefinities als filters: zonder
+dev-bundel, zonder slot-bundel, zonder top-2-bundel, zonder elke bundel, alleen gebundeld); **H1** vroege-kopersmomentum
+(N unieke kopers én M netto SOL in 5 minuten, N 15/25/40, M 3/5/10; het raster van de engine); **H3** themaleider (de eerste
+of sterkste munt van een opkomend thema tegenover de copycats); **H7** dev-verkoop (wat een verkoop van de maker binnen 10
+minuten voorspelt; met en zonder; verkopen zodra de maker verkoopt); **H2** graduatiemoment (munten die met netto minstens
+M SOL in 5 minuten van 75 naar 85 SOL in de curve gaan, M 5/10/20, houdtijd 5/10/15 minuten; de instap is de tick waarop de
+curve 75 SOL passeert, en alleen die); **H6** na graduatie (volume in het eerste half uur op PumpSwap boven 10k/25k/50k USD).
+Samen 145 varianten (instap × uitstap); elke variant wordt geteld en gerapporteerd, en het rapport zegt hoeveel er bij louter
+toeval een positieve ondergrens zouden tonen (de multipliciteitsnoot). Uitstappen: vaste doelen +40/60/100% met halve
+verkoop en trailing voor de rest, trailing 20/30/50% onder de piek, tijdstop 5/10/15/60 minuten, harde stop −35%, verkoop bij
+graduatie, verkoop bij de eerste dev-verkoop, uiterlijk na 24 uur.
+
+**Bewezen** betekent, en niets minder: de variant is gekozen op de **keuzehelft** (de eerste helft van de dagen: de hoogste
+verwachte waarde onder de varianten met minstens 20 gevallen daar) en op de **toetshelft** (de tweede helft) is de ondergrens
+van het 95%-interval (blokbootstrap met de UTC-dagen als blokken, 9.999 trekkingen, vaste seed 20261029) van de **verwachte
+waarde na kosten** groter dan 0, met minstens **100 gevallen**, een aandeel **onbekende** uitkomsten onder **20%** en een
+mediane **lead time** (signaal tot piek binnen 24 uur) van minstens **2 minuten**. Onbekend (het prijspad eindigt vóór een
+uitstap) en geen vulling (geen trade binnen 10 minuten na het signaal) tellen apart en nooit als resultaat. De instap vult
+20 s na het signaal (ook 5/60/120 s als gevoeligheid) op de eerste trade daarna tegen de curvequote van 0,5 SOL (ook 0,1 en
+1 SOL); kosten: curvefee 1% per kant, priority fee 0,0005 SOL per transactie, de prijsimpact van de curve (0,5 SOL verplaatst
+een verse curve 3,3%); na graduatie de PumpSwap-fee 0,25% en de impact uit de liquiditeit van DexScreener (zonder
+liquiditeit: 85 SOL aangenomen en zo gemarkeerd); de uitstap via `sell_quote` zolang er trades zijn, daarna via
+`mcap_samples` of minuutcandles. Per variant: verwachte waarde in SOL en %, trefkans, mediaan/p10/p90, maximale drawdown, n,
+het interval, de lead time, de capaciteit (SOL tot 5% impact), de gevoeligheid voor de instapvertraging en de grootte, het
+aandeel onbekend, en de conditionering op tijd van de dag (piek 13:00 tot 02:00 UTC), SOL-trend en munten per uur.
+Promotie (`fart research promote <H> <variant>`) weigert een onbewezen variant, een andere variant dan de vooraf gekozen en
+een hypothese zonder rapport; een promotie schrijft een nieuwe regelversie en zet de vorige van dezelfde hypothese op
+inactief.
+
+**Wat verder vastligt.** De Terminal leest alleen bestaande tabellen (`watchlist`, `coins`, `trades`, `decisions`, `outcomes`,
+kv `engine.metas_latest` en `sol_usd.cache`, `x_keys`, `creator_stats`, `plays`) via één feed-thread met één berekening voor
+alle kijkers; de rij per munt herberekent de engine-definities (unieke kopers, netto SOL, grootste koper, bundel) in het
+geheugen uit dezelfde trades, zonder de engine aan te raken. Onbekend blijft onbekend: zonder trade geen marktwaarde, zonder
+genoeg kopen geen bundeloordeel, zonder eerdere munt geen makercijfer, zonder meting geen X-aantal, zonder SOL-prijs geen
+dollar. De dataverzameling van M12 is begrensd en zichtbaar in `fart status`: makerstatistieken per stap hoogstens 2.000 makers
+met cursors en een backlog-vlag (hoogstens 50 munten per maker gescand); candles hoogstens 20 per run, één uur na graduatie,
+achter de budgetpoort `geckoterminal` (30 per minuut, gedeeld met de tracker), met wachtrij, pogingen en backlog; het
+Alchemy-dagplafond blijft 3.000.000 CU en M12 doet geen enkele RPC-aanroep. De retentie van `trades` gaat van 14 naar 30 dagen
+voor het harnas; `fart status` schat de schijfgroei (180 bytes per rij, een schatting om te kalibreren) en waarschuwt onder
+20 GB vrij; de VPS-schijf is voor 91% vol door andere projecten, dus die regel is geen versiering. De webdienst blijft
+alleen-lezen; er komt geen nieuwe naam in `.env`.
+
+161. **Everything of milestone 12 lives next to the engine, not in it** (`fart/web/terminal.py`, `fart/research/`,
+    `fart/plays/`, `fart/measure/creators.py`, `fart/measure/candles.py`, the execution model appended to
+    `fart/measure/paper.py`; schema v9 adds `creator_stats`, `pool_candles`, `candle_jobs` and `plays`): the frozen rule files
+    of `fart/version.py` → `RULE_FILES` are byte-identical, the fingerprint test of milestone 5 still pins
+    `sha256:d45c41793c64` as the registered equivalent of the frozen `sha256:e3bf4320c45c`, and the engine's tables are only
+    read. The terminal and the research code import the rule modules read-only (`curve.py` for the quotes, `meta.py` for the
+    tokenizer, `decide.py` nowhere) and never write a decision, a watchlist row or a kv the engine reads.
+162. **One execution model for research and live plays** (`paper.Position`, `PricePoint`, `ExitRules`, `Costs`,
+    `pool_sell`, `pool_buy`, `capacity_sol`): the harness and the plays daemon run the same code point by point, so a promoted
+    rule behaves live exactly as it was measured. A position fills at the first point at least `entry_delay_s` after the
+    signal (the quote of `buy_quote` on the curve: the fee and the impact of that size), waits at most 600 s for a point (then
+    no fill), and sells at the first point at least `exit_delay_s` after its trigger (a human needs the same seconds to act on
+    an exit as on an entry). Trigger order per point: dev sell, graduation, hard stop, target (partial), trailing stop, time
+    stop, max hold. After the graduation point the venue is the pool: PumpSwap fee 0.25% and a constant-product impact on the
+    liquidity of the sample (`assumed_85_sol` when none is known, flagged in the fill). The state serializes to JSON
+    (`to_json`/`from_json`) so the plays daemon stores it per tick and continues to the same result.
+163. **Features are replayed from `trades` in memory, not read from `features_asof`** (`research/features.py::replay_features`,
+    `tick_times`): the engine only stores feature snapshots at decisions, so the harness rebuilds the engine's momentum
+    definitions (unique buyers, net SOL, buys, sells for 1/5/15 min, largest buyer share over 15 min, trades total, curve
+    state, market cap, graduation progress) at 15 s ticks from the create, as-of each tick (`knowable`: event time and
+    `received_at` both at or before the tick). The same function feeds the live terminal rows and the plays daemon's contexts.
+164. **Three bundle definitions, each True / False / None, never a guess** (`features.bundle_flags`): the dev buy above 5% of
+    the 85 graduation SOL; at least three buyers in the create's slot buying together more than 15% of it; two wallets with
+    more than 40% of the buy SOL in the first ten trades, judged only once those trades hold at least five buys (two buys are
+    always above 40%). The aggregate is True when any flag is True, False only when the dev buy is known and the top-2 verdict
+    is False (a create without a known slot cannot have a slot flag; that absence does not block the verdict), otherwise None.
+    A coin with three trades stays "onbekend" forever rather than "gebundeld"; the terminal's "organisch" preset requires an
+    explicit False. `dev_sell` gives the creator's first sell, whether it fell within 10 minutes, and the fraction sold.
+165. **Walk-forward with one pre-chosen variant** (`harness.Harness.split_days`, `evaluate`, `proven_verdict`): the days are
+    split in two halves (the first half plus one when odd); on the selection half the variant with the highest expected value
+    among those with at least `min_select_cases` (20) is chosen; only that variant's test-half figures count as the test. Every
+    variant's full, selection and test metrics are reported anyway, with a multiplicity note that says how many of them would
+    show a positive lower bound by chance (`variants × alpha / 2`). "Bewezen" is the conjunction of four criteria on the
+    test half: the lower bound of the 95% block bootstrap of the mean pnl after costs above 0, at least 100 cases, an unknown
+    share under 20%, and a median lead time of at least 120 s. The bootstrap resamples UTC days with replacement, 9,999 draws,
+    seed 20261029 (`bootstrap_mean`; the same seed gives the same interval, a test proves it).
+166. **Unknown and no fill are counted, never scored** (`Case.status` closed | unknown | no_fill; `metrics`): a signal whose
+    price path ends before an exit (a dead coin, the end of the data) is unknown and lands in the unknown share; a signal
+    without a trade to fill on within 600 s is no fill and lands apart; neither enters the expected value, the hit rate, the
+    quantiles or the drawdown, and `signals == cases + unknown + no_fill` holds everywhere (a test checks it per half). A
+    position's `pnl_sol` is None while it is open: the plays page shows "onbekend", never a mark-to-market as a result.
+167. **Costs as the human pays them, and a capacity per signal** (`RunConfig.from_settings`, `config/measure.json` →
+    `research`): curve fee 1% per side (the frozen `trade_fee_bps`), priority fee 0.0005 SOL per transaction (each fill counts
+    one), the curve's price impact of the size (0.5 SOL moves a fresh 30 SOL curve by 3.3%), after graduation the PumpSwap fee
+    0.25% and the pool impact from DexScreener's liquidity (half the USD liquidity as the SOL side). The capacity of a signal
+    is the SOL that moves the curve's spot by 5% at the signal (`capacity_sol`; 0.74 SOL on a fresh curve); the report shows
+    its median per variant so a rule's size is a measurement, not a wish. The sensitivity section repeats the chosen variant
+    with entry delays 5/20/60/120 s and sizes 0.1/0.5/1 SOL.
+168. **H2 fires on the observed crossing only** (`hypotheses._h2_fires`, `H2_CROSS_SOL` = 75 real SOL in the curve, the
+    virtual reserve minus 30): the previous tick under 75 and this one at or above, once per coin; a coin first seen above 75
+    (the engine watched it late) never fires, in the harness and live alike, so the live layer cannot buy what the backtest
+    never saw. The candidates of H2 are the coins whose virtual reserve passed 105 SOL inside the window (an index range on
+    `trades`), not every coin.
+169. **Promotion is a gate, not a copy** (`report.promote`, `PromoteError`): it refuses an unknown variant, a variant that is
+    not the report's pre-chosen one (promoting another variant is choosing on the test half), an unproven pre-chosen variant
+    (the failed criteria named), and a hypothesis without a report; it writes a rule `<H>-v<n>` with the test-half figures,
+    the exit rules and their Dutch description, the report name and the promotion time into `config/plays.json`, and sets the
+    previous active rule of the same hypothesis to inactive with `superseded_by`. `config/plays.json` ships empty.
+170. **The plays layer is its own daemon** (`fart/plays/service.py::PlaysEngine`, `fart plays [--once]`,
+    `deploy/fart-plays.service`): every 15 s it loads the active rules, takes the candidates per family (the watchlist and the
+    recent creates; for H6 the recent graduations), replays the features as-of now, keeps the previous tick's features for
+    the crossing predicates, opens one play per (rule, version, mint) with the signal's features and entry state, feeds every
+    open position the price points that arrived since its last one, closes as unknown 24 h and 10 min after the signal without
+    an exit and as no fill 10 min after the entry delay without a trade, and enqueues the alerts: kind `play`, dedupe
+    `play:<id>`, the owner chat only, at most `alerts.max_per_hour` (6) in a sliding hour; a play over the bound is marked
+    alerted and counted (`plays.alerts_over_limit`), never sent late. The message names the rule, its measured hit rate and
+    expected value, the coin, the signal, the entry state, the exit rule and our own Terminal page; no venue link, no buy
+    word. Heartbeat and the last tick's summary are in kv (`plays.heartbeat`, `plays.rules_active`, `plays.last_tick`) for
+    `fart status` and the pages. The community chat is not a destination until the go/no-go.
+171. **The terminal is a feed with one computation for every viewer** (`terminal.TerminalFeed`): one thread cycles every
+    second (`stream_poll_s`), reads the new `trades` rows by `received_at` from 5 s behind its cursor (a row whose transaction
+    committed after a cycle had passed its received_at still arrives; a seen set of (mint, signature) keeps it from counting
+    twice; `trades` is WITHOUT ROWID, so there is no rowid cursor), keeps per coin the last 16 minutes of trades, the first ten,
+    the creator's buys and sells and the last curve state, recomputes every dirty row at once and every row every 5 s or when
+    the engine's heartbeat moved (the sliding windows age), and emits `rows` deltas (`upd`, `del`, `n`), a `snapshot` at most
+    every 300 s, `plays` when the firing plays change and a `heartbeat` every 15 s (engine age, coins, viewers). The last 400
+    delta events form a ring: a `Last-Event-ID` inside it gets the missed deltas, outside it a fresh snapshot. The universe
+    is the watchlist, the creates of the last 30 minutes and the mints the open connections follow (`?follow=`, at most 50
+    each); at most 800 rows; at most 64 connections (a 65th gets 503 with Retry-After 30); a client 200 events behind gets
+    `event: dropped` and is disconnected. `/api/public/terminal` is the same snapshot as JSON (max-age 1) for a browser
+    without EventSource and for the tests.
+172. **Server-sent events over our own HTTP/1.1 server** (`server.StreamResponse`, `Handler._stream`): the response is
+    chunked, each event its own chunk flushed at once, `Cache-Control: no-cache, no-store` and `X-Accel-Buffering: no`, a
+    `: keep-alive` comment when nothing happened for the heartbeat interval plus 5 s, and the handler checks its socket every
+    second (`select` plus a peek) so a closed tab is unsubscribed within seconds instead of at the next write. The Caddy
+    site file compresses only the listed content types (an `encode` response matcher; `text/event-stream` is not among them)
+    and proxies `/api/public/stream` with `flush_interval -1`; both are Caddy 2.6 core directives (the allow-list test of
+    milestone 8 knows them). Through Caddy the first event must arrive within a second: `docs/UNVERIFIED.md`.
+173. **The browser builds every cell with DOM calls and keeps the content-security policy** (`static/terminal.js`): no HTML
+    is built from data (a test forbids innerHTML, insertAdjacentHTML, document.write, eval), the page keeps
+    `default-src 'self'` with no inline script or style (the progress bar's width is set through the CSSOM), the configuration
+    (terminals, presets, columns, link patterns, limits) travels in a `data-config` attribute as escaped JSON, every external
+    link opens with `noopener noreferrer nofollow` in a new tab, the copy action uses the clipboard API with a textarea
+    fallback. One tab is one EventSource; a changed follow list reconnects with `?follow=` and `?last=`; a hidden tab closes
+    its stream after 90 s and resumes when shown; without EventSource, or while the stream fails, the snapshot is polled every
+    3 s and the pill says so. Filters live in the URL (`?preset=`, `?q=`, `?maxage=` ... shareable) and, on request, in
+    localStorage; follows, notes, columns, density, the sound switch and the sort order live in localStorage only (per
+    visitor, never on the server). The ages tick client-side from the server's clock offset, so the table moves between
+    events without a request.
+174. **The public vocabulary grows by one measured word** (`pages.terminal_page`, `pages.plays_page`, `public.plays_view`,
+    `tests/test_m12_terminal.py`): the Terminal and Plays pages may say "signaal" and "trefkans" because a play is a measured
+    rule with its hit rate and expected value after costs next to it, but never "winst", "rendement", "voorspelling" or a buy
+    word (the m9 word test still holds for the older pages, and the new pages are tested against the same owner lists); the
+    public JSON keeps the owner-key rule (the plays layer's state is `layer`, the stream interval `pulse_s`). The tools page
+    keeps its "geen koopknoppen" sentence next to the links to the Terminal and Plays.
+175. **Creator statistics and candles are bounded steps of the track timer** (`measure/creators.py`, `measure/candles.py`,
+    `outcomes.run_extra_steps`): `creator_stats` is recomputed per creator when a coin, graduation or outcome of theirs arrives
+    (three cursors in kv, at most 2,000 creators per run and 60 s of work, a backlog flag when either bound hit, at most 50 of a
+    creator's coins scanned for the bundle and dev-sell flags), with a track record good / bad / neutral / none that the
+    terminal shows and H4 uses through `creator_history` (as-of, so the harness never sees a later coin). `pool_candles`
+    holds the GeckoTerminal 1-minute candles of the hour after each graduation, fetched once per graduation by a job queue
+    (`candle_jobs`: due an hour after the migration, at most 20 fetches per run, 3 attempts, the error kept per job, the gate
+    `geckoterminal` asked first and a refusal counted). Both steps run isolated after the outcomes: a failure is logged and
+    recorded (`measure.creator_stats_failed`, `measure.candles_failed`) and never stops the tracker. Both are lines in
+    `fart status`.
+176. **Retention 30 days and the disk line** (`config/ingest.json`, `cli.disk_status`, `DISK_WARN_FREE_GB`, `TRADE_ROW_BYTES`):
+    the harness needs a month of trade paths, so `trades_days` goes from 14 to 30 (the retention test moved its fixture to 35
+    days old); `pool_candles` are pruned after 60 days into the archive like the other pruned rows. `fart status` shows the
+    free space of the data disk, the database size, the trades rows, the rows of the last 24 hours and the projection at the
+    retention (rows × days × 180 bytes, an estimate to calibrate on the VPS) and warns under 20 GB free, because the shared
+    disk is at 91%.
+177. **Branch and PR**: all work on the branch `claude/magical-lovelace-vqukei`; part B (schema, research, plays, data steps)
+    and part A (the Terminal) are two commits in that order because the Terminal shows the plays and the maker statistics;
+    the PR targets `main`.

@@ -16,9 +16,24 @@
 #
 # Milestone 9: only kingdegen.dev. www.kingdegen.dev has no DNS record, so it is left out on purpose (Caddy would otherwise
 # keep trying to obtain a certificate for it and log the failures); add it back to the first line when the record exists.
+#
+# Milestone 12: /api/public/stream is a server-sent-events stream (text/event-stream, chunked). It must reach the browser
+# unbuffered and uncompressed: the encoder only compresses the listed content types (text/event-stream is not among them)
+# and the stream's reverse_proxy flushes every write at once (flush_interval -1). After `caddy validate`, check with
+# `curl -N https://kingdegen.dev/api/public/stream` that the first event arrives within a second (docs/UNVERIFIED.md).
 
 kingdegen.dev {
-	encode zstd gzip
+	encode zstd gzip {
+		match {
+			header Content-Type text/html*
+			header Content-Type text/css*
+			header Content-Type text/javascript*
+			header Content-Type text/plain*
+			header Content-Type text/markdown*
+			header Content-Type application/json*
+			header Content-Type image/svg+xml*
+		}
+	}
 
 	request_body {
 		max_size 64KB
@@ -31,6 +46,11 @@ kingdegen.dev {
 		?X-Frame-Options DENY
 		-Server
 		defer
+	}
+
+	@stream path /api/public/stream
+	reverse_proxy @stream 127.0.0.1:8792 {
+		flush_interval -1
 	}
 
 	reverse_proxy 127.0.0.1:8792
