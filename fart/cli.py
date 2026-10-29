@@ -55,6 +55,7 @@ from typing import Any
 
 from . import db
 from .config import load_settings
+from .engine import tickstats
 from .log import setup_logging
 from .util import day_key, day_start, now, utc_iso
 from .version import rules_version
@@ -210,6 +211,8 @@ def cmd_status(settings, as_json: bool) -> int:
                               "skipped_last": json.loads(kv["measure.track.skipped.last"]) if kv.get("measure.track.skipped.last") else None,
                               "max_mints_per_run": settings.config("measure")["sampling"].get("max_mints_per_run")}
             out["rules_fingerprints"] = {k[len("engine.rules_fingerprint."):]: v for k, v in kv.items() if k.startswith("engine.rules_fingerprint.")}
+            # milestone 11: the budget of the last completed engine tick (every step) and the slow-tick counters
+            out["engine_tick"] = tickstats.read(kv, t, float(settings.config("engine").get("loop_interval_s", 15)))
             out["week_report_last_end_day"] = kv.get("measure.week.last_end_day")
             out["global_check"] = {"status": kv.get("chain.global.status"), "checked_at": utc_iso(float(kv["chain.global.checked_at"])) if kv.get("chain.global.checked_at") else None,
                                    "mismatches": json.loads(kv.get("chain.global.mismatches") or "[]")}
@@ -334,6 +337,8 @@ def cmd_status(settings, as_json: bool) -> int:
           + (f"  last={json.dumps(tr['skipped_last'])}" if tr.get("skipped_last") else ""))
     if out.get("rules_fingerprints"):
         print("  rules fingerprints (engine): " + ", ".join(f"{k}={str(v)[:19]}" for k, v in sorted(out["rules_fingerprints"].items())))
+    if out.get("engine_tick"):
+        print("  " + tickstats.status_line(out["engine_tick"]))
     if out.get("week_report_last_end_day"):
         print(f"  week report: last end day {out['week_report_last_end_day']}")
     xm = out.get("x_mode") or {}

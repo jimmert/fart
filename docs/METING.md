@@ -100,7 +100,11 @@ veranderde. Daarom krijgt elke `rules_version` een *vingerafdruk* van de regelbe
 `config/engine.json`, `config/pumpfun.json`, `config/stopwords.json`, curve-wiskunde, features, clustering,
 verdicts). Gelijke vingerafdruk = dezelfde regels; die rules_versions staan samen in één segment en worden
 allemaal genoemd. De bevroren regels van de meetweek (`150ca73cb354`, vingerafdruk in `config/measure.json`
-→ `community_gate.frozen_rules`) zijn het eerste segment. Een echte regelwijziging opent een nieuw segment.
+→ `community_gate.frozen_rules`) zijn het eerste segment. Een echte regelwijziging opent een nieuw segment. Een
+wijziging van een regelbestand die bewijsbaar dezelfde uitkomsten geeft (mijlpaal 11: de basislijn van de thema's één
+keer per tick berekend in plaats van per term) krijgt een nieuwe vingerafdruk maar geen nieuw segment: zij staat in
+`community_gate.frozen_rules_equivalents` met datum, PR en de test die de gelijkheid bewijst, wordt met de bevroren
+vingerafdruk samengenomen en onder de segmenttitel genoemd als *bewezen gelijkwaardige berekening*.
 Een andere `method_version` in `outcomes` geeft een eigen segment met eigen dagrapporten.
 
 **Universum per dag.** Creates per bron (PumpPortal, RPC, unie), graduaties, graduaties zonder bekende

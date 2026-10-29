@@ -218,15 +218,33 @@ def test_gate_thresholds_in_config_match_the_frozen_decisions(settings):
     assert g["frozen_rules"]["rules_version"] == "150ca73cb354" and g["frozen_rules"]["first_full_day"] == "2026-10-27"
 
 
+FROZEN_FP = "sha256:e3bf4320c45c7cd3c159bc045a66164ae1754637979ddacc759dc6bd59bbbd46"   # 150ca73cb354, the measurement week
+M11_FP = "sha256:147aa831c90d545ca8cd73f45c3772f854a1ec399cee961b7513b0c6ab253ace"      # milestone 11: the same rules, computed once per tick
+
+
 def test_the_working_tree_still_runs_the_frozen_rules():
     """Changing a rule-defining file (config/engine.json, decide.py, features.py, meta.py, curve.py, pumpfun.json,
     stopwords.json) is a rules change: describe it in docs/DECISIONS.md first and then update
-    community_gate.frozen_rules in config/measure.json on purpose. Never silently."""
-    from fart.util import load_json
-    from fart.version import REPO_ROOT
+    community_gate.frozen_rules in config/measure.json on purpose. Never silently.
 
-    frozen = load_json(REPO_ROOT / "config" / "measure.json")["community_gate"]["frozen_rules"]
-    assert rules_fingerprint() == frozen["rules_fingerprint"], "a rule-defining file changed: this is a new rules_version, not a silent edit"
+    Milestone 11 changed `features.py` without changing a rule (the meta baseline once per tick instead of once per term):
+    the working tree carries that fingerprint, `community_gate.frozen_rules_equivalents` lists it with the date, the PR and
+    the test that proves byte-equal outcomes against the frozen implementation, and the frozen entry itself is untouched."""
+    from fart.util import load_json
+    from fart.version import REPO_ROOT, canonical_fingerprint, frozen_rules_equivalents, runs_frozen_rules
+
+    gate = load_json(REPO_ROOT / "config" / "measure.json")["community_gate"]
+    assert gate["frozen_rules"]["rules_fingerprint"] == FROZEN_FP and gate["frozen_rules"]["rules_version"] == "150ca73cb354"
+    assert rules_fingerprint() == M11_FP, "a rule-defining file changed: this is a new rules_version, not a silent edit (or a new, unproven equivalent)"
+    equivalents = frozen_rules_equivalents(gate)
+    assert list(equivalents) == [M11_FP] and gate["frozen_rules_equivalents"][0]["pr"] == 11 and gate["frozen_rules_equivalents"][0]["date"] == "2026-10-29"
+    for e in equivalents.values():
+        assert e["rules_fingerprint"].startswith("sha256:") and len(e["rules_fingerprint"]) == 71 and e["date"] and int(e["pr"]) > 0
+        path, _, func = str(e["test"]).partition("::")
+        assert (REPO_ROOT / path).exists() and f"def {func}(" in (REPO_ROOT / path).read_text(), e["test"]  # the proof exists
+        assert e.get("changed_files") == ["fart/engine/features.py"]
+    assert canonical_fingerprint(M11_FP, gate) == FROZEN_FP and runs_frozen_rules(gate) is True
+    assert canonical_fingerprint("sha256:other", gate) == "sha256:other" and runs_frozen_rules(gate, "sha256:other") is False
 
 
 # ----- segments per rules group and method ----------------------------------------------------------------------
@@ -295,7 +313,9 @@ def test_week_cli_end_to_end_on_a_synthetic_world(settings, conn, capsys):
     assert rep["kind"] == "week" and rep["days"] == 2 and rep["end_day"] == end and rep["synthetic"] is False
     assert rep["method_versions"] == ["m1.0"] and len(rep["segments"]) == 1
     seg = rep["segments"][0]
-    assert seg["rules_versions"] == ["r1"] and seg["rules_group"] == rules_fingerprint() and seg["frozen"] is True  # r1 ran the frozen rules
+    # r1 ran the working tree's rules: since milestone 11 a proven-equivalent fingerprint, pooled into the frozen segment and named there
+    assert seg["rules_versions"] == ["r1"] and seg["rules_group"] == FROZEN_FP and seg["frozen"] is True
+    assert seg["rules_fingerprints"] == [rules_fingerprint()] == [M11_FP] and seg["equivalents"][0]["pr"] == 11
     # build_world marks the PumpPortal source as started at epoch 1: both days are covered, the first one has no graduations
     assert seg["universe"]["covered_days"] == 2 and seg["universe"]["not_covered_days"] == []
     assert seg["universe"]["graduations"] == 5 and seg["hit_rate"]["decisions"] == 3 and seg["universe"]["winners"] == 2
@@ -306,6 +326,7 @@ def test_week_cli_end_to_end_on_a_synthetic_world(settings, conn, capsys):
     for heading in ("### Samenvatting", "### Universum per dag", "### Trefkans van munt-observaties", "### Recall", "### Lead time",
                     "### Betrouwbaarheidsintervallen", "### Go/no-go community-alerts (bevroren criteria)", "## Kosten per dag", "## Versies"):
         assert heading in md, heading
+    assert "## Regels `sha256:e3bf4320c45c` (bevroren meetweek)" in md and "bewezen gelijkwaardige berekening** `sha256:147aa831c90d` (PR #11, 2026-10-29" in md
     assert main(["--root", str(settings.root), "--quiet", "status"]) == 0
     out = capsys.readouterr().out
     assert f"week report: last end day {end}" in out and "rules fingerprints (engine): r1=" in out

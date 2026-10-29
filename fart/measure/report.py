@@ -381,6 +381,7 @@ def build_report(conn: sqlite3.Connection, settings: Settings, day: str, now: fl
         "enrich": {"used": kvi(f"enrich.tx.{day}"), "limit": int(limit_kv) if limit_kv else enrich_daily_limit(bcfg, cap, tx_cost),
                    "skipped_budget": kvi(f"enrich.skipped_budget.{day}"), "backlog": enrich_backlog(conn, int(bcfg.get("max_attempts", 3)))},
         "engine_tick_failed": kvi(f"engine.tick_failed.{day}"),
+        "engine_tick_slow": kvi(f"engine.tick_slow.{day}"),   # milestone 11: ticks longer than the loop interval (work never skipped)
         "handle_failed": {s: kvi(f"ingest.handle_failed.{s}.{day}") for s in ("pumpportal", "rpc_logs", "rpc_trades")},
         "rejected_messages": rejected,
         "rpc_trades": {"subscription_capped": kvi(f"rpc_trades.subscription_capped.{day}"), "envelope_paused": kvi(f"rpc_trades.envelope_paused.{day}")},
@@ -724,7 +725,7 @@ def render_markdown(r: dict[str, Any]) -> str:
             f"- Verrijking (getTransaction van gemiste creates/graduaties): {_n(en.get('used'))} van {_n(en.get('limit'))} vandaag gebruikt, "
             f"{_n(en.get('skipped_budget'))} keer overgeslagen door de limiet; wachtrij nu: {_n(bl.get('migrate_tx'))} migraties, "
             f"{_n(bl.get('create_tx'))} creates (migraties gaan voor)",
-            f"- Mislukte engine-ticks: {_n(ops.get('engine_tick_failed'))}",
+            f"- Mislukte engine-ticks: {_n(ops.get('engine_tick_failed'))}; trage engine-ticks (langer dan het loopinterval): {_n(ops.get('engine_tick_slow', 0))}",
             f"- Mislukte ingest-handlers: " + ", ".join(f"{k} {_n(v)}" for k, v in hf.items()),
             f"- Geweigerde berichten: " + (", ".join(f"{k} {_n(v)}" for k, v in rej.items()) if rej else "geen"),
             f"- Trade-stroom: {_n(rt.get('subscription_capped'))} abonnementen afgekapt, {_n(rt.get('envelope_paused'))} keer gepauzeerd door de uurenvelop",

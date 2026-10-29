@@ -1078,3 +1078,131 @@ fart-engine en fart-web, de `curl`-controle koud en warm onder 1 s en de `fart s
     "never waits" test is a computation blocked on an event, released by the test: the request must come back within a
     second with the placeholder the first time and with the last value afterwards.
 153. **Branch and PR**: all work on the harness branch `claude/eloquent-mayer-acz0cg`; the PR targets `main`.
+
+## Milestone 11 (29 oktober 2026)
+
+**Samenvatting (Nederlands).** Gemeten op de VPS op 29 oktober 2026 om 02:05 UTC (1.494.055 trades, 145.299 coins; 6.012
+coins in het venster van 3 uur, 88.736 coins in de basislijn van 6 tot 48 uur): de engine-tick duurde **590 tot 598
+seconden** (`tick_s` in de `engine.tick`-logregel; op 26 oktober 14:00 UTC nog 4 s, om 23:00 UTC 166 tot 337 s), het
+engine-proces zat op circa 100% CPU, de heartbeat liep op tot 650 s, beslissingen en `engine.metas_latest` kwamen elke tien
+minuten in plaats van elke 15 s, de thema-kaart van de website stond daardoor op "stale" en de mediane lead time in het
+weekrapport was negatief (beslissingen ná graduatie). De oorzaak stond in de code: `features.meta_features` haalde **per
+term** alle coins van 6 tot 48 uur geleden op en tokeniseerde ze opnieuw om te tellen hoe vaak de term voorkwam; met
+honderden termen per tick waren dat honderden keren dezelfde scan van 88.736 rijen en tienduizenden tokenisaties per term.
+`features_s` was 1,1 s; de rest van de tick zat in stap 5 (de metas).
+
+M11 haalt de basislijn **één keer per tick** op en tokeniseert haar één keer (`features.meta_baseline` → `MetaBaseline`,
+een `collections.Counter` per term); `meta_features` leest `base_n` daaruit (`themes.compute_metas` geeft de teller aan elke
+term door). **De regels zijn niet veranderd, alleen de rekentijd**: dezelfde tijdgrenzen op dezelfde eventtijd
+(`COALESCE(block_time, received_at)`) onder dezelfde as-of-clausule (dezelfde SQL-tekst), dezelfde `tokenize` met dezelfde
+stopwoorden en `min_token_len`, dezelfde `base_hours`, dezelfde afronding; een coin telt per term één keer omdat `tokenize`
+een set teruggeeft, precies zoals `sum(1 for r in base_rows if term in tokenize(...))` telde. **Bewijs**: `tests/frozen/`
+bewaart `features.py`, `meta.py` en `decide.py` exact zoals vastgelegd op dd91c28 (alleen de importregels zijn aangepast,
+de sha256 van het origineel staat in de kop);
+`tests/test_m11_engine_performance.py::test_meta_step_equals_the_frozen_reference_byte_for_byte` draait de oude en de nieuwe
+metastap naast elkaar op een fixture-database van ruim 21.000 coins (ruim 20.000 binnen 48 uur, met de randgevallen van de
+vensters: rijen precies op de grenzen, zonder block_time, ontvangen ná `as_of`, laat nageleverd) en ruim 52.000 trades
+(128 termen, basislijn 17.605 coins) en bewijst byte-gelijke uitkomsten: dezelfde termen, dezelfde veldwaarden in dezelfde
+volgorde, dezelfde rangschikking, dezelfde JSON die de engine opslaat en dezelfde thema-snapshot; dezelfde controle voor
+`coin_features` en voor `decide.coin_verdict`/`meta_verdict`; een telling van de `tokenize`-aanroepen bewijst dat de nieuwe
+stap lineair is in het aantal coins (venster + basislijn) en niet in coins × termen. Op een database van VPS-grootte
+(145.299 coins, 1.494.055 trades, 1.217 termen) duurde de oude metastap in de sandbox **687 s** en de nieuwe **2,06 s**
+(de basislijn zelf 0,75 s), met byte-gelijke gerangschikte metas; op de fixture 11,1 s tegen 0,35 s.
+
+Omdat `features.py` een regelbestand is, verandert de vingerafdruk: `sha256:147aa831c90d` in plaats van `sha256:e3bf4320c45c`.
+Dat is uitsluitend toegestaan met dit bewijs en deze registratie: `config/measure.json` → `community_gate.frozen_rules_equivalents`
+krijgt de nieuwe vingerafdruk met de datum (2026-10-29), het PR-nummer (#11), het gewijzigde bestand en de naam van de
+bewijstest; de bevroren vingerafdruk zelf blijft onaangeroerd. Het weekrapport neemt vingerafdrukken uit die lijst samen met de
+bevroren vingerafdruk in één segment (`week.rules_groups` met `version.canonical_fingerprint`) en zegt onder de segmenttitel
+dat het om een **bewezen gelijkwaardige berekening** gaat (PR, datum, test); de website (`regels bevroren`, `/eigenaar` →
+Instellingen) en `fart status` noemen de regels bevroren; de vingerafdruktest pint de nieuwe vingerafdruk én controleert de
+lijst (de genoemde test bestaat, de velden zijn compleet, de bevroren waarde is ongewijzigd).
+
+Zichtbaarheid: elke tick logt nu de duur van elke stap (`expire_s`, `features_s`, `promote_s`, `rpc_s`, `metas_s`,
+`decisions_s`, `tick_s`; `engine.tick` wordt elke tick gelogd), de engine schrijft het complete record van de **vorige**
+tick in kv `engine.tick_last` binnen de bestaande beslissingstransactie (de eigen duur van een tick is pas na de commit
+bekend; geen schrijfactie buiten de bestaande transacties), telt ticks langer dan het loopinterval (`engine.tick_slow`, ook
+per dag, in het dagrapport naast de mislukte ticks) en waarschuwt daarover hoogstens één keer per uur (`engine.tick_slow` in
+het log). `fart status` toont de stapduren en de tellers (`engine tick (last completed, ...)`), `/eigenaar` → "Gezondheid en
+versheid" ook. Er wordt geen werk overgeslagen of ingekort als een tick te lang duurt: het wordt zichtbaar, niet verborgen.
+Met een snelle tick is `engine.metas_latest` weer vers en toont de thema-kaart "fresh"; de ouderdomsgrens van 5 minuten is
+niet aangepast. Uitrol: `deploy/DEPLOY.md`, "Milestone 11: engine performance".
+
+154. **The baseline once per tick, with the definition untouched** (`features.meta_baseline`, `features.MetaBaseline`,
+    `features.meta_features(..., baseline)`, `themes.compute_metas`): one `SELECT name, symbol FROM coins WHERE <as-of> AND
+    <event time> > as_of - baseline_from_s AND <event time> <= as_of - baseline_to_s` per tick (the SQL text of the per-term
+    scan, unchanged, so the same rows under the same plan), every row tokenized once with the tick's stopwords and
+    `min_token_len`, the token sets summed into a `Counter`; `count(term)` is the number of baseline coins whose token set
+    holds the term, which is exactly what the per-term `sum(1 for r in base_rows if term in tokenize(...))` counted (a set
+    contributes a term at most once). `base_hours`, `base_rate`, `cur_rate`, `burst` and every rounding stay as they were;
+    `b_from`/`b_to` come from the baseline object, which holds the same floats the config gave. `MetaBaseline.matches()`
+    refuses a baseline of another `as_of`, another window, another `min_token_len` or other stopwords (`ValueError`), so a
+    stale or foreign baseline can never silently produce a wrong `base_n`; without a baseline `meta_features` computes one
+    itself, for that term alone, so every old call site keeps its meaning. `compute_metas` builds the baseline lazily (no
+    term with `min_coins` coins: no baseline fetched) and returns it as a fourth value (the tick summary logs
+    `baseline_coins`). Not cached across ticks on purpose: the window slides every tick, coin rows are updated after their
+    insert (`store.py` fills name, symbol, block_time, creator and moves `received_at` when a second source reports the
+    coin), a row can arrive hours after its chain time, and the as-of clause makes membership depend on `received_at`
+    too; a per-tick recomputation is the only choice that is exact by construction, and it costs 0.75 s for 88,736 rows
+    (tokenize is 5 µs per row). The baseline covers 61% of the `coins` table, so SQLite's choice (an index range on
+    `coins_received_at`, close to a scan) is the right one; the per-term `trades` and `migrations` aggregates were left
+    exactly as they were: they walk the mint index and are cheap, and re-expressing `SUM`/`COUNT(DISTINCT)` in Python
+    would change the floating-point summation order and so, rarely, a rounded fourth decimal: not byte-equal.
+155. **The proof is a frozen copy, not a memory** (`tests/frozen/features_m10.py`, `meta_m10.py`, `decide_m10.py`,
+    `tests/test_m11_engine_performance.py`): the three Python rule files exactly as committed at dd91c28 (the frozen
+    rules of the measurement week), with only their import lines changed so they run from the test tree, the sha256 of
+    every original in the header and a test that pins those hashes next to the unchanged live `meta.py`, `decide.py`,
+    `curve.py` and the three config files (only `features.py` may differ from dd91c28 in this milestone). The fixture
+    database is built, not shipped: more than 21,000 coins (20,000+ within 48 hours: 1,500 in the three-hour window,
+    1,000 between three and six hours, 17,600 in the baseline, 1,500 older) from a vocabulary that exercises stopwords,
+    camelCase, digits, accents, empty names and missing symbols, the edge rows of the baseline window (exactly on both
+    boundaries, without a chain time, received after `as_of`, received at `as_of`, back-filled a day late), the edge rows
+    of the three-hour window and of a trade window, more than 52,000 trades (Zipf over the window coins, 3,000 wallets so
+    buyers overlap across coins, buys and sells, rows without a chain time), 500 graduations with one received after
+    `as_of`, and a watchlist of 120 coins. The old and the new meta step run inside the same read snapshot and must agree
+    on `recent_coins` (rows and order), the clusters, every term's dict (keys in order, values, the `json.dumps(...,
+    default=str)` bytes the engine persists), the verdicts, the ranked top 50 and the themes snapshot bytes; coin features
+    and `coin_verdict` / `wants_promotion` agree for 143 mints including an unknown one and one not yet knowable. The
+    linearity test counts `tokenize` calls: exactly window coins + baseline coins, independent of the 128 terms (the old
+    loop made terms × baseline rows of them). The frozen reference is slow by design (11 s on the fixture): that is the
+    bug it preserves.
+156. **An equivalence list, not a new frozen entry** (`config/measure.json` → `community_gate.frozen_rules_equivalents`,
+    `fart/version.py` → `frozen_rules_equivalents`, `canonical_fingerprint`, `frozen_equivalent`, `runs_frozen_rules`):
+    the measurement week keeps its one frozen fingerprint (`frozen_rules` is untouched: it is the promise), and a commit
+    whose rule files provably compute the same outcomes is registered as an equivalent with the evidence attached: the
+    fingerprint, the date, the PR number, the changed file and the test that proves byte-equal outcomes. The week report
+    maps an equivalent fingerprint to the frozen one when grouping (`week.rules_groups(..., canonical)`), lists every
+    fingerprint of the segment (`rules_fingerprints`) and the proof entries (`equivalents`), and prints under the segment
+    title "Dit segment bevat ook de bewezen gelijkwaardige berekening `...` (PR #11, 2026-10-29, test `...`): dezelfde
+    regels en dezelfde uitkomsten als de bevroren vingerafdruk, alleen de rekentijd veranderde"; the "Versies" section
+    lists the equivalents too; without the list the same fingerprint is a segment of its own, as before. The public
+    measurement pages say "regels bevroren" for a listed equivalent (`public.week_position` → `runs_frozen_rules`), the
+    owner's settings page says "ja: bewezen gelijkwaardige berekening (PR #11, ...)" instead of "NEE", and
+    `test_the_working_tree_still_runs_the_frozen_rules` now pins the new fingerprint, checks that the listed test exists
+    and that the frozen entry still reads `150ca73cb354` / `sha256:e3bf4320c45c`. An entry is added only together with
+    its proof and its DECISIONS entry; a real rules change never goes into this list.
+157. **Every step timed, the previous tick recorded, slow ticks counted** (`fart/engine/tickstats.py`, `Engine.tick`,
+    `run_engine`): the summary carries `expire_s`, `features_s` (now the features step alone, no longer "since the start
+    of the tick"), `promote_s`, `rpc_s`, `metas_s`, `decisions_s`, `tick_s`, `baseline_coins`, `interval_s` and `slow`, and
+    `engine.tick` is logged every tick (before: only with a decision or every 300 s; the budget per step is the point of
+    the line, and 5,760 lines a day of 700 bytes fit the 5 MB × 5 rotation for about a week). A tick's own duration is
+    known only after its decision write committed, so the engine writes the complete record of the *previous* tick in kv
+    `engine.tick_last` inside the next tick's decision transaction (`tickstats.write_previous`: no new transaction, one
+    tick of delay, the log line has the current one), and bumps `engine.tick_slow` plus its per-day twin when that tick
+    exceeded the loop interval. `SlowTickReporter` counts slow ticks and lets the loop log `engine.tick_slow` (the
+    durations, the count since the last warning) at most once per hour, the first one at once. `fart status` prints
+    `engine tick (last completed, as_of ..., N s ago): 1.2 s = expire 0.00 s + features 0.9 s + ... [coins, metas,
+    baseline coins; within/longer than the interval]; slow ticks (> 15 s): total N, today M` (and the record in `--json`),
+    `/eigenaar` → "Gezondheid en versheid" shows the same two lines, the daily report counts the day's slow ticks next to
+    the failed ones. A slow tick is not a failure (`failures` does not list it): nothing was skipped. Nothing in the tick
+    is shortened or skipped when it runs long; the loop still sleeps `interval - elapsed`, floored at zero, as before.
+158. **The themes card is fresh because the engine is, not because the limit moved** (`themes.MAX_AGE_S` stays 300 s):
+    with a tick of seconds the snapshot `engine.metas_latest` is at most one interval old; a test ticks the engine on the
+    fixture and reads the card at 0, 15 and 30 s ("fresh", rows shown, "berekend door de engine ... geleden"), and at
+    301 s ("nu niet berekend", no rows). The age limit was never the problem and is not touched.
+159. **A pre-existing, date-dependent failure fixed in passing** (`public.headline`): the sentence assumed three parts, but
+    on a day without a covered hour `graduations_today` is None and the third part was missing: an `IndexError` that made
+    the public status view fail (seen as `test_sigterm_stops_the_server_and_the_views_thread` failing on 29 Oct against the
+    fixture world of 26 Oct, because that test runs the real clock). The uncovered case is now named ("vandaag is nog geen
+    uur gedekt, dus geen telling van graduaties"), never a zero, and the sentence always has its three parts.
+160. **Branch and PR**: all work on the harness branch `claude/beautiful-sagan-uedb2q`; the PR (#11) targets `main`.

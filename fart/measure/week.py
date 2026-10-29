@@ -11,7 +11,10 @@ Everything is reported per segment = (rules group, method_version):
   fingerprint of the rule-defining files (`fart/version.py`: kv `engine.rules_fingerprint.<rv>`, the
   frozen entry in `config/measure.json` -> `community_gate.frozen_rules`, the running tree). A
   rules_version without a known fingerprint is a group of its own. The rules_versions of a group are
-  always listed; nothing is hidden by the pooling;
+  always listed; nothing is hidden by the pooling. Milestone 11: a fingerprint listed in
+  `community_gate.frozen_rules_equivalents` (rule files that provably compute the same outcomes, the proof
+  being the test the entry names) is pooled with the frozen fingerprint, and the segment says so under its
+  title with the PR, the date and the test;
 * a method_version is one measurement method (`outcomes.method_version`); every method present in the
   window gets its own day reports (`report.build_report(..., method_version=mv)`).
 
@@ -48,7 +51,7 @@ from .. import db
 from ..config import Settings
 from ..log import get_logger
 from ..util import atomic_write_json, atomic_write_text, day_bounds, day_key, now as wall_now, utc_iso
-from ..version import rules_fingerprint, rules_version
+from ..version import frozen_rules_equivalents, rules_fingerprint, rules_version
 from .report import CU_NOTE, build_report
 
 log = get_logger("week")
@@ -91,11 +94,14 @@ def rules_fingerprint_map(conn: sqlite3.Connection, gate_cfg: dict[str, Any], rv
     return out
 
 
-def rules_groups(rules_versions: Iterable[str], fp_map: dict[str, str]) -> dict[str, list[str]]:
-    """group key (the fingerprint, or `unknown:<rv>`) -> sorted rules_versions."""
+def rules_groups(rules_versions: Iterable[str], fp_map: dict[str, str], canonical: dict[str, str] | None = None) -> dict[str, list[str]]:
+    """group key (the fingerprint, or `unknown:<rv>`) -> sorted rules_versions. `canonical` maps a proven-equivalent
+    fingerprint to the frozen one (milestone 11), so both land in the frozen segment."""
     groups: dict[str, list[str]] = {}
     for rv in sorted({str(v) for v in rules_versions}):
-        groups.setdefault(fp_map.get(rv) or f"unknown:{rv}", []).append(rv)
+        fp = fp_map.get(rv)
+        key = (canonical or {}).get(fp, fp) if fp else f"unknown:{rv}"
+        groups.setdefault(key, []).append(rv)
     return groups
 
 
@@ -423,6 +429,8 @@ def aggregate(day_reports_by_mv: dict[str, list[dict[str, Any]]], fp_map: dict[s
     gate_cfg = cfg.get("community_gate") or {}
     frozen = gate_cfg.get("frozen_rules") or {}
     frozen_fp = frozen.get("rules_fingerprint")
+    equivalents = frozen_rules_equivalents(gate_cfg)   # milestone 11: fingerprint -> the proof entry (date, PR, test)
+    canonical = {fp: str(frozen_fp) for fp in equivalents} if frozen_fp else {}
     segments: list[dict[str, Any]] = []
     for mv in sorted(day_reports_by_mv):
         reps = day_reports_by_mv[mv]
@@ -434,8 +442,12 @@ def aggregate(day_reports_by_mv: dict[str, list[dict[str, Any]]], fp_map: dict[s
                 rvs |= set((w.get("earliest_by_rules_version") or {}).keys())
         if not rvs:
             rvs = {rv_now}
-        for key, group in rules_groups(rvs, fp_map).items():
-            segments.append(build_segment(reps, group, key, mv, cfg, frozen_fp))
+        for key, group in rules_groups(rvs, fp_map, canonical).items():
+            seg = build_segment(reps, group, key, mv, cfg, frozen_fp)
+            fps = sorted({str(fp_map[rv]) for rv in group if fp_map.get(rv)})
+            seg["rules_fingerprints"] = fps                                      # every fingerprint pooled in this segment
+            seg["equivalents"] = [equivalents[fp] for fp in fps if fp in equivalents]   # the proven-equivalent ones among them
+            segments.append(seg)
     # the frozen rules group first, then the rest
     segments.sort(key=lambda s: (not s["frozen"], s["rules_group"], s["method_version"]))
     any_reps = next(iter(day_reports_by_mv.values()), [])
@@ -483,6 +495,7 @@ def aggregate(day_reports_by_mv: dict[str, list[dict[str, Any]]], fp_map: dict[s
         "rules_version_now": rv_now,
         "rules_fingerprint_now": fp_now,
         "frozen_rules": frozen,
+        "frozen_rules_equivalents": list(equivalents.values()),
         "method_versions": sorted(day_reports_by_mv),
         "rules_fingerprints": fp_map,
         "costs": {"per_day": costs, "rpc_cu_estimate_total": sum(int(c.get("rpc_cu_estimate") or 0) for c in costs),
@@ -566,11 +579,13 @@ def render_markdown(r: dict[str, Any]) -> str:
     for seg in r.get("segments") or []:
         u, hit, rec, lt, obs, g = seg["universe"], seg["hit_rate"], seg["recall"], seg["lead_time"], seg["observations"], seg["gate"]
         title = f"## Regels `{seg['rules_group'][:19]}`" + (" (bevroren meetweek)" if seg.get("frozen") else "") + f" · method_version `{seg['method_version']}`"
+        lines += ["", title, "", f"rules_versions in dit segment: {', '.join(f'`{v}`' for v in seg['rules_versions'])}"]
+        for e in seg.get("equivalents") or []:
+            # milestone 11: a pooled fingerprint that is not the frozen one is a proven-equivalent computation, and says so
+            lines.append(f"Dit segment bevat ook de **bewezen gelijkwaardige berekening** `{str(e.get('rules_fingerprint'))[:19]}` "
+                         f"(PR #{e.get('pr')}, {e.get('date')}, test `{e.get('test')}`): dezelfde regels en dezelfde uitkomsten als de "
+                         f"bevroren vingerafdruk, alleen de rekentijd veranderde.")
         lines += [
-            "",
-            title,
-            "",
-            f"rules_versions in dit segment: {', '.join(f'`{v}`' for v in seg['rules_versions'])}",
             "",
             "### Samenvatting",
             "",
@@ -744,6 +759,8 @@ def render_markdown(r: dict[str, Any]) -> str:
         f"- rules_version nu: `{r['rules_version_now']}` (vingerafdruk `{r.get('rules_fingerprint_now')}`)",
         f"- method_version(s): {', '.join(f'`{m}`' for m in (r.get('method_versions') or []))}",
         "- Vingerafdrukken per rules_version: " + ("; ".join(f"`{rv}` → `{str(fp)[:19]}`" for rv, fp in sorted((r.get("rules_fingerprints") or {}).items())) or "geen"),
+        "- Bewezen gelijkwaardige berekeningen (gepoold met de bevroren vingerafdruk): "
+        + ("; ".join(f"`{str(e.get('rules_fingerprint'))[:19]}` (PR #{e.get('pr')}, {e.get('date')}, test `{e.get('test')}`)" for e in (r.get("frozen_rules_equivalents") or [])) or "geen"),
         "",
     ]
     return "\n".join(lines)

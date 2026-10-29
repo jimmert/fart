@@ -316,3 +316,15 @@ def community_weekly(rep: dict[str, Any], footer: str, ccfg_notify: dict[str, An
         lines.append("Community-berichten deze week: geen (het kanaal staat uit tot na de meetweek).")
     lines.append(f"<b>Let op</b>: {esc(str(ccfg_notify.get('warning') or ''))}")
     return with_footer(lines, footer)
+
+
+def secs(v: Any) -> str:
+    """A duration: '0.02 s', '0.4 s', '12 s' (two significant digits under ten seconds, whole seconds above); under five
+    milliseconds '0.00 s'; '–' when there is no value. The one figure `fart status`, /eigenaar and the log summaries share."""
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return "–"
+    if x < 0.005:
+        return "0.00 s"
+    return f"{x:.2g} s" if x < 10 else f"{x:.0f} s"

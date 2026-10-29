@@ -11,6 +11,12 @@ files (`RULE_FILES`): two rules_versions with the same fingerprint ran the same 
 its fingerprint next to its rules_version in kv (`engine.rules_fingerprint.<rules_version>`), and
 `config/measure.json` -> `community_gate.frozen_rules` carries the fingerprint of the frozen measurement
 week; a test pins the working tree to it, so changing a rule means changing that config entry on purpose.
+
+Milestone 11: a change of a rule file that provably computes the same outcomes (the meta baseline once per tick instead
+of once per term) gets a new fingerprint but not a new segment: `community_gate.frozen_rules_equivalents` lists such
+fingerprints with the date, the PR and the test that proves byte-equal outcomes on a fixture database. The week report
+pools them with the frozen fingerprint (`canonical_fingerprint`) and says so under the segment title; the website and
+`fart status` call the running tree frozen when it is the frozen fingerprint or a listed equivalent (`runs_frozen_rules`).
 """
 from __future__ import annotations
 
@@ -74,3 +80,40 @@ def rules_fingerprint(root: Path | None = None) -> str:
         h.update(b"\n")
     _CACHE[key] = "sha256:" + h.hexdigest()
     return _CACHE[key]
+
+
+def frozen_fingerprint(gate_cfg: dict | None) -> str | None:
+    """The fingerprint of `community_gate.frozen_rules`, or None when there is none."""
+    fr = (gate_cfg or {}).get("frozen_rules") or {}
+    return str(fr["rules_fingerprint"]) if fr.get("rules_fingerprint") else None
+
+
+def frozen_rules_equivalents(gate_cfg: dict | None) -> dict[str, dict]:
+    """fingerprint -> entry of `community_gate.frozen_rules_equivalents` (milestone 11): fingerprints of rule files that
+    compute exactly what the frozen rules compute, each with the date, the PR number and the test that proves it."""
+    out: dict[str, dict] = {}
+    for e in (gate_cfg or {}).get("frozen_rules_equivalents") or []:
+        if isinstance(e, dict) and e.get("rules_fingerprint"):
+            out[str(e["rules_fingerprint"])] = e
+    return out
+
+
+def canonical_fingerprint(fp: str | None, gate_cfg: dict | None) -> str | None:
+    """The frozen fingerprint for the frozen one and for every proven equivalent; any other fingerprint stays itself."""
+    frozen = frozen_fingerprint(gate_cfg)
+    if fp is not None and frozen is not None and fp in frozen_rules_equivalents(gate_cfg):
+        return frozen
+    return fp
+
+
+def frozen_equivalent(fp: str | None, gate_cfg: dict | None) -> dict | None:
+    """The equivalence entry of `fp`, or None when `fp` is the frozen fingerprint itself or no equivalent at all."""
+    return frozen_rules_equivalents(gate_cfg).get(fp) if fp else None
+
+
+def runs_frozen_rules(gate_cfg: dict | None, fp: str | None = None) -> bool:
+    """Whether `fp` (default: the running tree) is the frozen fingerprint of the measurement week or a proven equivalent."""
+    frozen = frozen_fingerprint(gate_cfg)
+    if frozen is None:
+        return False
+    return canonical_fingerprint(rules_fingerprint() if fp is None else fp, gate_cfg) == frozen

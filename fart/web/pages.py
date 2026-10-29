@@ -889,7 +889,8 @@ def owner_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
             f'<div class="hero-meta"><span>gegevens van {esc(st["generated_label"])}</span><span>schema {esc(fmt(st.get("schema_version")))}</span><span>rules_version {esc(st.get("rules_version"))}</span></div></section>'
             f'<nav class="owner-nav" aria-label="Secties">{anchors}</nav>{note}')
     health = card("Gezondheid en versheid", table(DAEMON_COLS, _rowcls(st.get("daemons") or [], {"stale": "is-stale", "never": "is-never"}), empty="geen database", widths=("40", "25", "10", "25"))
-                  + kv([("open gaten in de stromen", esc(st.get("open_gaps_label"))), ("mislukkingen (tellers)", esc(st.get("failures_label")))]), anchor="gezondheid", live="eigenaar-gezondheid")
+                  + kv([("open gaten in de stromen", esc(st.get("open_gaps_label"))), ("mislukkingen (tellers)", esc(st.get("failures_label")))]
+                       + engine_tick_items(st.get("engine_tick"))), anchor="gezondheid", live="eigenaar-gezondheid")
     coverage = card("Dekking van de laatste 24 uur", f'<p class="small muted">gedekt {esc(fmt(get_path(cv, "summary.hours_covered")))} · compleet {esc(fmt(get_path(cv, "summary.hours_complete")))} · '
                     f'NIET GEDEKT {esc(fmt(get_path(cv, "summary.hours_not_covered")))} (een uur zonder actieve bron blijft leeg)</p>'
                     + table(COVERAGE_COLS, _rowcls(cv.get("rows") or [], {"notcovered": "is-nc"}), empty="geen database"), anchor="dekking", live="eigenaar-dekking")
@@ -946,6 +947,23 @@ def owner_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
     return (head + f'<div class="grid grid-2 section owner">{health}{decisions}{budgets}{report}</div><div class="section owner">{coverage}</div>'
             f'<div class="section owner">{xcard}</div><div class="section owner">{week}</div><div class="section owner">{reports_raw}</div>'
             f'<div class="section owner">{views}</div><div class="section owner">{settings_card}</div><div class="section owner">{logs}</div>')
+
+
+def engine_tick_items(et: dict[str, Any] | None) -> list[tuple[str, str]]:
+    """Milestone 11: the budget of the last completed engine tick (every step) and the slow-tick counters, for the health
+    card of /eigenaar; the same figures `fart status` prints (kv engine.tick_last, engine.tick_slow)."""
+    if not et:
+        return []
+    last = et.get("last") or {}
+    if last:
+        value = (f'{pill("stale" if last.get("slow") else "fresh", last.get("tick_label"))} {esc(last.get("status_label"))}; as_of {esc(last.get("as_of_label"))} '
+                 f'({esc(fmt_n(last.get("age_s")))} s geleden): {esc(last.get("steps_label"))}; {esc(fmt_n(last.get("coins")))} gevolgde munten, '
+                 f'{esc(fmt_n(last.get("metas")))} thema’s, basislijn {esc(fmt_n(last.get("baseline_coins")))} munten')
+    else:
+        value = esc("nog geen voltooide tick geregistreerd (de engine schrijft engine.tick_last vanaf zijn tweede tick; milestone 11)")
+    slow = (f'totaal {esc(fmt_n(et.get("slow_total")))}, vandaag {esc(fmt_n(et.get("slow_today")))} '
+            f'(een tick langer dan het interval van {esc(secs_label(et.get("interval_s")))}; geteld in engine.tick_slow, hoogstens één waarschuwing per uur in het log)')
+    return [("engine-tick (laatste voltooide, duur per stap)", value), ("trage engine-ticks", slow)]
 
 
 def secs_label(s: Any) -> str:

@@ -1,5 +1,33 @@
 # fart
 
+## Voor Jim: wat milestone 11 repareert
+
+Mijlpaal 11 brengt de engine-tick terug van tien minuten naar seconden zonder dat ook maar één uitkomst verandert. Gemeten op
+de VPS op 29 oktober 2026 om 02:05 UTC (1.494.055 trades, 145.299 coins): een tick duurde 590 tot 598 seconden tegen een
+loopinterval van 15 s, de engine zat op 100% CPU, beslissingen en de thema's kwamen elke tien minuten, de thema-kaart stond
+op "stale" en de mediane lead time in het weekrapport was negatief. De oorzaak: per thema-term haalde de engine alle 88.736
+coins van 6 tot 48 uur geleden opnieuw op en tokeniseerde ze, honderden keren per tick. Nu gebeurt dat één keer per tick. De
+regels zijn niet veranderd, alleen de rekentijd; de beslissingen staan in `docs/DECISIONS.md` ("Milestone 11"), de uitrol in
+`deploy/DEPLOY.md` ("Milestone 11: engine performance"):
+
+1. **Basislijn één keer per tick.** `features.meta_baseline` haalt de basislijncoins één keer op en telt per term hoe vaak
+   die voorkomt; elke term leest zijn telling daaruit. Dezelfde tijdgrenzen, dezelfde eventtijd, dezelfde `tokenize`,
+   dezelfde afronding. Op een database van VPS-grootte: oude metastap 687 s, nieuwe 2,06 s, uitkomsten byte-gelijk.
+2. **Bewijs en registratie.** `tests/frozen/` bewaart de oude regelbestanden exact zoals ze waren; een test draait de oude
+   en de nieuwe berekening naast elkaar op een fixture-database van ruim 21.000 coins en 52.000 trades en bewijst dat de
+   thema's, de muntkenmerken en de verdicts byte voor byte gelijk zijn. Omdat `features.py` een regelbestand is, verandert
+   de vingerafdruk (`sha256:147aa831c90d`); `config/measure.json` → `community_gate.frozen_rules_equivalents` registreert die
+   met datum, PR-nummer en de naam van de bewijstest. Het weekrapport neemt haar samen met de bevroren vingerafdruk
+   (`sha256:e3bf4320c45c`) in één segment en zegt onder de titel dat het om een bewezen gelijkwaardige berekening gaat.
+3. **Tick-begroting zichtbaar.** Elke tick logt de duur van elke stap (`expire_s`, `features_s`, `promote_s`, `rpc_s`,
+   `metas_s`, `decisions_s`, `tick_s`); `fart status` toont de regel `engine tick (last completed, ...)` met de stapduren en
+   de tellers van trage ticks (`engine.tick_slow`, ook op `/eigenaar`); een tick langer dan 15 s wordt geteld en hoogstens
+   één keer per uur in het log gemeld. Er wordt geen werk overgeslagen: een te lange tick wordt zichtbaar, niet verborgen.
+
+Na de uitrol: `journalctl -u fart-engine -n 3` toont `engine.tick` met `tick_s` onder 15 (verwacht 2 tot 4 s), `fart status`
+de regel `engine tick (last completed, ...)` en `rules fingerprints (engine)` met `sha256:147aa831c90d` naast de oude
+`sha256:e3bf4320c45c`; de thema-kaart staat binnen een minuut weer op "fresh".
+
 ## Voor Jim: wat milestone 10 toevoegt
 
 Mijlpaal 10 maakt het openbare dashboard snel en robuust zonder iets aan het ontwerp of de inhoud te veranderen. Direct na

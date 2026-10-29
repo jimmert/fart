@@ -64,7 +64,13 @@ it on after the week, to the community chat).
   empty social tables, so a shadow day's decisions equal a day's without X), promotes watchlist entries,
   writes `features_asof` and `decisions` (kind `observe` / `observe_meta`), and since milestone 6 the per-day
   candidate maxima (`engine_candidates`, `fart/engine/candidates.py`) that `fart engine explain --day` and the
-  daily report's "Waarom wel of geen observaties" read. Observations only.
+  daily report's "Waarom wel of geen observaties" read. Observations only. Since milestone 11 the meta step fetches and
+  tokenizes the baseline coins (6 to 48 h before `as_of`) once per tick (`features.meta_baseline` → `MetaBaseline`, a
+  `Counter` per term handed to every `features.meta_features` call by `themes.compute_metas`) instead of once per term:
+  the same rows, the same `tokenize`, the same counts, 590 s ticks on the VPS back to seconds, proven byte-equal by
+  `tests/test_m11_engine_performance.py` against the frozen copies in `tests/frozen/`. Every tick logs the duration of every
+  step; the previous tick's record goes to kv `engine.tick_last`, ticks longer than the interval are counted in
+  `engine.tick_slow` and warned about once an hour (`fart/engine/tickstats.py`; shown by `fart status` and `/eigenaar`).
 * **fart-social** (`fart/social/service.py`): X mega-account watch (60 s in the peak hours 13:00-02:00 UTC, 120 s
   outside), velocity refresh (120 s), KOL watch (180 s / 300 s), the confirmation planner and `fast_post` decisions;
   idles without `X_BEARER_TOKEN` or with `X_MODE=off`. Since milestone 6 the default with a token is shadow mode

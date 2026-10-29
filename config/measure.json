@@ -57,13 +57,25 @@
     }
   },
   "community_gate": {
-    "_comment": "Go/no-go criteria for community alerts, frozen BEFORE the measurement week (docs/DECISIONS.md, milestone 5, 26 Oct 2026). Start values chosen by the builder; Jim may adjust them before the week ends, never afterwards. The week report prints every criterion as voldaan / niet voldaan / te weinig data and an overall verdict; nothing is decided or sent by it. complete day = a day of the window in which every peak hour (peak_hours_utc, 12:00-02:00 UTC as the hours 12..23 and 0..1 of that UTC day) was covered. hit rate = observe (coin) decisions that became a winner within 24 h, over the decisions whose 24 h have elapsed: an unknown outcome stays in the denominator (not a demonstrated hit), a pending one is listed apart. recall = winners with an observe or observe_meta decision before graduation. lead time = graduation minus the earliest observe/observe_meta decision. observations per day = observe + observe_meta decisions per covered day. frozen_rules: the rules_version that started the measurement week and the fingerprint of the rule-defining files at that commit (fart/version.py RULE_FILES); every later rules_version with the same fingerprint ran the same rules and is pooled with it.",
+    "_comment": "Go/no-go criteria for community alerts, frozen BEFORE the measurement week (docs/DECISIONS.md, milestone 5, 26 Oct 2026). Start values chosen by the builder; Jim may adjust them before the week ends, never afterwards. The week report prints every criterion as voldaan / niet voldaan / te weinig data and an overall verdict; nothing is decided or sent by it. complete day = a day of the window in which every peak hour (peak_hours_utc, 12:00-02:00 UTC as the hours 12..23 and 0..1 of that UTC day) was covered. hit rate = observe (coin) decisions that became a winner within 24 h, over the decisions whose 24 h have elapsed: an unknown outcome stays in the denominator (not a demonstrated hit), a pending one is listed apart. recall = winners with an observe or observe_meta decision before graduation. lead time = graduation minus the earliest observe/observe_meta decision. observations per day = observe + observe_meta decisions per covered day. frozen_rules: the rules_version that started the measurement week and the fingerprint of the rule-defining files at that commit (fart/version.py RULE_FILES); every later rules_version with the same fingerprint ran the same rules and is pooled with it. frozen_rules_equivalents (milestone 11): fingerprints of later commits whose rule files provably compute exactly what the frozen rules compute (same metas, features and verdicts on a fixture database, proven by the named test); the week report pools them with frozen_rules and names them under the segment title, the website calls them frozen. An entry is added only together with its proof and its DECISIONS.md entry; a real rules change never goes here.",
     "frozen_rules": {
       "rules_version": "150ca73cb354",
       "rules_fingerprint": "sha256:e3bf4320c45c7cd3c159bc045a66164ae1754637979ddacc759dc6bd59bbbd46",
       "since": "2026-10-26T12:18:00Z",
       "first_full_day": "2026-10-27"
     },
+    "frozen_rules_equivalents": [
+      {
+        "rules_fingerprint": "sha256:147aa831c90d545ca8cd73f45c3772f854a1ec399cee961b7513b0c6ab253ace",
+        "date": "2026-10-29",
+        "pr": 11,
+        "test": "tests/test_m11_engine_performance.py::test_meta_step_equals_the_frozen_reference_byte_for_byte",
+        "changed_files": [
+          "fart/engine/features.py"
+        ],
+        "note": "Milestone 11: the meta baseline (the coins of 6 to 48 h before as_of) is fetched and tokenized once per tick instead of once per term (590 to 598 s per tick on the VPS on 29 Oct 2026). Same rules, same outcomes: the test runs the frozen old implementation (tests/frozen/) next to the new one on a fixture database of at least 20,000 coins over 48 h and 50,000 trades and proves byte-equal metas, coin features and verdicts. Only the computation time changed; the week report pools this fingerprint with frozen_rules and says so under the segment title."
+      }
+    ],
     "min_complete_days": 5,
     "peak_hours_utc": [
       12,

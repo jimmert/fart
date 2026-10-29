@@ -940,6 +940,76 @@ of design or content: every card shows what it showed, plus the state "wordt ber
 5. **Rollback:** a code rollback to M9 (`git checkout <M9 commit> && sudo deploy/install.sh`) works on the v8 database: the
    two indexes are harmless to M9, which never drops them, and M9 ignores the kv value `engine.metas_latest`.
 
+## 5j. Milestone 11: engine performance (M11)
+
+M11 brings the engine tick back from ten minutes to seconds without changing a single outcome. Measured on the VPS on 29 Oct
+2026 at 02:05 UTC (1,494,055 trades, 145,299 coins; 6,012 coins in the three-hour window, 88,736 in the 6-48 h baseline):
+`tick_s` 590 to 598 s in the `engine.tick` log line against a loop interval of 15 s, the engine at about 100% CPU, the
+heartbeat up to 650 s old, decisions and `engine.metas_latest` every ten minutes, the themes card "stale", a negative median
+lead time in the week report. The cause was in the code: `features.meta_features` fetched and tokenized all 88,736 baseline
+coins **once per term**, hundreds of times per tick. Now the baseline is fetched and tokenized **once per tick**
+(`features.meta_baseline`) and every term reads its count from it. The rules did not change, only the computation time: a
+test runs the frozen old implementation next to the new one and proves byte-equal metas, coin features and verdicts
+(`docs/DECISIONS.md`, "Milestone 11"). On a database of VPS size the old meta step took 687 s in the sandbox, the new one
+2.06 s.
+
+Because `fart/engine/features.py` is a rule file, the fingerprint changes: `sha256:147aa831c90d...` instead of
+`sha256:e3bf4320c45c...`. `config/measure.json` → `community_gate.frozen_rules_equivalents` records the new fingerprint with
+the date, the PR number (#11) and the test that proves the equivalence; the frozen entry itself is untouched. The week report
+pools the two fingerprints in one segment and says under the segment title that it contains a **bewezen gelijkwaardige
+berekening**; the website and `fart status` call the rules frozen. Every tick now logs the duration of every step
+(`expire_s`, `features_s`, `promote_s`, `rpc_s`, `metas_s`, `decisions_s`, `tick_s`), the previous tick's record goes to kv
+`engine.tick_last`, a tick longer than the interval is counted in kv `engine.tick_slow` (and per day) and warned about at most
+once per hour. No schema migration, no new dependency, no change of any threshold.
+
+1. **Pull and install** (restarts `fart-ingest`, `fart-engine` and the optional services; only the engine matters here):
+   ```bash
+   cd /opt/fart-src && git pull --ff-only && sudo deploy/install.sh
+   ```
+   If the installer ran with `START_SERVICES=0`, restart the engine by hand:
+   ```bash
+   sudo systemctl restart fart-engine
+   ```
+2. **Check `tick_s` in the engine log**: every tick logs one `engine.tick` line now, with the duration of every step. The
+   first tick after the restart may take a few seconds (cold cache); from the second tick on `tick_s` must be well under 15:
+   ```bash
+   journalctl -u fart-engine -n 3 --no-pager                  # engine.tick ... metas_s=1.9 tick_s=3.2 ... slow=false, no engine.tick_slow
+   journalctl -u fart-engine --since "-10 min" --no-pager | grep -c engine.tick_slow      # expected 0
+   ```
+   `metas_s` carries the meta step (expected 2 to 3 s on today's database; the baseline alone about 1 s), `features_s` the
+   coin features (about 1 s for 200 watched coins), the others milliseconds. A `tick_s` above 15 is counted and reported as
+   `engine.tick_slow` (at most one warning per hour); the tick is never shortened.
+3. **The step durations in `fart status`** (the record of the last completed tick, written by the next tick, so at most
+   one interval old):
+   ```
+   engine tick (last completed, as_of 2026-10-29T12:00:15Z, 9 s ago): 3.2 s = expire 0.01 s + features 1.1 s + promote 0.00 s + rpc 0.00 s + metas 1.9 s + decisions 0.1 s [coins 200, metas 50, baseline coins 88736; binnen het interval van 15 s]; slow ticks (> 15 s): total 0, today 0
+   ```
+   `slow ticks ... total` counts since this deploy (the counter did not exist before). `/eigenaar` → "Gezondheid en
+   versheid" shows the same two lines ("engine-tick (laatste voltooide, duur per stap)", "trage engine-ticks"); the heartbeat
+   row is "vers" again within a minute.
+4. **The fingerprint**: `fart status` → `rules fingerprints (engine)` shows the new commit with `sha256:147aa831c90d` next to
+   the older commits with `sha256:e3bf4320c45c`:
+   ```
+   rules fingerprints (engine): 150ca73cb354=sha256:e3bf4320c45c, ..., <M11 commit>=sha256:147aa831c90d
+   ```
+   Both belong to the frozen measurement week: `config/measure.json` → `community_gate.frozen_rules_equivalents` says so with
+   the proof. `/eigenaar` → Instellingen → "Vingerafdruk gelijk aan de bevroren meetweek" reads `ja: bewezen gelijkwaardige
+   berekening (PR #11, 2026-10-29, test tests/test_m11_engine_performance.py::...)`; the public measurement page keeps the
+   pill "regels bevroren".
+5. **The week report** (the next 06:30 UTC run, or by hand: `sudo -u fart /opt/fart/bin/fart measure week`): one segment
+   titled "Regels `sha256:e3bf4320c45c` (bevroren meetweek)" with every rules_version of the week, and directly under its title
+   the line "Dit segment bevat ook de **bewezen gelijkwaardige berekening** `sha256:147aa831c90d` (PR #11, 2026-10-29, test
+   `tests/test_m11_engine_performance.py::test_meta_step_equals_the_frozen_reference_byte_for_byte`): dezelfde regels en
+   dezelfde uitkomsten als de bevroren vingerafdruk, alleen de rekentijd veranderde." Never a second segment for the M11
+   commits. The "Versies" section lists the equivalence too.
+6. **The themes card**: with a fast tick `engine.metas_latest` is at most 15 s old and the card shows "fresh" with rows and
+   "berekend door de engine ... geleden"; the 5-minute limit of M10 is unchanged:
+   ```bash
+   curl -s https://kingdegen.dev/api/public/themes | head -c 200; echo       # "state": "fresh", "age_s" under 30
+   ```
+7. **Rollback**: a code rollback to M10 (`git checkout <M10 commit> && sudo deploy/install.sh`) runs on the same database
+   (no schema change); it brings the ten-minute ticks back and ignores kv `engine.tick_last` and `engine.tick_slow`.
+
 ## 6. First-day checklist (docs/UNVERIFIED.md)
 
 1. `fart chain global`: reserves, supply, `fee_basis_points` 95 and `creator_fee_basis_points` 5 must

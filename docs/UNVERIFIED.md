@@ -274,6 +274,22 @@ with it is implemented from documentation. Verify at the rollout (`deploy/DEPLOY
 - [ ] **`/usr/share/zoneinfo`** is present on the VPS (the pages show Europe/Amsterdam times; without zoneinfo they would
   be labelled UTC twice, like the Telegram messages).
 
+## Milestone 11 (engine performance)
+
+- [ ] **`tick_s` on the VPS after the restart**: the sandbox measured the new meta step at 2.06 s on a database of VPS size
+  (145,299 coins, 1,494,055 trades, 1,217 terms; the baseline alone 0.75 s) against 687 s for the old one. The VPS CPU is
+  slower and shared: read `metas_s` and `tick_s` in `journalctl -u fart-engine` after the first ten ticks; expected 2 to 4 s
+  for the tick, never above 15. If `engine.tick_slow` appears, the line names the step that took the time.
+- [ ] **CPU of the engine process**: about 100% before M11 (`top -p $(systemctl show -p MainPID --value fart-engine)`);
+  expected well under 25% afterwards (a few seconds of work per 15 s interval).
+- [ ] **The week report of the M11 deploy day**: one frozen segment that pools the M10 and M11 rules_versions and names the
+  equivalence under its title; the median lead time should turn positive again once the engine decides every 15 s (the
+  negative median of 29 Oct came from decisions taken after graduation by a ten-minute tick, not from a rule).
+- [ ] **The fixture, not the VPS database, is the proof**: the equivalence test runs on a built fixture of 21,000+ coins and
+  52,000+ trades with the edge cases of the windows. A one-off check against a copy of the VPS database (restore an archive
+  per section 7, run the old and the new `meta_features` on it as the benchmark of DECISIONS item 154 did) would confirm
+  the same on real names; not done from the sandbox because the database never leaves the VPS.
+
 ## Milestone 7
 
 - [ ] **The planner's stop rules against real chatter**: `refuted` after three consecutive counts without growth of the

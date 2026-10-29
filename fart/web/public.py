@@ -29,7 +29,7 @@ from ..config import Settings
 from ..engine import themes as engine_themes
 from ..notify.format import age as age_label, fmt_day, fmt_time, n as fmt_n
 from ..util import day_bounds, day_key, day_start, hour_bounds, hour_key, utc_iso
-from ..version import rules_fingerprint, rules_version
+from ..version import frozen_equivalent, rules_fingerprint, rules_version, runs_frozen_rules
 from . import data
 
 H24 = 86400
@@ -177,7 +177,8 @@ def week_position(settings: Settings, now: float) -> dict[str, Any]:
     today = day_key(now)
     out: dict[str, Any] = {"first_full_day": first, "first_full_day_label": fmt_day(first) if first else "onbekend", "today": today,
                            "days_total": WEEK_DAYS, "frozen_since": fr.get("since"), "frozen_rules_version": fr.get("rules_version"),
-                           "rules_frozen": rules_fingerprint() == fr.get("rules_fingerprint"), "fingerprint_short": rules_fingerprint()[:19],
+                           "rules_frozen": runs_frozen_rules(gate), "fingerprint_short": rules_fingerprint()[:19],
+                           "rules_equivalent": frozen_equivalent(rules_fingerprint(), gate),   # milestone 11: the proof entry, or None
                            "rules_version": rules_version()}
     try:
         start = _dt.datetime.strptime(first, "%Y-%m-%d").date()
@@ -286,6 +287,8 @@ def headline(st: dict[str, Any]) -> str:
     if live.get("graduations_today") is not None:
         g = live["graduations_today"]
         parts.append(f"vandaag {fmt_n(g)} {'graduatie' if g == 1 else 'graduaties'}")
+    else:
+        parts.append("vandaag is nog geen uur gedekt, dus geen telling van graduaties")   # never an IndexError on an uncovered day
     o = live.get("observations_today") or 0
     parts.append(f"{fmt_n(o)} {'observatie' if o == 1 else 'observaties'}")
     lead = "De radar ziet" if fr.get("status") == "fresh" else "De radar zag"

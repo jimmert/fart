@@ -17,10 +17,11 @@ from typing import Any
 
 from .. import db
 from ..config import Settings
+from ..engine import tickstats
 from ..ingest import coverage as cov
 from ..notify.format import age as age_label, fmt_day, fmt_time, n as fmt_n
 from ..util import day_key, day_start, utc_iso
-from ..version import rules_fingerprint, rules_version
+from ..version import frozen_equivalent, frozen_rules_equivalents, rules_fingerprint, rules_version
 
 H24 = 86400
 DECISIONS_LIMIT = 200
@@ -166,6 +167,8 @@ def status_view(conn: sqlite3.Connection | None, settings: Settings, now: float)
         row["status_label"] += f" · laatste controle {bstatus}"
     rows.append(row)
     out["daemons"] = rows
+    # milestone 11: the budget of the last completed engine tick and the slow-tick counters (kv engine.tick_last, engine.tick_slow)
+    out["engine_tick"] = tickstats.read(kv, now, float(settings.config("engine").get("loop_interval_s", 15)))
     out["counts"] = db.table_counts(conn, ("coins", "migrations", "trades", "watchlist", "decisions", "outcomes", "coverage_gaps", "outbox"))
     out["watchlist_active"] = int(conn.execute("SELECT COUNT(*) FROM watchlist WHERE active=1").fetchone()[0])
     out["trades_by_source_today"] = {str(r[0]): int(r[1]) for r in conn.execute(
@@ -562,6 +565,18 @@ def week_latest_view(settings: Settings, now: float) -> dict[str, Any]:
 
 
 # ----- /instellingen -------------------------------------------------------------------------------------------------
+def _frozen_label(gate: dict[str, Any]) -> str:
+    """Milestone 11: a proven-equivalent fingerprint runs the frozen rules; only a real rules change says NEE."""
+    fp = rules_fingerprint()
+    fr = gate.get("frozen_rules") or {}
+    if fp == fr.get("rules_fingerprint"):
+        return "ja"
+    e = frozen_equivalent(fp, gate)
+    if e is not None:
+        return f"ja: bewezen gelijkwaardige berekening (PR #{e.get('pr')}, {e.get('date')}, test {e.get('test')}); dezelfde regels, alleen de rekentijd veranderde"
+    return "NEE (andere regels dan de meetweek)"
+
+
 def settings_view(settings: Settings) -> dict[str, Any]:
     """Read-only: versions, the frozen go/no-go criteria, the active configuration without secrets."""
     from . import auth
@@ -582,7 +597,9 @@ def settings_view(settings: Settings) -> dict[str, Any]:
             {"label": "rules_version (deze uitrol)", "value": rules_version()},
             {"label": "Vingerafdruk van de regelbestanden", "value": rules_fingerprint()},
             {"label": "Bevroren regels van de meetweek", "value": f"rules_version {fr.get('rules_version')} sinds {fr.get('since')}, vingerafdruk {fr.get('rules_fingerprint')}, eerste volle dag {fr.get('first_full_day')}"},
-            {"label": "Vingerafdruk gelijk aan de bevroren meetweek", "value": "ja" if rules_fingerprint() == fr.get("rules_fingerprint") else "NEE (andere regels dan de meetweek)"},
+            {"label": "Vingerafdruk gelijk aan de bevroren meetweek", "value": _frozen_label(gate)},
+            {"label": "Bewezen gelijkwaardige berekeningen (gepoold met de bevroren regels)", "value": "; ".join(
+                f"{str(e.get('rules_fingerprint'))[:19]} (PR #{e.get('pr')}, {e.get('date')}, test {e.get('test')})" for e in frozen_rules_equivalents(gate).values()) or "geen"},
             {"label": "method_version (meetmethode)", "value": m.get("method_version")},
             {"label": "Regelbestanden", "value": ", ".join(_rule_files())},
         ]},
