@@ -682,7 +682,8 @@ def test_unit_installer_env_example_and_caddy_file():
     assert "request_body {" in caddy and "max_size 64KB" in caddy and "Strict-Transport-Security" in caddy and "-Server" in caddy
     directives = {l.strip().split()[0] for l in caddy.splitlines() if l.strip() and not l.strip().startswith(("#", "}", "?", "-"))
                   and not l.strip().endswith("{") or l.strip().endswith("{") and not l.strip().startswith("#")}
-    allowed = {"kingdegen.dev", "encode", "request_body", "max_size", "header", "Strict-Transport-Security", "defer", "reverse_proxy"}
+    allowed = {"kingdegen.dev", "encode", "request_body", "max_size", "header", "Strict-Transport-Security", "defer", "reverse_proxy",
+               "match", "@stream", "flush_interval"}   # milestone 12: encode's response matcher, the stream's named matcher and reverse_proxy's flush_interval (all Caddy 2.6 core)
     assert directives <= allowed, directives - allowed  # plain Caddy 2.6.2 directives only, no plugin
     deploy_md = (ROOT / "deploy" / "DEPLOY.md").read_text()
     for needle in ("## 5g. Milestone 8: website", "fart-setsecret.sh", "caddy validate", "Caddyfile.before-fart-", "launch.kingdegen.dev",

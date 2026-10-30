@@ -344,3 +344,53 @@ with it is implemented from documentation. Verify at the rollout (`deploy/DEPLOY
   Anything else that calls `chown`/`fchown` (tar with `--same-owner`, `cp -p` as root, `install`) would
   die the same way: keep the service scripts to plain file writes.
 - [ ] **PumpPortal and Alchemy websockets behind the shared VPS egress**: no proxy in the way.
+
+## Milestone 12 (terminal, research, plays)
+
+Built and tested in the sandbox against a synthetic world and a real loopback server; nothing here touched the VPS database.
+Verify at the rollout (`deploy/DEPLOY.md`, "Milestone 12: terminal and research"):
+
+- [ ] **The trading-terminal link patterns** in `config/web.json` → `terminals`: Axiom `https://axiom.trade/t/{mint}`, Photon
+  `https://photon-sol.tinyastro.io/en/lp/{mint}`, BullX `https://neo.bullx.io/terminal?chainId=1399811149&address={mint}`,
+  GMGN `https://gmgn.ai/sol/token/{mint}`. From the sandbox only BullX answered 200; Axiom, Photon and GMGN answered 403 (bot
+  protection), so none of the four is verified by eye and all carry `"verified": false` (the Terminal says so in its help).
+  Open each from the Terminal on a real coin; a wrong pattern is a one-line change in `config/web.json` (set `verified` to
+  true once seen). Photon's `/lp/` path may want a pool address rather than the mint on some pages; if the mint form does not
+  resolve, drop that entry or point it at the pump.fun page until the pattern is known. pump.fun (`/coin/<mint>`), DexScreener
+  (`/solana/<mint>`) and Solscan (`/token/<mint>`) are the documented forms.
+- [ ] **GeckoTerminal OHLCV** (`fart/measure/candles.py`): the endpoint shape was verified from the sandbox on 29 October 2026
+  (`GET /api/v2/networks/solana/pools/<pool>/ohlcv/minute?aggregate=1&limit=N&before_timestamp=T` →
+  `data.attributes.ohlcv_list` as `[unix_s, open, high, low, close, volume_usd]`, newest first, prices in USD); the free limit
+  of 30 calls per minute is from their documentation and is shared with the tracker through the budget source `geckoterminal`
+  (0.5 per second, burst 5). To confirm on the first fetched job: that `before_timestamp` = graduation + 1 h + 60 s returns the
+  hour after the graduation (`SELECT pool, MIN(minute), MAX(minute), COUNT(*) FROM pool_candles GROUP BY pool`), that a pool
+  created an hour ago already has candles (else raise `candles.after_graduation_s`), and that `migrations.pool_address` is
+  filled for the graduations (`pool_unknown` jobs in `fart status` say it is not: then the candles wait for a pool source).
+- [ ] **The stream through Caddy** (`deploy/caddy/fart.caddy`): the `encode` response matcher (`match { header Content-Type
+  ... }`, repeated lines for one field are alternatives) and `flush_interval -1` on the stream's `reverse_proxy` are Caddy 2.6
+  core directives; `caddy validate --adapter caddyfile` is the proof, then `curl -N https://kingdegen.dev/api/public/stream`
+  must print `retry: 3000` and `event: snapshot` within a second and `: keep-alive` lines at most every 20 s. If the first
+  event only arrives after seconds, Caddy buffers: check that the upstream Content-Type `text/event-stream` reaches it
+  unchanged and that no other site-wide `encode` applies. Caddy's `reverse_proxy` has no response timeout by default; if this
+  Caddy sets one, a stream drops at that point and the browser resumes with `Last-Event-ID` (the ring keeps 400 deltas).
+- [ ] **Browsers**: `EventSource` resumes with `Last-Event-ID` on its own (standard); the clipboard API needs HTTPS (the site
+  has it) and the textarea fallback covers the rest; the Web Audio beep needs a user gesture first (the sound switch is one).
+  Tested with the real server over sockets, not in a browser: open `/terminal` on a phone and a desktop after the rollout and
+  check the sticky name column, the detail sheet and the keyboard keys.
+- [ ] **The disk estimate**: 180 bytes per `trades` row including its share of the three indexes is an estimate from the schema
+  (`fart/cli.py` → `TRADE_ROW_BYTES`). Calibrate after a day at 30 days retention: `du -b /opt/fart/data/fart.db` divided by
+  `SELECT COUNT(*) FROM trades` (the other tables are small next to it); adjust the constant if off by more than 30%. The
+  warning under 20 GB free is on the data disk (`shutil.disk_usage` of `/opt/fart/data`), the disk the other projects fill.
+- [ ] **The first creator-statistics run** backfills every creator of the database in batches of 2,000 per track run (the
+  backlog flag in `fart status` shows until done; the step stops after 60 s of work and continues next run). Check
+  `creator_stats.done` in the track log stays well under the unit's `TimeoutStartSec=240` with the outcomes step before it.
+- [ ] **H2's crossing** counts the real SOL in the curve (the virtual reserve minus the 30 SOL of a fresh curve); a coin whose
+  first seen trade is already above 75 SOL never fires, by design. Read `stats.coins_evaluated` and the H2 signals in the first
+  report against the graduations of the window to see whether the ingest sees the crossing early enough.
+- [ ] **X mentions in the Terminal** come from `x_keys.last_n_1h` of the planner (shadow mode): empty for most coins by design
+  and labelled "meting niet beschikbaar"; the column is off by default.
+- [ ] **The first real research report**: `fart research run --hypothesis H5 --days 3 --limit 300` (bounded; the report says
+  it is a smoke run), then `--hypothesis all` over the available days. The retention was 14 days at the rollout, so the first
+  full 30-day window exists a month later; runtime on the VPS is unknown (the sandbox replays about 80 coins with 20,000 trades
+  in seconds; the real window holds tens of thousands of coins, hundreds of thousands of trades; the run logs progress every
+  5,000 coins). It runs in the `fart` user's shell, not in a timer, and writes `out/research/<day>-<H>.md|json`.

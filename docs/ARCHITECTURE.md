@@ -344,6 +344,49 @@ or a day NIET GEDEKT stays empty, an unknown outcome stays "onbekend", a decisio
   `RestartPreventExitStatus=2` (a missing `.env` value is a configuration error, not a crash loop). The installer
   installs the unit always and starts it only when both `.env` values exist.
 
+## Terminal, research and plays (milestone 12)
+
+Everything of milestone 12 sits next to the engine and reads its tables; nothing in it writes a decision, a watchlist row or
+a kv the engine reads, and the frozen rule files are byte-identical (`docs/DECISIONS.md`, 161).
+
+* **The Terminal feed** (`fart/web/terminal.py::TerminalFeed`) is one thread inside `fart-web` with one computation for every
+  viewer. Every second it reads the new `trades` rows by `received_at` (from 5 s behind its cursor, with a seen set, so a row
+  committed late still arrives once), keeps per coin the last 16 minutes of trades, the first ten, the creator's buys and
+  sells and the last curve state, and recomputes the rows that changed; every 5 s, or when the engine's heartbeat moved, it
+  recomputes every row (the windows age) and refreshes the themes (`engine.metas_latest`), the X counts (`x_keys`), the
+  plays and the creator statistics. The row's figures are the engine's definitions replayed in memory
+  (`fart/research/features.py::replay_features`, `bundle_flags`) from the same trades. The universe is the watchlist, the
+  creates of the last 30 minutes and the mints the open connections follow. It emits `rows` deltas, a `snapshot` at most
+  every 300 s, `plays` on change and a `heartbeat` every 15 s, keeps the last 400 deltas for a resume and serves at most 64
+  connections (`config/web.json` → `terminal`).
+* **The stream** (`/api/public/stream`, `fart/web/server.py::stream_response`, `Handler._stream`) is server-sent events over
+  the same `ThreadingHTTPServer`: a chunked response, every event flushed at once, a keep-alive comment, the socket checked
+  every second so a closed tab is unsubscribed within seconds; `Last-Event-ID` or `?last=` resumes, `?follow=` keeps coins
+  alive for one viewer, a 65th viewer gets 503. `/api/public/terminal` is the same snapshot as JSON. The Caddy site file
+  keeps the stream uncompressed and unbuffered.
+* **The page** (`pages.terminal_page`, `static/terminal.js`) is a server-rendered skeleton the script fills with DOM calls
+  from the feed's JSON (no HTML from data, the content-security policy unchanged). Filters live in the URL and optionally in
+  localStorage; follows, notes, columns, density, sound and sort in localStorage. Every action is a copy or a link in a new
+  tab (pump.fun, DexScreener, Solscan, the terminals of `config/web.json`); there is no buy action and no wallet.
+* **The research harness** (`fart/research/`: `hypotheses.py` the pre-registered H1 to H7 with their variants and exits,
+  `features.py` the replay and the bundle / dev-sell features, `harness.py` the run, `report.py` the Dutch report and the
+  promotion gate, `autopsy.py` the autopsy of the organic winners) replays every candidate coin at 15 s ticks as-of each tick,
+  fires each variant once per coin, executes the signal with the shared execution model (`fart/measure/paper.py::Position`:
+  the fill after the entry delay at the curve's quote, the exits in their order, the costs, the pool after graduation) on the
+  coin's price path (`trades`, then `mcap_samples` or `pool_candles`), and evaluates walk-forward: the variant chosen on the
+  first half of the days, judged on the second with a day-block bootstrap. Unknown and no fill are counted apart. The reports
+  go to `out/research/`; `fart research promote` writes a proven variant into `config/plays.json` and refuses the rest.
+* **The plays layer** (`fart/plays/`, `fart plays`, `deploy/fart-plays.service`) is its own daemon: every 15 s it tests the
+  active rules of `config/plays.json` on the live candidates with the same features and the same predicates as the harness,
+  opens one play per rule, version and coin, follows every open position with the same `Position` on the points that arrive,
+  writes `plays` rows (signal → open → closed | unknown | no fill) and enqueues the owner alerts (kind `play`, 6 per hour)
+  through the existing outbox. `/plays` and the Terminal's Plays panel read the table; `fart status` shows the heartbeat.
+* **Two data steps in the track timer** (`fart/measure/creators.py`, `fart/measure/candles.py`, run by
+  `outcomes.run_extra_steps` after the outcomes, each isolated): `creator_stats` per creator with cursors and a backlog flag
+  (the Terminal's maker column and H4), and `pool_candles` from GeckoTerminal for the hour after each graduation through a
+  bounded job queue behind the budget gate `geckoterminal` (30 per minute, shared with the tracker). Schema v9 holds their
+  tables and `plays`; the retention keeps `trades` 30 days (the harness's window) and prunes candles after 60 days.
+
 ## What comes after milestone 6
 
 * The measurement week itself (frozen rules `150ca73cb354`, pooled with every later commit that keeps the

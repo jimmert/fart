@@ -36,7 +36,7 @@ from .util import day_key
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 BUSY_TIMEOUT_MS = 15000
 WRITE_RETRY_ATTEMPTS = 3
@@ -749,6 +749,105 @@ def _migrate_v8(conn: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[8] = _migrate_v8
+
+
+# ----- schema version 9 (milestone 12) -------------------------------------------------------------
+# Four new tables next to the engine, no change to any existing table, no cleanup; every statement is idempotent. None of
+# them is read by the engine or by the frozen rule files: the research harness, the plays layer, the terminal feed and the
+# `fart status` lines read them, the measure-track timer and the plays daemon write them.
+# * `creator_stats`: one row per creator wallet with what our own data says about its earlier coins (coins, graduations,
+#   winners, bundled, early dev sells, first and last coin); recomputed incrementally by a step of `fart measure track`
+#   (`fart/measure/creators.py`). The research harness never reads it (it computes the same figures as-of the entry time);
+#   the terminal shows it.
+# * `pool_candles`: the 1-minute OHLCV candles of a PumpSwap pool as GeckoTerminal serves them (`fart/measure/candles.py`),
+#   fetched once per graduation an hour after it, within the shared `geckoterminal` budget source. A missing candle stays
+#   missing. `candle_jobs` is the bounded queue with the backlog `fart status` shows (one row per graduation).
+# * `plays`: one row per (rule, version, mint) the plays layer fired (`fart/plays`): the features at the signal, the curve
+#   state at the entry, the paper position (size, fill, fees), the exit and the outcome after costs. Updated in place while
+#   the position is open (status signal -> open -> closed / unknown / no_fill); never read by the engine.
+SCHEMA_V9_SQL = [
+    """CREATE TABLE IF NOT EXISTS creator_stats(
+        creator        TEXT PRIMARY KEY,
+        coins          INTEGER NOT NULL DEFAULT 0,
+        graduations    INTEGER NOT NULL DEFAULT 0,
+        winners        INTEGER NOT NULL DEFAULT 0,
+        not_winners    INTEGER NOT NULL DEFAULT 0,
+        bundled        INTEGER NOT NULL DEFAULT 0,
+        dev_sold_early INTEGER NOT NULL DEFAULT 0,
+        first_coin_at  REAL,
+        last_coin_at   REAL,
+        computed_at    REAL NOT NULL,
+        json           TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS creator_stats_last ON creator_stats(last_coin_at)",
+    """CREATE TABLE IF NOT EXISTS pool_candles(
+        pool        TEXT NOT NULL,
+        minute      INTEGER NOT NULL,
+        open        REAL,
+        high        REAL,
+        low         REAL,
+        close       REAL,
+        volume_usd  REAL,
+        fetched_at  REAL NOT NULL,
+        PRIMARY KEY(pool, minute)
+    ) WITHOUT ROWID""",
+    """CREATE TABLE IF NOT EXISTS candle_jobs(
+        mint          TEXT PRIMARY KEY,
+        pool          TEXT,
+        graduated_at  REAL NOT NULL,
+        due_at        REAL NOT NULL,
+        attempts      INTEGER NOT NULL DEFAULT 0,
+        last_attempt  REAL,
+        done          INTEGER NOT NULL DEFAULT 0,
+        candles       INTEGER NOT NULL DEFAULT 0,
+        last_error    TEXT,
+        created_at    REAL NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS candle_jobs_due ON candle_jobs(done, due_at)",
+    """CREATE TABLE IF NOT EXISTS plays(
+        id             INTEGER PRIMARY KEY,
+        rule           TEXT NOT NULL,
+        version        INTEGER NOT NULL,
+        hypothesis     TEXT,
+        variant        TEXT,
+        mint           TEXT NOT NULL,
+        as_of          REAL NOT NULL,
+        created_at     REAL NOT NULL,
+        features_json  TEXT NOT NULL,
+        entry_json     TEXT,
+        size_sol       REAL,
+        status         TEXT NOT NULL,
+        entry_time     REAL,
+        entry_price    REAL,
+        fill_price     REAL,
+        tokens         REAL,
+        fees_sol       REAL,
+        peak_price     REAL,
+        last_price     REAL,
+        last_seen      REAL,
+        exit_time      REAL,
+        exit_price     REAL,
+        exit_reason    TEXT,
+        exit_sol_net   REAL,
+        pnl_sol        REAL,
+        pnl_pct        REAL,
+        alerted_at     REAL,
+        rules_version  TEXT,
+        json           TEXT,
+        UNIQUE(rule, version, mint)
+    )""",
+    "CREATE INDEX IF NOT EXISTS plays_status ON plays(status, as_of)",
+    "CREATE INDEX IF NOT EXISTS plays_mint ON plays(mint)",
+    "CREATE INDEX IF NOT EXISTS plays_as_of ON plays(as_of)",
+]
+
+
+def _migrate_v9(conn: sqlite3.Connection) -> None:
+    for stmt in SCHEMA_V9_SQL:
+        conn.execute(stmt)
+
+
+MIGRATIONS[9] = _migrate_v9
 
 
 def _apply_pragmas(conn: sqlite3.Connection, readonly: bool) -> None:

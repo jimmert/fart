@@ -228,3 +228,62 @@ meetweek beslist; de go/no-go-toets van de community-alerts gebruikt ze niet. De
 account-watches ($0,49 mega, $1,00 KOL) = $9,89 = 66% van `X_DAILY_BUDGET_USD` 15,00. Een sleutel kan niet tegelijk al
 zijn tellingen en een zoekopdracht hebben, dus de echte dag blijft eronder; de prijzen zijn nog niet geverifieerd
 (`docs/UNVERIFIED.md`, `fart social calibrate`).
+
+## Mijlpaal 12: het onderzoeksharnas, bewezen regels en de Plays-laag
+
+**Wat het harnas doet.** `fart research run --hypothesis <H>` speelt elke kandidaatmunt van het venster af in ticks van 15 s
+vanaf de create, met per tick alleen wat toen kenbaar was (eventtijd én ontvangsttijd op of vóór de tick), berekent de
+kenmerken van de engine opnieuw in het geheugen (unieke kopers, netto SOL, grootste koper, bundel, dev-verkoop, curvestand) en
+laat elke **variant** (een instapregel × een uitstapregel) hoogstens één keer per munt **vuren**. Elk signaal wordt
+uitgevoerd als een papierpositie van 0,5 SOL (ook 0,1 en 1 SOL als gevoeligheid): de instap vult 20 s na het signaal (ook
+5/60/120 s) op de eerste trade daarna tegen de quote van de curve (1% fee en de prijsimpact van die grootte), de uitstap
+volgt de regel (doel met halve verkoop, trailing stop onder de piek, tijdstop, harde stop −35%, bij graduatie, bij de eerste
+dev-verkoop, uiterlijk na 24 uur) en vult ook 20 s na het moment waarop de regel afging, via `sell_quote` zolang er trades
+zijn en na de graduatie op de pool (PumpSwap-fee 0,25% en de impact uit de liquiditeit van DexScreener; zonder liquiditeit
+85 SOL aangenomen en zo gemarkeerd), met 0,0005 SOL priority fee per transactie.
+
+**Begrippen in het onderzoeksrapport (`out/research/<dag>-<H>.md`).**
+
+* **Hypothese** en **varianten**: vooraf vastgelegd in `fart/research/hypotheses.py` (H4, H5, H1, H3, H7, H2, H6; samen 145
+  varianten). Het rapport herhaalt de hypothese zoals vastgelegd, vóór de cijfers.
+* **Keuzehelft** en **toetshelft**: de dagen van het venster in twee helften (de eerste helft, bij een oneven aantal één dag
+  meer). Op de keuzehelft wordt de variant gekozen met de hoogste verwachte waarde onder de varianten met minstens 20
+  gevallen; alleen die variant wordt op de toetshelft beoordeeld. De andere varianten staan erbij om te zien, niet om uit te
+  kiezen: wie op de toetshelft kiest, toetst niets.
+* **Verwachte waarde na kosten**: het gemiddelde resultaat per positie in SOL (en als percentage van de inzet) over de
+  gesloten gevallen, alle fees en impact meegerekend. Het **95%-interval** komt uit een blokbootstrap met de UTC-dagen als
+  blokken (9.999 trekkingen, vaste seed), zodat dagen die bij elkaar horen bij elkaar blijven; dezelfde data geven altijd
+  hetzelfde interval.
+* **Trefkans**: het aandeel gesloten gevallen met een positief resultaat na kosten. **Mediaan, p10, p90**: de verdeling van het
+  resultaat als percentage. **Maximale drawdown**: de grootste val van de som van de resultaten in tijdsvolgorde.
+* **Onbekend**: het prijspad eindigde vóór een uitstap (de munt stierf, of de data houden op). **Geen vulling**: geen trade
+  binnen 10 minuten na het signaal. Beide tellen apart en nooit als resultaat; het aandeel onbekend is een van de vier
+  criteria.
+* **Lead time**: de tijd van het signaal tot de hoogste prijs binnen 24 uur; de mediaan moet minstens 2 minuten zijn, anders
+  was de beweging al voorbij toen een mens kon handelen.
+* **Capaciteit**: hoeveel SOL de curve op het signaalmoment aankon met hoogstens 5% prijsimpact; de mediaan zegt hoeveel een
+  regel écht kan dragen.
+* **Conditionering**: de gekozen variant gesplitst op tijd van de dag (piekuren 13:00 tot 02:00 UTC), de SOL/USD-trend over
+  de vorige 24 uur en de drukte (nieuwe munten in het uur van het signaal, in tercielen). **Gevoeligheid**: dezelfde variant met
+  instapvertraging 5/20/60/120 s en grootte 0,1/0,5/1 SOL.
+* **Multipliciteit**: het rapport zegt hoeveel van de getoetste varianten bij louter toeval een positieve ondergrens zouden
+  tonen; daarom telt alleen de vooraf gekozen variant als toets.
+
+**Bewezen** is een variant pas als op de toetshelft alle vier gelden: ondergrens van het interval van de verwachte waarde na
+kosten boven 0, minstens 100 gevallen, aandeel onbekend onder 20%, mediane lead time minstens 2 minuten. Het oordeel staat
+boven de tabellen als "Bewezen" of "niet bewezen"; "geen variant gekozen" betekent dat geen variant genoeg gevallen had op de
+keuzehelft. Alleen een bewezen, vooraf gekozen variant kan met `fart research promote` een regel in `config/plays.json`
+worden; de weigering noemt het criterium dat faalde.
+
+**De Plays-laag en de pagina `/plays`.** Een bewezen regel wordt elke 15 s tegen de live stroom getoetst met dezelfde
+kenmerken en hetzelfde rekenmodel als in het onderzoek. Een **play** is een papierpositie: signaal → open (gevuld) → gesloten
+met een resultaat na kosten, of onbekend (24 uur zonder uitstap), of geen vulling (10 minuten zonder trade). Op `/plays` staan
+per regel de papierposities sinds de promotie naast de cijfers uit het onderzoek (trefkans, verwachte waarde, interval,
+gevallen); de trefkans "live" is die van de gesloten plays en kan afwijken van de gemeten: dat verschil is de meting van de
+regel in de echte wereld. De Telegram-alert (hoogstens 6 per uur, alleen aan de eigenaar tot de go/no-go) herhaalt de gemeten
+cijfers en de uitstapregel in gewone woorden en linkt naar onze Terminal, nooit naar een handelsplatform.
+
+**Wat dit niet is.** Het harnas voorspelt niets en het platform handelt niet; de mens handelt via de knoppen van de Terminal
+naar externe terminals, op eigen rekening. Een rapport met "niet bewezen" is een afgerond resultaat: de fabriek werkte, de
+edge toonde zich niet in deze data. De regels van de engine zijn onveranderd (vingerafdruk `sha256:d45c41793c64`, de
+bewezen gelijkwaardige van de meetweek); het onderzoek leest ze alleen.

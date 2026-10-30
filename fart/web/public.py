@@ -1377,3 +1377,101 @@ def social_view(conn: sqlite3.Connection | None, settings: Settings, now: float)
     if not out["keys"] and not out["fast_posts"]:
         out["note"] = f"De X-laag draait ({out['mode_label']}) maar heeft op dit moment geen tellingen of snelle posts."
     return out
+
+
+# =====================================================================================================================
+# Milestone 12: the plays layer on the website (/plays, /api/public/plays) and the Terminal's plays panel.
+# =====================================================================================================================
+PLAYS_FRESH_S = 60
+PLAY_STATUS_NL = {"signal": "signaal, wacht op vulling", "open": "open", "closed": "gesloten", "unknown": "onbekend (geen prijspad tot een uitstap)", "no_fill": "geen vulling"}
+PLAY_EXIT_NL = {"target": "winstdoel", "trailing_stop": "trailing stop", "hard_stop": "harde stop", "time_stop": "tijdstop", "max_hold": "uiterste houdtijd",
+                "graduation": "graduatie", "dev_sell": "dev-verkoop", "no_trade_after_entry": "geen trade na het signaal"}
+
+
+def plays_view(conn: sqlite3.Connection | None, settings: Settings, now: float) -> dict[str, Any]:
+    """`/api/public/plays`: the proven rules of config/plays.json with their measured figures, the state of the plays layer, per rule the
+    paper positions (open, closed with the result after costs, unknown, no fill) and the recent history. Empty, and honest
+    about it, while nothing is proven."""
+    from ..plays import rules as plays_rules
+    from ..plays.service import KV_HEARTBEAT, KV_RULES
+
+    rules = plays_rules.load_rules(settings, include_inactive=True)
+    pcfg = plays_rules.settings_of(settings)
+    out: dict[str, Any] = {**data.stamp(now), "rules": [r.to_public() for r in rules], "active_rules": sum(1 for r in rules if r.active), "per_rule": [], "open": [], "history": [],
+                           "size_sol": pcfg["size_sol"], "entry_delay_s": pcfg["entry_delay_s"], "alerts_per_hour": pcfg["alerts_per_hour"],
+                           "definition": ("Een play is een munt die op dat moment aan een bewezen regel voldeed. Bewezen = de ondergrens van het 95%-interval van de verwachte waarde "
+                                          "na kosten lag boven 0 op de toetshelft van een onderzoeksrapport, met minstens 100 gevallen, minder dan 20% onbekende uitkomsten en een "
+                                          "mediane lead time van minstens 2 minuten. Elke play wordt als papierpositie gevolgd met dezelfde kosten als in het onderzoek; de uitkomst "
+                                          "na kosten staat hier. Het platform plaatst nooit een order."),
+                           "layer": {"state": "never", "label": "nog nooit getikt", "age_s": None}}
+    if not rules:
+        out["note"] = ("Nog geen bewezen regel: config/plays.json is leeg. Het onderzoeksharnas (fart research) toetst de vooraf vastgelegde hypotheses op onze eigen data; "
+                       "pas een variant die op de toetshelft bewezen is, komt hier als regel. Tot die tijd staat alles klaar en staat hier niets.")
+    if conn is None:
+        out["note"] = out.get("note") or "Er zijn nog geen gegevens."
+        return out
+    kv = _kv(conn, (KV_HEARTBEAT, KV_RULES))
+    hb = _float(kv.get(KV_HEARTBEAT))
+    if hb is not None:
+        age = max(0.0, now - hb)
+        out["layer"] = {"state": "fresh" if age <= PLAYS_FRESH_S else "stale", "label": ("live" if age <= PLAYS_FRESH_S else f"oud ({age_label(age)} geen tik)"), "age_s": round(age),
+                         "rules_seen": int(kv.get(KV_RULES) or 0)}
+    if not data.table_exists(conn, "plays"):
+        return out
+    names = _coin_names(conn, [str(r[0]) for r in conn.execute("SELECT DISTINCT mint FROM plays")])
+    rows = [play_row(dict(r), names, now) for r in conn.execute("SELECT * FROM plays ORDER BY as_of DESC LIMIT 500")]
+    out["open"] = [r for r in rows if r["status"] in ("signal", "open")]
+    out["history"] = [r for r in rows if r["status"] not in ("signal", "open")][:100]
+    per = []
+    for rule in rules:
+        mine = [r for r in rows if r["rule"] == rule.id]
+        closed = [r for r in mine if r["status"] == "closed" and r["pnl_sol"] is not None]
+        pnl = [float(r["pnl_sol"]) for r in closed]
+        per.append({**rule.to_public(), "signals": len(mine), "open": sum(1 for r in mine if r["status"] in ("signal", "open")), "closed": len(closed),
+                    "unknown": sum(1 for r in mine if r["status"] == "unknown"), "no_fill": sum(1 for r in mine if r["status"] == "no_fill"),
+                    "pnl_sum_sol": round(sum(pnl), 4) if pnl else None, "pnl_mean_sol": round(sum(pnl) / len(pnl), 4) if pnl else None,
+                    "pnl_sum_label": sol_signed(sum(pnl)) if pnl else "–", "pnl_mean_label": sol_signed(sum(pnl) / len(pnl)) if pnl else "–",
+                    "live_hit_rate": (sum(1 for p in pnl if p > 0) / len(pnl)) if pnl else None, "live_hit_label": pct(sum(1 for p in pnl if p > 0) / len(pnl)) if pnl else "–",
+                    "measured_hit_label": pct(rule.figures.get("hit_rate")), "measured_ev_label": sol_signed(rule.figures.get("ev_sol")) if rule.figures.get("ev_sol") is not None else "–",
+                    "ci_label": (f"{sol_signed(rule.figures.get('ci_low_sol'))} tot {sol_signed(rule.figures.get('ci_high_sol'))}"
+                                 if rule.figures.get("ci_low_sol") is not None else "–"),
+                    "rows": mine[:50]})
+    out["per_rule"] = per
+    out["counts"] = {"signals": len(rows), "open": len(out["open"]), "closed": sum(1 for r in rows if r["status"] == "closed"),
+                     "unknown": sum(1 for r in rows if r["status"] == "unknown"), "no_fill": sum(1 for r in rows if r["status"] == "no_fill")}
+    return out
+
+
+def sol_signed(x: Any, decimals: int = 4) -> str:
+    return "onbekend" if x is None else (f"{float(x):+.{decimals}f} SOL").replace(".", ",")
+
+
+def play_row(r: dict[str, Any], names: dict[str, tuple[str | None, str | None]], now: float) -> dict[str, Any]:
+    try:
+        e = json.loads(r.get("entry_json") or "{}")
+    except ValueError:
+        e = {}
+    try:
+        f = json.loads(r.get("features_json") or "{}")
+    except ValueError:
+        f = {}
+    mint = str(r["mint"])
+    nm = names.get(mint) or (f.get("name"), f.get("symbol"))
+    name = nm[0] or "naam onbekend"
+    symbol = nm[1]
+    status = str(r["status"])
+    pnl = r.get("pnl_sol")
+    return {"id": int(r["id"]), "rule": str(r["rule"]), "version": int(r["version"]), "mint": mint, "mint_short": short_mint(mint), "name": name, "symbol": symbol,
+            "title": name + (f" (${symbol})" if symbol else ""), "as_of": utc_iso(float(r["as_of"])), "as_of_label": fmt_time(float(r["as_of"])), "since_label": age_label(max(0.0, now - float(r["as_of"]))),
+            "status": status, "status_label": PLAY_STATUS_NL.get(status, status), "size_sol": r.get("size_sol"),
+            "signal": {"buyers_5m": f.get("unique_buyers_5m"), "net_sol_5m": f.get("net_sol_5m"), "share": f.get("largest_buyer_share_15m"), "dev_frac": f.get("dev_buy_frac_of_curve"),
+                       "bundled": f.get("bundled_any")},
+            "signal_label": (f"{fmt_n(f.get('unique_buyers_5m'))} kopers, {fmt_n(f.get('net_sol_5m'), 2)} SOL netto in 5 min" if f.get("unique_buyers_5m") is not None else "–"),
+            "entry_curve_sol": e.get("curve_sol"), "entry_mcap_sol": e.get("mcap_sol"), "entry_label": (f"{fmt_n(e.get('curve_sol'), 1)} SOL in de curve · {fmt_n(e.get('mcap_sol'), 1)} SOL marktwaarde"
+                                                                                                            if e.get("curve_sol") is not None else "–"),
+            "fill_price": r.get("fill_price"), "exit_price": r.get("exit_price"), "exit_reason": r.get("exit_reason"),
+            "exit_label": PLAY_EXIT_NL.get(str(r.get("exit_reason") or ""), r.get("exit_reason") or "–"), "exit_at_label": fmt_time(r["exit_time"]) if r.get("exit_time") else "–",
+            "fees_sol": r.get("fees_sol"), "pnl_sol": pnl, "pnl_pct": r.get("pnl_pct"), "pnl_label": sol_signed(pnl) if pnl is not None else "–",
+            "pnl_pct_label": (f"{100 * float(r['pnl_pct']):+.1f}%".replace(".", ",") if r.get("pnl_pct") is not None else "–"),
+            "hold_label": age_label(float(r["exit_time"]) - float(r["entry_time"])) if r.get("exit_time") and r.get("entry_time") else "–",
+            "_class": "is-winner" if pnl is not None and float(pnl) > 0 else ("is-stale" if pnl is not None and float(pnl) < 0 else "")}

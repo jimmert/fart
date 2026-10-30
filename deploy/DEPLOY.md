@@ -1028,6 +1028,105 @@ on a day without coverage (it joins the parts it has instead of expecting three)
    and `engine.tick_slow*`. The tick is minutes again then, and the week report would open a second segment for a rules_version
    running M10 only if its fingerprint were unknown (it is the frozen one, so no).
 
+## 5k. Milestone 12: terminal and research (M12)
+
+M12 adds the Terminal (`/terminal`, a live table of every coin in view over one server-sent-events stream), the research
+harness (`fart research`: the pre-registered hypotheses H4, H5, H1, H3, H7, H2, H6 back-tested on our own trades with the
+costs a human pays; `fart research autopsy`; `fart research promote`), two bounded data steps in the track timer (creator
+statistics; GeckoTerminal minute candles for the hour after each graduation) and the plays layer (`fart plays`,
+`deploy/fart-plays.service`: proven rules from `config/plays.json` against the live trades, paper positions, `/plays`, Telegram
+alerts to the owner at most 6 per hour). Schema v9 adds the tables `creator_stats`, `pool_candles`, `candle_jobs` and `plays`
+(additive; the engine's tables are untouched). The frozen rule files are byte-identical (fingerprint `sha256:d45c41793c64`,
+the registered equivalent of the frozen week). `config/plays.json` ships empty: nothing is proven, nothing fires, the plays
+daemon idles. No new `.env` name. Design and the definition of "bewezen": `docs/DECISIONS.md`, "Milestone 12".
+
+1. **Pull and install:**
+   ```bash
+   cd /opt/fart-src && git pull --ff-only && sudo deploy/install.sh
+   ```
+   The installer applies the v9 migration before the restarts (`user_version` 8 → 9; `fart status` prints it), installs and
+   enables `fart-plays.service`, restarts `fart-ingest`, `fart-engine`, `fart-plays` and the optional services, and updates
+   the Caddy site file at `/srv/fart/fart.caddy` when it differs (validate and reload, step 4). Check the schema:
+   ```bash
+   sudo -u fart /opt/fart/bin/fart --json status | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["schema_version"])'   # 9
+   ```
+2. **The plays daemon idles with the empty configuration:**
+   ```bash
+   systemctl status fart-plays --no-pager
+   journalctl -u fart-plays -n 20 --no-pager          # plays.started ... rules=0; then a plays.tick every 15 s with rules=0
+   sudo -u fart /opt/fart/bin/fart plays --once        # one tick: {"rules": 0, "candidates": 0, "signals": 0, ...}
+   sudo -u fart /opt/fart/bin/fart status | grep -E '^(plays|disk|candles|creator stats|research):'
+   #   disk: 23.1 GB free of 240.0 GB (90% used); database 4.4 GB; trades 1,980,000 rows (~0.36 GB est.), 190,000 rows in the last 24 h -> ~1.03 GB at 30 days retention (...)
+   #   candles (GeckoTerminal, 1-minute, once per graduation an hour after it): pending 0 (due now 0), done 0 with candles, ... never run
+   #   creator stats: 0 creators (0 with a graduation or winner), updated today 0, backlog no; never run
+   #   plays: 0 active rule(s) in config/plays.json (nothing proven yet: the layer idles); heartbeat 3 s ago; open 0, closed 0 (pnl +0.0000 SOL), unknown 0, no fill 0; alerts today 0
+   #   research: no reports yet (fart research run --hypothesis H5 --days 3)
+   ```
+   The disk line warns under 20 GB free: the shared disk is at 91%, and the trades retention went from 14 to 30 days
+   (`config/ingest.json`); the projection on that line says what 30 days cost in GB. If the warning shows, free space on the
+   other projects or lower `trades_days` again (the harness then has a shorter window; it says so in its reports).
+3. **The track timer's new steps** run after the outcomes every 5 minutes: creator statistics (bounded to 2,000 creators and
+   60 s per run; the first runs backfill the whole database, `backlog yes` until done) and the candle queue (at most 20
+   fetches per run, behind the `geckoterminal` gate shared with the tracker). After two runs:
+   ```bash
+   grep -E 'creator_stats.done|candles.done' /opt/fart/logs/measure.log | tail -n 4
+   sudo -u fart /opt/fart/bin/fart status | grep -E '^(candles|creator stats):'
+   sqlite3 /opt/fart/data/fart.db 'SELECT pool, MIN(minute), MAX(minute), COUNT(*) FROM pool_candles GROUP BY pool LIMIT 5;'
+   ```
+   A `pool_unknown` count in the candles line means the migrations carry no pool address for those graduations: the jobs are
+   closed without candles, honestly; the research falls back to `mcap_samples` for the post-graduation path.
+4. **Caddy: the stream must not be buffered or compressed.** The site file now compresses only the listed content types and
+   proxies `/api/public/stream` with `flush_interval -1`. Validate and reload as in section 5g:
+   ```bash
+   caddy validate --config /srv/larp-scanner/https/Caddyfile --adapter caddyfile
+   systemctl reload larp-scanner-https        # or: caddy reload --config ... (the admin API must be on)
+   curl -s -N -m 3 https://kingdegen.dev/api/public/stream | head -c 600; echo
+   #   retry: 3000
+   #   id: 1234
+   #   event: snapshot
+   #   data: {"t": "...", "rows": [...], "n": 57, "engine_age_s": 4, "sol_usd": {...}, ...}
+   ```
+   The first event must arrive within a second; `curl -s -o /dev/null -w '%{http_code}\n' https://kingdegen.dev/terminal`
+   is 200. If `caddy validate` refuses `match` inside `encode` or `flush_interval`, this Caddy is older than documented: drop
+   the `match` block (then the stream is gzip-compressed; Caddy still flushes `text/event-stream` responses by default from
+   2.4 on) and the `@stream` block, and note it in `docs/UNVERIFIED.md`.
+5. **The Terminal in a browser:** open `https://kingdegen.dev/terminal`. The pill says "live", the count shows the coins in
+   view (the watchlist plus the creates of the last 30 minutes), a new trade changes its row within a second, `j`/`k` move,
+   `enter` opens pump.fun, `c` copies the mint, `f` follows, `1` to `4` open Axiom, Photon, BullX and GMGN (the patterns are
+   not verified by hand: `docs/UNVERIFIED.md`, and a wrong one is a one-line change in `config/web.json`), the presets filter
+   ("organisch" needs an explicit "niet gebundeld", so coins with few trades stay out), the Plays panel says that
+   `config/plays.json` is empty. `/plays` says the same and shows the plays layer's heartbeat. The pages carry no owner
+   vocabulary and no buy button; the test suite checks both.
+6. **The first research report, on real data** (the sandbox has no copy of the database, so this is the first real run):
+   ```bash
+   sudo -u fart /opt/fart/bin/fart research run --hypothesis H5 --days 3 --limit 300     # a bounded smoke run; the report says so
+   sudo -u fart /opt/fart/bin/fart research list
+   sudo -u fart /opt/fart/bin/fart research run --hypothesis all --days 7                 # the pre-registered order H4, H5, H1, H3, H7, H2, H6; minutes to an hour
+   sudo -u fart /opt/fart/bin/fart research autopsy --days 7
+   ls -la /opt/fart/out/research/
+   ```
+   Read `out/research/<day>-<H>.md` in Dutch: the pre-registered hypothesis, the data and execution, the verdict ("Bewezen"
+   only when the pre-chosen variant meets all four criteria on the test half: lower bound of the 95% interval of the expected
+   value after costs above 0, at least 100 cases, unknown share under 20%, median lead time at least 2 minutes), every
+   variant's figures, the per-group table, the conditioning on time of day / SOL trend / coins per hour, the sensitivity to the
+   entry delay and the size, the unknown and no-fill counts, and the honesty section. A report that says "Niet bewezen" is a
+   finished deliverable: the harness worked, the edge did not show. The runtime on the VPS is unknown; the run logs progress
+   every 5,000 coins (`research.progress`). The 30-day window exists a month after the rollout (the retention was 14 days).
+7. **Promotion, only with proof:**
+   ```bash
+   sudo -u fart /opt/fart/bin/fart research promote H2 m5_ts10     # refuses an unproven or unchosen variant, with the reason
+   sudo systemctl restart fart-plays                               # the daemon reloads config/plays.json at start (and every minute)
+   sudo -u fart /opt/fart/bin/fart status | grep '^plays:'          # plays: 1 active rule(s) in config/plays.json (H2-v1); ...
+   ```
+   A promoted rule fires live as it was measured (the same execution model), writes `plays` rows, shows on `/terminal` (the
+   Plays panel and column) and `/plays`, and alerts the owner chat (kind `play`, at most 6 per hour; the message carries our
+   Terminal link, never a venue). The community chat receives nothing from this layer until the go/no-go of the measurement
+   week.
+8. **Rollback:** a code rollback to M11 works on the same database (v9 is additive; M11 ignores the new tables and the kv keys
+   `plays.*`, `candles.*`, `creator_stats.*`); disable the new unit first: `systemctl disable --now fart-plays`. The retention
+   of 30 days is a config value; an M11 checkout carries 14 again and prunes back on its next weekly run (archived, as always).
+   Restore the previous Caddy site file from `Caddyfile.before-fart-*` or re-copy the M11 `fart.caddy` and reload.
+
 ## 6. First-day checklist (docs/UNVERIFIED.md)
 
 1. `fart chain global`: reserves, supply, `fee_basis_points` 95 and `creator_fee_basis_points` 5 must

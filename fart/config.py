@@ -280,7 +280,7 @@ class Settings:
 
 
 CONFIG_DIR = REPO_ROOT / "config"
-CONFIG_FILES = ("pumpfun", "budget", "engine", "measure", "stopwords", "ingest", "x", "x_kols", "notify", "web")
+CONFIG_FILES = ("pumpfun", "budget", "engine", "measure", "stopwords", "ingest", "x", "x_kols", "notify", "web", "plays")
 
 # milestone 9: the brand of the public website (config/web.json overrides these; see Settings.web_site)
 WEB_DEFAULTS: dict[str, Any] = {
@@ -291,6 +291,14 @@ WEB_DEFAULTS: dict[str, Any] = {
     "accent": "#F2B33D",
     "public_observations_limit": 500,
     "refresh_s": 30,
+    # milestone 12: the Terminal (config/web.json -> terminals, terminal); the defaults are the documented link patterns, unverified
+    "terminals": [
+        {"name": "Axiom", "url": "https://axiom.trade/t/{mint}", "verified": False},
+        {"name": "Photon", "url": "https://photon-sol.tinyastro.io/en/lp/{mint}", "verified": False},
+        {"name": "BullX", "url": "https://neo.bullx.io/terminal?chainId=1399811149&address={mint}", "verified": False},
+        {"name": "GMGN", "url": "https://gmgn.ai/sol/token/{mint}", "verified": False},
+    ],
+    "terminal": {"creates_window_s": 1800, "max_rows": 800, "stream_heartbeat_s": 15, "stream_max_connections": 64, "follow_max": 50, "stream_poll_s": 1.0},
 }
 
 

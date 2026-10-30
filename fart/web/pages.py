@@ -18,10 +18,12 @@ import html
 import json
 from typing import Any
 
-from ..notify.format import n as fmt_n
+from ..notify.format import fmt_time, n as fmt_n
+from . import data
 
 BANNER = "Observatie, geen advies. Alles wordt achteraf gemeten."
-NAV_PUBLIC = (("/", "Dashboard"), ("/observaties", "Observaties"), ("/meting", "Meting"), ("/rapporten", "Rapporten"), ("/methode", "Methode"), ("/tools", "Tools"))
+NAV_PUBLIC = (("/", "Dashboard"), ("/terminal", "Terminal"), ("/plays", "Plays"), ("/observaties", "Observaties"), ("/meting", "Meting"), ("/rapporten", "Rapporten"),
+              ("/methode", "Methode"), ("/tools", "Tools"))
 OWNER_PATH = "/eigenaar"
 GLOSSARY = {
     "graduatie": "Graduatie", "universum": "Universum", "observatie": "Observatie", "trefkans": "Trefkans", "recall": "Recall", "lead-time": "Lead time",
@@ -166,7 +168,7 @@ MARK = ('<svg class="mark" viewBox="0 0 28 28" aria-hidden="true" focusable="fal
 
 # ----- layout -----------------------------------------------------------------------------------------------------------
 def layout(ctx: dict[str, Any], title: str, body: str, *, active: str = "", script: bool = True, robots: str | None = None, description: str | None = None,
-           refresh_s: int | None = None) -> str:
+           refresh_s: int | None = None, terminal_script: bool = False) -> str:
     """`ctx`: site (name, product, tagline, domain, refresh_s), public (bool), logged_in (bool), logout_csrf, footer."""
     site = ctx["site"]
     refresh = int(refresh_s or site.get("refresh_s", 30))
@@ -180,6 +182,8 @@ def layout(ctx: dict[str, Any], title: str, body: str, *, active: str = "", scri
     elif ctx.get("public"):
         nav += '<a href="/login" class="owner-link">Eigenaar</a>'
     js = '<script src="/static/app.js" defer></script>' if script else ""
+    if terminal_script:
+        js += '<script src="/static/terminal.js" defer></script>'   # milestone 12: the Terminal builds its table from the live feed (no inline script)
     desc = description or site["tagline"]
     rob = f'<meta name="robots" content="{esc(robots)}">' if robots else ""
     return (
@@ -582,7 +586,8 @@ def how_card() -> str:
 def warning_block(text: str) -> str:
     return (f'<section class="warning" aria-label="Waarschuwing"><h2>Let op</h2><p>{esc(text)}</p>'
             '<p>Deze site toont wat een meetinstrument ziet. Een observatie is geen aansporing om iets te doen; de meeste nieuwe munten verliezen hun hele waarde. '
-            'Er staan geen koopknoppen en geen links naar handelsplaatsen; een mint-adres staat alleen als tekst zodat je kunt controleren wat gemeten werd.</p></section>')
+            'Op het dashboard en in de rapporten staan geen koopknoppen en geen links naar handelsplaatsen; een mint-adres staat daar alleen als tekst zodat je kunt controleren wat gemeten werd. '
+            'De Terminal heeft knoppen die een munt openen op pump.fun of in een externe handelsterminal; het platform zelf plaatst nooit een order.</p></section>')
 
 
 # ----- observations -----------------------------------------------------------------------------------------------------
@@ -835,7 +840,7 @@ def method_page(ctx: dict[str, Any], m: dict[str, Any]) -> str:
         '<h2 id="disclaimer">Disclaimer</h2>'
         f'<p><strong>{esc(m["warning"])}</strong></p>'
         '<p>Deze website en de bijbehorende berichten zijn een meetinstrument en een verslag daarvan. Niets erop is financieel advies, een aanbeveling, een aansporing of een voorspelling. Memecoins zijn extreem riskant: de meeste nieuwe munten verliezen hun hele waarde, vaak binnen uren, en een piek die hier als “winnaar” staat kan allang voorbij zijn op het moment dat je hem leest. '
-        'De cijfers zijn zo eerlijk als de dekking toelaat: wat de radar niet zag, staat als onbekend of NIET GEDEKT. De eigenaar handelt niet op basis van deze site, verkoopt niets, en ontvangt niets van de makers van munten die hier genoemd worden. Mint-adressen staan uitsluitend als tekst, zodat je kunt controleren wat gemeten werd; er zijn geen links naar handelsplaatsen en geen koopknoppen. '
+        'De cijfers zijn zo eerlijk als de dekking toelaat: wat de radar niet zag, staat als onbekend of NIET GEDEKT. De eigenaar handelt niet op basis van deze site, verkoopt niets, en ontvangt niets van de makers van munten die hier genoemd worden. Mint-adressen staan in de rapporten uitsluitend als tekst, zodat je kunt controleren wat gemeten werd; er zijn geen koopknoppen. De Terminal linkt een munt naar pump.fun en naar externe handelsterminals; dat is een link naar een andere site, nooit een order vanuit dit platform, en nooit een advies. '
         'Wie toch handelt, doet dat volledig op eigen risico en verantwoordelijkheid.</p>'
         f'<p class="caption">{esc(m["banner"])}</p></article>'
     )
@@ -844,10 +849,16 @@ def method_page(ctx: dict[str, Any], m: dict[str, Any]) -> str:
 
 # ----- tools --------------------------------------------------------------------------------------------------------------
 def tools_page(ctx: dict[str, Any]) -> str:
-    return ('<section class="hero"><p class="eyebrow">Tools</p><h1>Binnenkort</h1>'
-            '<p class="lede">Hier komen hulpmiddelen die op dezelfde data bouwen als het dashboard en de rapporten: dezelfde observaties, dezelfde metingen, dezelfde eerlijkheidsregels.</p></section>'
-            f'<div class="section placeholder">{pill("soon")}<p class="small muted">Eerst de meetweek, dan de tools. Wat hier komt, gebruikt geen andere bron dan wat je op deze site al ziet, '
-            'en krijgt geen functie die de site tot een koopknop maakt.</p><p class="small"><a href="/">Terug naar het dashboard</a></p></div>')
+    return ('<section class="hero"><p class="eyebrow">Tools</p><h1>De Terminal en de Plays</h1>'
+            '<p class="lede">Hulpmiddelen die op dezelfde data bouwen als het dashboard en de rapporten: dezelfde observaties, dezelfde metingen, dezelfde eerlijkheidsregels.</p></section>'
+            '<div class="grid grid-2 section">'
+            + card("Terminal", explain("Alle munten in beeld, live: elke trade binnen een seconde, filters en presets, één klik naar pump.fun, DexScreener, Solscan of een externe handelsterminal, een volg-paneel en het Plays-paneel. Toetsenbord: j/k, enter, c, 1 tot 5.")
+                   + '<p class="section"><a class="btn btn-primary" href="/terminal">Open de Terminal</a></p>', pill_html=pill("fresh", "live"))
+            + card("Plays", explain("Per bewezen regel en versie: het resultaat na kosten van de papierposities, de trefkans, open posities en historie. Leeg zolang niets bewezen is; het onderzoeksharnas zegt wanneer dat verandert.")
+                   + '<p class="section"><a class="btn" href="/plays">Naar de Plays</a></p>', pill_html=pill("pending", "meting"))
+            + '</div>'
+            f'<div class="section placeholder">{pill("soon")}<p class="small muted">Binnenkort meer: alleen op dezelfde data als wat je op deze site al ziet, '
+            'en nooit een functie die de site tot een koopknop maakt. Een link naar een handelsterminal opent die site; het platform plaatst geen order.</p><p class="small"><a href="/">Terug naar het dashboard</a></p></div>')
 
 
 # ----- login and errors -----------------------------------------------------------------------------------------------------
@@ -1010,3 +1021,107 @@ def views_card(vs: dict[str, Any]) -> str:
 def raw_report_page(ctx: dict[str, Any], body_html: str, name: str, public_href: str | None) -> str:
     back = f'<a href="/rapporten">← alle rapporten</a>' + (f'<a href="{esc(public_href)}">de openbare pagina</a>' if public_href else "")
     return f'<p class="report-nav">{back}<span class="muted">{esc(name)} (ruwe Markdown, alleen voor de eigenaar)</span></p><section class="card report-md">{body_html}</section>'
+
+
+# ----- milestone 12: the Terminal ----------------------------------------------------------------------------------------
+def terminal_page(ctx: dict[str, Any], cfg: dict[str, Any], plays: dict[str, Any] | None = None) -> str:
+    """`/terminal`: the server renders the skeleton (the toolbar, the empty table with its header, the panels, the help, the
+    warning); `static/terminal.js` fills it from the live feed and builds every cell with DOM calls (no HTML from data).
+    The configuration (terminals, presets, columns, link patterns) travels in a data attribute as JSON, escaped."""
+    presets = "".join(f'<button type="button" class="chip" data-preset="{esc(p["id"])}" title="{esc(p["text"])}">{esc(p["label"])}</button>' for p in cfg.get("presets") or [])
+    cols = "".join(f'<label class="col-toggle"><input type="checkbox" data-col="{esc(c["id"])}"{" checked" if c.get("default") else ""}> {esc(c["label"])}</label>' for c in cfg.get("columns") or [])
+    head = "".join(f'<th data-col="{esc(c["id"])}" data-sort="{esc(c["id"])}" class="{"num" if c["id"] in ("mcap", "prog", "buyers", "net", "bs", "share", "dev", "x", "age", "last") else ""}">'
+                   f'<button type="button" class="sort">{esc(c["label"])}</button></th>' for c in cfg.get("columns") or [])
+    terms = ", ".join(f"{i + 1} = {esc(t['name'])}" for i, t in enumerate(cfg.get("terminals") or []))
+    unverified = [t["name"] for t in cfg.get("terminals") or [] if not t.get("verified")]
+    rules_n = (plays or {}).get("active_rules") if isinstance(plays, dict) else None
+    hero = (f'<section class="hero hero-compact"><p class="eyebrow">Terminal · live</p><h1>Alle munten in beeld</h1>'
+            f'<p class="lede">De watchlist en de munten van de laatste {int(cfg.get("creates_window_s", 1800)) // 60} minuten, elke trade binnen een seconde. '
+            f'Filter, sorteer, volg, en open een munt met één klik op pump.fun of in een handelsterminal. Het platform plaatst nooit een order; wat je ziet is observatie.</p>'
+            f'<div class="hero-meta"><span id="t-conn" class="pill pill-unknown">verbinden …</span><span id="t-count">–</span><span id="t-engine">engine: –</span>'
+            f'<span id="t-sol">SOL-prijs onbekend</span><span id="t-updated">–</span></div></section>')
+    toolbar = (
+        '<section class="t-toolbar" aria-label="Filters">'
+        f'<div class="t-presets" role="group" aria-label="Presets">{presets}<button type="button" class="chip chip-clear" data-preset="">alles</button></div>'
+        '<form class="t-filters" id="t-filters" autocomplete="off">'
+        '<label>zoek <input type="search" id="f-q" placeholder="naam, ticker of mint" size="18"></label>'
+        '<label>leeftijd ≤ <input type="number" id="f-maxage" min="0" step="1" size="4" placeholder="min"> min</label>'
+        '<label>kopers 5 min ≥ <input type="number" id="f-minbuyers" min="0" step="1" size="3"></label>'
+        '<label>netto SOL ≥ <input type="number" id="f-minnet" min="0" step="0.5" size="4"></label>'
+        '<label>grootste koper ≤ <input type="number" id="f-maxshare" min="0" max="100" step="1" size="3"> %</label>'
+        '<label>dev-buy ≤ <input type="number" id="f-maxdev" min="0" max="100" step="0.5" size="3"> % curve</label>'
+        '<label>curve ≥ <input type="number" id="f-mincurve" min="0" max="85" step="1" size="3"> SOL</label>'
+        '<label>bundel <select id="f-bundled"><option value="">alles</option><option value="no">niet gebundeld</option><option value="yes">gebundeld</option><option value="unknown">onbekend</option></select></label>'
+        '<label>status <select id="f-status"><option value="">alles</option><option value="probation">nieuw</option><option value="early_buyers">vroege kopers</option>'
+        '<option value="meta_burst">thema</option><option value="observe">observatie</option><option value="graduated">gegradueerd</option><option value="unwatched">niet gevolgd</option></select></label>'
+        '<label>thema <select id="f-theme"><option value="">alles</option><option value="burning">brandt</option><option value="any">met thema</option></select></label>'
+        '<label>maker <select id="f-maker"><option value="">alles</option><option value="track">met track record</option><option value="clean">zonder bundel of dump</option></select></label>'
+        '<label><input type="checkbox" id="f-rising"> momentum (stijgend)</label>'
+        '<label><input type="checkbox" id="f-plays"> alleen plays</label>'
+        '<button type="button" class="btn" id="f-save">bewaar filter</button><button type="button" class="btn" id="f-share">deel als URL</button>'
+        '<button type="button" class="btn" id="f-reset">wis</button>'
+        '</form>'
+        '<div class="t-settings"><details><summary>kolommen</summary><div class="col-toggles">' + cols + '</div></details>'
+        '<label>dichtheid <select id="t-density"><option value="comfortable">ruim</option><option value="compact" selected>compact</option><option value="dense">dicht</option></select></label>'
+        '<label><input type="checkbox" id="t-sound"> geluid bij een nieuwe play</label>'
+        '<label><input type="checkbox" id="t-pause"> pauzeer</label></div>'
+        '</section>')
+    table_html = (f'<div class="t-wrap" id="t-wrap"><table class="table t-table" id="t-table"><caption class="sr-only">Munten in beeld, live</caption><thead><tr>{head}</tr></thead>'
+                  '<tbody id="t-body"><tr class="empty"><td colspan="17" id="t-empty">verbinden met de live-bron …</td></tr></tbody></table></div>')
+    panels = (
+        '<div class="grid grid-2 section">'
+        + card("Volgen", explain("Jouw volglijst (alleen in deze browser): de munten blijven live zolang dit tabblad open staat, ook als ze de watchlist verlaten. Druk op f of de ster om te volgen; notities blijven in deze browser.")
+               + '<div id="t-follow" class="t-follow"><p class="empty-state">Nog geen gevolgde munten.</p></div>', pill_html='<span class="pill pill-unknown" id="t-follow-n">0</span>', anchor="volgen")
+        + card("Plays die nu vuren", explain("Munten die op dit moment aan een bewezen regel voldoen, met de regel, de gemeten trefkans en verwachte waarde na kosten, de tijd sinds het signaal, de curvestand nu tegenover de instapstand en de uitstapregel in gewone woorden.")
+               + '<div id="t-plays" class="t-plays">' + ("" if rules_n else '<p class="empty-state">Nog geen bewezen regel: config/plays.json is leeg. Het onderzoeksharnas toetst de vooraf vastgelegde hypotheses op onze eigen data; pas een bewezen variant komt hier als regel. Tot die tijd staat dit paneel leeg.</p>')
+               + '</div>', pill_html=f'<span class="pill pill-{"fresh" if rules_n else "unknown"}" id="t-plays-n">{esc(fmt_n(rules_n or 0))} regel{"" if rules_n == 1 else "s"}</span>',
+               foot='<a href="/plays">Alle plays met uitkomst</a>', anchor="plays")
+        + '</div>')
+    helptext = card("Toetsen en links", kv([("j / k", "regel omlaag / omhoog"), ("enter", "open de munt op pump.fun"), ("c", "kopieer het mint-adres"), ("f", "volg of ontvolg de munt"),
+                                              ("1 tot 5", esc("open de munt in terminal " + (terms or "–"))), ("/", "naar het zoekveld"), ("esc", "sluit de details")])
+                    + explain("Een link opent een andere site in een nieuw tabblad; dit platform plaatst nooit een order en geeft geen advies."
+                              + (f" Linkpatronen nog niet handmatig geverifieerd: {esc(', '.join(unverified))} (docs/UNVERIFIED.md)." if unverified else "")))
+    detail = ('<aside id="t-detail" class="t-detail" hidden aria-label="Details van de munt"><div class="t-detail-head"><strong id="d-title">–</strong><button type="button" id="d-close" class="btn">sluit</button></div>'
+              '<code id="d-mint" class="coin-mint"></code><div id="d-links" class="t-links"></div><dl class="kv" id="d-facts"></dl>'
+              '<label class="t-note">notitie (alleen in deze browser)<textarea id="d-note" rows="2"></textarea></label></aside>')
+    warn = warning_block(ctx.get("warning") or "")
+    root = (f'<div id="terminal" data-config="{esc(json.dumps(cfg, ensure_ascii=False, separators=(",", ":")))}">{hero}{toolbar}{table_html}{detail}{panels}'
+            f'<div class="section">{helptext}</div><div class="section">{warn}</div></div>')
+    return root
+
+
+# ----- milestone 12: the Plays page --------------------------------------------------------------------------------------
+PLAY_COLS: list[Col] = [("as_of_label", "signaal"), ("title", "munt", "wide"), ("signal_label", "signaal (features)", "wide"), ("entry_label", "instapstand", "wide"),
+                        ("status_label", "status"), ("exit_label", "uitstap"), ("hold_label", "houdtijd", "num"), ("pnl_label", "resultaat na kosten", "num"), ("pnl_pct_label", "%", "num"),
+                        ("mint", "mint-adres", "wide")]
+
+
+def plays_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
+    if is_computing(v):
+        return computing_page("Plays", "Bewezen regels en hun papierposities")
+    d = v.get("layer") or {}
+    dpill = pill({"fresh": "fresh", "stale": "stale"}.get(str(d.get("state")), "unknown"), f"plays-laag: {d.get('label', 'nog nooit getikt')}")
+    hero = (f'<section class="hero"><p class="eyebrow">Plays</p><h1>Bewezen regels en hun papierposities</h1>'
+            f'<p class="lede">{esc(v.get("definition") or "")}</p>'
+            f'<div class="hero-meta">{dpill}<span>{esc(fmt_n(v.get("active_rules", 0)))} actieve regel{"" if v.get("active_rules") == 1 else "s"}</span>'
+            f'<span>papierpositie {esc(fmt_n(v.get("size_sol"), 2))} SOL, instap {esc(fmt_n(v.get("entry_delay_s"), 0))} s na het signaal</span><span>gegevens van {esc(v["generated_label"])}</span></div></section>')
+    if not v.get("rules"):
+        body = card("Nog niets bewezen", explain(esc(v.get("note") or "")) + empty_state("config/plays.json is leeg: de Plays-laag staat klaar en wacht op het eerste onderzoeksrapport met een bewezen variant."),
+                    pill_html=pill("unknown", "leeg"), foot='<a href="/methode#begrip-observatie">Wat een observatie is</a><a href="/terminal">De Terminal</a>')
+        return hero + f'<div class="section" data-live="plays">{body}</div><div class="section">{warning_block(ctx.get("warning") or "")}</div>'
+    cards = ""
+    for r in v.get("per_rule") or []:
+        kpis = (kpi(r["pnl_sum_label"], "", "resultaat na kosten (gesloten)") + kpi(r["pnl_mean_label"], "", "gemiddeld per play") + kpi(r["live_hit_label"], "", "trefkans live")
+                + kpi(fmt_n(r["open"]), "", "open") + kpi(fmt_n(r["closed"]), "", "gesloten") + kpi(fmt_n(r["unknown"]), "", "onbekend") + kpi(fmt_n(r["no_fill"]), "", "geen vulling"))
+        meas = kv([("gemeten in het onderzoek", f'trefkans {esc(r["measured_hit_label"])}, verwachte waarde {esc(r["measured_ev_label"])} per {esc(fmt_n(r.get("size_sol") or v.get("size_sol"), 2))} SOL, interval {esc(r["ci_label"])}, {esc(fmt_n(r.get("cases")))} gevallen'),
+                   ("instap", esc(r["label"])), ("uitstap", esc(r["exit_text"])), ("rapport", esc(r.get("report") or "–")), ("gepromoveerd", esc(fmt_time(data.iso_to_ts(r.get("promoted_at")))))])
+        rows = [{**p, "mint": Raw(f"<code>{esc(p['mint'])}</code>"), "status_label": Raw(pill({"open": "pending", "signal": "pending", "closed": "fresh", "unknown": "unknown", "no_fill": "unknown"}.get(p["status"], "unknown"), p["status_label"]))} for p in r.get("rows") or []]
+        cards += card(f"{r['name']} · {r['id']}" + ("" if r.get("active") else " (vervangen)"),
+                      explain(f"Regel {esc(r['id'])}, versie {esc(fmt_n(r['version']))}: {esc(r['label'])}. De cijfers hieronder zijn de papierposities sinds de promotie; het onderzoek staat ernaast.")
+                      + f'<div class="kpi-row">{kpis}</div>' + meas + table(PLAY_COLS, rows, empty="nog geen play voor deze regel"),
+                      pill_html=pill("fresh" if r.get("active") else "unknown", "actief" if r.get("active") else "vervangen"), anchor=f"regel-{r['id']}")
+    c = v.get("counts") or {}
+    summary = card("Samenvatting", explain("Elke play is een papierpositie met dezelfde kosten als in het onderzoek: curvefee 1% per kant, priority fee, prijsimpact; na graduatie de PumpSwap-fee en de impact uit de liquiditeit. Onbekend = het prijspad eindigde vóór een uitstap; geen vulling = geen trade binnen 10 minuten na het signaal. Beide tellen nooit als resultaat.")
+                   + f'<div class="kpi-row">{kpi(fmt_n(c.get("signals")), "", "signalen")}{kpi(fmt_n(c.get("open")), "", "open")}{kpi(fmt_n(c.get("closed")), "", "gesloten")}{kpi(fmt_n(c.get("unknown")), "", "onbekend")}{kpi(fmt_n(c.get("no_fill")), "", "geen vulling")}</div>',
+                   pill_html=dpill)
+    return hero + f'<div class="section" data-live="plays">{summary}<div class="section">{cards}</div></div><div class="section">{warning_block(ctx.get("warning") or "")}</div>'
