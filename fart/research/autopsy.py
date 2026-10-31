@@ -1,6 +1,11 @@
 """The autopsy of the organic winners (milestone 12, B.3): their first five minutes next to the non-winners on every feature,
 and what the radar saw of them (coverage and lead). Feeds the parameter grids of the hypotheses; replaces no test.
 
+Milestone 13 adds the part AFTER graduation (the only place where the week's winners were tradable): per group the time from
+the graduation to the peak within 24 hours, the drawdown from the graduation price in the first hour and within 24 hours, the
+volume per five minutes of the first hour (from the minute candles), whether the maker sold on the curve before the graduation
+(a sell after it, on the pool, is not in our data and is reported as not measured), and whether candles exist at all.
+
 Universe: the graduations of the window with a measured 24 h outcome. Winner = hit_100k, organic = not bundled by the
 outcome's own flag AND not bundled by the three research definitions on the trades knowable five minutes after the create
 (the stricter of the two; a coin whose bundle flags cannot be evaluated is "bundeling onbekend" and left out of both
@@ -20,7 +25,7 @@ from ..measure.report import tracker_coverage
 from ..util import atomic_write_json, atomic_write_text, day_bounds, day_key, utc_iso
 from ..version import rules_version
 from . import features as rf
-from .harness import _quantile, creator_history_capped, load_coin
+from .harness import _quantile, creator_history_capped, load_coin, price_path
 from .report import report_dir
 
 ET = "COALESCE(block_time, received_at)"
@@ -61,7 +66,7 @@ def build_autopsy(conn: sqlite3.Connection, settings: Settings, days: list[str],
         if o is None:
             counts["no_outcome"] += 1
             continue
-        coin = load_coin(conn, mint, with_path=False)
+        coin = load_coin(conn, mint, with_path=True)   # milestone 13: the post-graduation part reads the samples and the candles
         if coin is None:
             counts["no_coin_row"] += 1
             continue
@@ -97,6 +102,7 @@ def build_autopsy(conn: sqlite3.Connection, settings: Settings, days: list[str],
         first_received = min((x.received_at for x in coin.trades if x.received_at is not None), default=None)
         dec = conn.execute("SELECT MIN(as_of) FROM decisions WHERE kind='observe' AND mint=?", (mint,)).fetchone()[0]
         cr = creator_history_capped(conn, coin, t5, mv, h24, dev_window, 50) if coin.creator else {}
+        post = post_graduation_facts(coin, params, h24)
         groups[group].append({
             "mint": mint, "name": coin.name, "symbol": coin.symbol, "created_t": coin.created_t, "graduated_t": grad_t, "age_at_graduation_s": grad_t - coin.created_t,
             "peak_mcap_usd": o["peak_mcap_usd"], "marks": marks, "bundle": bundle, "dev": dev, "creator": {k: cr.get(k) for k in ("creator_coins", "creator_graduations", "creator_winners", "creator_bundled", "creator_dev_sold_early", "creator_track_record")},
@@ -104,10 +110,11 @@ def build_autopsy(conn: sqlite3.Connection, settings: Settings, days: list[str],
             "first_received_delay_s": None if first_received is None else first_received - coin.created_t,
             "observed": dec is not None, "observed_before_graduation": dec is not None and float(dec) < grad_t,
             "lead_s": None if dec is None else grad_t - float(dec), "observe_age_s": None if dec is None else float(dec) - coin.created_t,
+            "post": post,
         })
     out: dict[str, Any] = {"kind": "autopsy", "name": f"{day_key(now)}-autopsy", "generated_at": utc_iso(now), "rules_version": rules_version(), "days": days,
                            "counts": counts, "groups": {k: len(v) for k, v in groups.items()}, "seconds": round(time.perf_counter() - t0, 2), "features": {}, "coverage": {},
-                           "coins": {k: v for k, v in groups.items() if k != "unknown"}}
+                           "post_graduation": {}, "coins": {k: v for k, v in groups.items() if k != "unknown"}}
     for gname, coins in groups.items():
         if gname == "unknown":
             continue
@@ -134,6 +141,51 @@ def build_autopsy(conn: sqlite3.Connection, settings: Settings, days: list[str],
             "age_at_graduation_median_s": _quantile(sorted(c["age_at_graduation_s"] for c in coins), 0.5),
             "creator_track": _tally(c["creator"].get("creator_track_record") for c in coins),
         }
+        posts = [c["post"] for c in coins]
+        out["post_graduation"][gname] = {
+            "n": n, "with_candles": sum(1 for p in posts if p["candles"]), "with_points": sum(1 for p in posts if p["points_24h"]),
+            "time_to_peak_s": _dist([p["time_to_peak_s"] for p in posts]), "peak_gain_24h": _dist([p["peak_gain_24h"] for p in posts]),
+            "drawdown_1h": _dist([p["drawdown_1h"] for p in posts]), "drawdown_24h": _dist([p["drawdown_24h"] for p in posts]),
+            "volume_5m_usd": _dist([v for p in posts for v in p["volume_5m_usd"]]), "volume_first_hour_usd": _dist([p["volume_first_hour_usd"] for p in posts]),
+            "dev_sold_before_graduation": sum(1 for p in posts if p["dev_sold_before_graduation"]),
+            "dev_sold_after_graduation": "niet gemeten: de radar heeft geen pool-trades",
+        }
+    return out
+
+
+def post_graduation_facts(coin: Any, params: CurveParams, h24: int) -> dict[str, Any]:
+    """Milestone 13: what the post-graduation path says about one graduation: the time to the peak within 24 h and its gain over
+    the graduation price, the drawdown from the graduation price in the first hour and within 24 h (the lowest point), the
+    volume per five minutes and of the first hour from the candles, the maker's sells on the curve before the graduation. A
+    figure without points stays None."""
+    out: dict[str, Any] = {"candles": len(coin.candles), "points_24h": 0, "time_to_peak_s": None, "peak_gain_24h": None, "drawdown_1h": None, "drawdown_24h": None,
+                           "volume_5m_usd": [], "volume_first_hour_usd": None,
+                           "dev_sold_before_graduation": any(x.t <= (coin.grad_t or 0) and not x.is_buy and x.buyer is not None and x.buyer == coin.creator for x in coin.trades)}
+    if coin.grad_t is None:
+        return out
+    path = price_path(coin, coin.grad_t)
+    grad = next((p for p in path if p.graduation), None)
+    gp = grad.spot(params) if grad is not None else None
+    post = [(p.t, p.spot(params)) for p in path if p.t > coin.grad_t and p.t <= coin.grad_t + h24 and p.spot(params) is not None]
+    out["points_24h"] = len(post)
+    if gp and post:
+        peak_t, peak = max(post, key=lambda x: x[1])
+        out["time_to_peak_s"] = round(peak_t - coin.grad_t)
+        out["peak_gain_24h"] = round(peak / gp - 1.0, 4)
+        out["drawdown_24h"] = round(min(sp for _, sp in post) / gp - 1.0, 4)
+        hour = [sp for t, sp in post if t <= coin.grad_t + 3600]
+        out["drawdown_1h"] = None if not hour else round(min(hour) / gp - 1.0, 4)
+    if coin.candles:
+        buckets: dict[int, float] = {}
+        total = 0.0
+        for c in coin.candles:
+            m = float(c["minute"])
+            if m < coin.grad_t - 60 or m >= coin.grad_t + 3600 or c.get("volume_usd") is None:
+                continue
+            buckets[int((m - coin.grad_t) // 300)] = buckets.get(int((m - coin.grad_t) // 300), 0.0) + float(c["volume_usd"])
+            total += float(c["volume_usd"])
+        out["volume_5m_usd"] = [round(v, 2) for _, v in sorted(buckets.items())]
+        out["volume_first_hour_usd"] = round(total, 2)
     return out
 
 
@@ -194,6 +246,29 @@ def render_autopsy(r: dict[str, Any]) -> str:
             pct = base in ("largest_buyer_share_15m", "graduation_progress", "dev_buy_frac_of_curve", "top2_share")
             cells.append("–" if not d or not d["n"] else f"{_f(d['p10'], pct)} / {_f(d['p50'], pct)} / {_f(d['p90'], pct)} (n {d['n']})")
         lines.append(f"| {label} | " + " | ".join(cells) + " |")
+    pg = r.get("post_graduation") or {}
+    if pg:
+        lines += ["", "## Na graduatie (mijlpaal 13)", "",
+                  "De enige plek waar de winnaars van deze week verhandelbaar waren. Per groep: de tijd van graduatie tot de piek binnen 24 u en de winst van die piek op de graduatieprijs, "
+                  "de terugval vanaf de graduatieprijs (laagste punt in het eerste uur en binnen 24 u), het volume per 5 minuten in het eerste uur (minuutcandles) en of de maker vóór de "
+                  "graduatie op de curve verkocht. Een dev-verkoop ná de graduatie gebeurt op de pool en staat niet in onze data: niet gemeten, dus niet geteld.", "",
+                  "| groep | n | met candles | met punten na graduatie | tijd tot piek (p10 / p50 / p90) | piekwinst op graduatieprijs | terugval 1 u | terugval 24 u | volume per 5 min (USD) | volume eerste uur (USD) | dev verkocht vóór graduatie | dev verkocht ná graduatie |",
+                  "|---|---:|---:|---:|---|---|---|---|---|---|---:|---|"]
+        for name, label in (("organic_winner", "organische winnaars"), ("bundled_winner", "gebundelde winnaars"), ("not_winner", "geen winnaar")):
+            p = pg.get(name)
+            if not p:
+                continue
+
+            def q(d: dict[str, Any], pct: bool = False, minutes: bool = False) -> str:
+                if not d or not d.get("n"):
+                    return "–"
+                vals = [d["p10"], d["p50"], d["p90"]]
+                if minutes:
+                    return " / ".join(_f(None if v is None else v / 60) + " min" for v in vals) + f" (n {d['n']})"
+                return " / ".join(_f(v, pct) for v in vals) + f" (n {d['n']})"
+
+            lines.append(f"| {label} | {p['n']} | {p['with_candles']} | {p['with_points']} | {q(p['time_to_peak_s'], minutes=True)} | {q(p['peak_gain_24h'], pct=True)} | "
+                         f"{q(p['drawdown_1h'], pct=True)} | {q(p['drawdown_24h'], pct=True)} | {q(p['volume_5m_usd'])} | {q(p['volume_first_hour_usd'])} | {p['dev_sold_before_graduation']} | {p['dev_sold_after_graduation']} |")
     lines += ["", "## Lezing", "",
               "- De kolom 'trades in de eerste 5 min' zegt of de radar de munt überhaupt op tijd volgde; zonder die trades kan geen regel in de eerste minuten vuren, wat de winnaar ook deed.",
               "- Een kenmerk dat bij de organische winnaars duidelijk hoger ligt dan bij 'geen winnaar' is een kandidaat voor een drempel in B.2; de toets blijft de walk-forward van het harnas.",

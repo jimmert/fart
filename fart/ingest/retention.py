@@ -1,6 +1,6 @@
 """Retention: raw gz 30 days, trades only for watched mints and only for N days (14 until milestone 11, 30 since milestone 12
-so the research harness has a month of trade paths), samples, api_ledger and pool candles pruned, weekly archive of pruned
-rows to data/archive/*.jsonl.gz. The append-only ledgers (decisions, outcomes) are never touched.
+so the research harness has a month of trade paths), samples, api_ledger, pool candles and the poll points of the followed coins (milestone 13) pruned, weekly archive of
+pruned rows to data/archive/*.jsonl.gz. The append-only ledgers (decisions, outcomes) are never touched.
 """
 from __future__ import annotations
 
@@ -78,6 +78,17 @@ def run_retention(conn: sqlite3.Connection, raw_dir: Path, archive_dir: Path, cf
         _archive_rows(archive_dir, "pool_candles", rows, now)
         conn.execute("DELETE FROM pool_candles WHERE fetched_at < ?", (cutoff_candles,))
         out["candles_archived"] = len(rows)
+    # milestone 13: the poll points of the followed coins live as long as the trades (the research window); a followed row is kept
+    # as long as its 24 hours plus that window, so the reports can split signals before and after the follow started
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='path_points'").fetchone() is not None:
+        rows = conn.execute("SELECT * FROM path_points WHERE t < ?", (cutoff_trades,)).fetchall()
+        _archive_rows(archive_dir, "path_points", rows, now)
+        conn.execute("DELETE FROM path_points WHERE t < ?", (cutoff_trades,))
+        out["path_points_archived"] = len(rows)
+        rows = conn.execute("SELECT * FROM followed WHERE until < ?", (cutoff_trades,)).fetchall()
+        _archive_rows(archive_dir, "followed", rows, now)
+        conn.execute("DELETE FROM followed WHERE until < ?", (cutoff_trades,))
+        out["followed_archived"] = len(rows)
     kv_set(conn, "retention.last_run", str(now), now)
     log.info("retention.done", **out)
     return out

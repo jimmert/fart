@@ -36,13 +36,13 @@ def _trade(conn, mint, t, buyer, sol, is_buy, vsol, sig=None):
 
 # ----- schema ------------------------------------------------------------------------------------------------------------
 def test_schema_v9_adds_the_research_tables_idempotently(settings, conn):
-    assert db.SCHEMA_VERSION == 9 and conn.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert db.SCHEMA_VERSION >= 9 and conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION   # v9 ran (milestone 13 adds v10 on top)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"creator_stats", "pool_candles", "candle_jobs", "plays"} <= tables
     indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
     assert {"creator_stats_last", "candle_jobs_due", "plays_status", "plays_mint", "plays_as_of"} <= indexes
     again = db.connect(settings.db_path)
-    assert again.execute("PRAGMA user_version").fetchone()[0] == 9
+    assert again.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     again.close()
     # the plays table is unique per rule, version and coin: a signal is opened once
     cols = "rule, version, hypothesis, variant, mint, as_of, created_at, features_json, entry_json, size_sol, status, rules_version, json"

@@ -12,15 +12,15 @@
         "getSignaturesForAddress": 40,
         "getTokenLargestAccounts": 20,
         "getAccountInfo": 10,
-        "getSlot": 10,
-        "getBlockTime": 10,
+        "getSlot": 20,
+        "getBlockTime": 20,
         "getHealth": 0,
-        "getMultipleAccounts": 25,
+        "getMultipleAccounts": 20,
         "ws_connect": 10
       },
       "backoff_base_s": 2,
       "backoff_max_s": 300,
-      "_comment": "getTransaction 40, getSignaturesForAddress 40, getTokenLargestAccounts 20, getAccountInfo 10: the Alchemy compute-unit page (https://www.alchemy.com/docs/reference/compute-unit-costs, read 26 Oct 2026). getSlot, getBlockTime, getMultipleAccounts were not read from the page and stay estimates. Solana websocket subscriptions are billed per byte: 0.0002 CU per byte according to the Solana section of that page; its 'Webhooks and Subscription APIs' section says 0.04 CU per byte (a factor 200, not reconciled). cu_per_byte 0.0002 is the working value until the dashboard comparison in docs/UNVERIFIED.md settles it; set 0.04 to book the pessimistic reading. ws_notification/ws_subscribe = the creates+migrations log stream (rpc_logs), ws_trade_* = the per-mint trade stream (rpc_trades), booked separately so `fart status` -> rpc CU today by method shows bytes and CU per stream. ws_connect stays a flat estimate.",
+      "_comment": "getTransaction 40, getSignaturesForAddress 40, getTokenLargestAccounts 20, getAccountInfo 10: the Alchemy compute-unit page (https://www.alchemy.com/docs/reference/compute-unit-costs, read 26 Oct 2026). Milestone 13 (read again on 31 Oct 2026): getMultipleAccounts 20 (a flat figure per call, not per account: the page gives no per-account price, so the follow step packs 100 addresses in one call), getSlot 20 and getBlockTime 20 (they were estimates of 10). Solana websocket subscriptions are billed per byte: 0.0002 CU per byte according to the Solana section of that page; its 'Webhooks and Subscription APIs' section says 0.04 CU per byte (a factor 200, not reconciled). cu_per_byte 0.0002 is the working value until the dashboard comparison in docs/UNVERIFIED.md settles it; set 0.04 to book the pessimistic reading. ws_notification/ws_subscribe = the creates+migrations log stream (rpc_logs), ws_trade_* = the per-mint trade stream (rpc_trades), booked separately so `fart status` -> rpc CU today by method shows bytes and CU per stream. ws_connect stays a flat estimate. The follow step's getMultipleAccounts calls are bounded by their own share of the daily cap (config/measure.json -> follow.daily_cu_share).",
       "cu_per_byte": 0.0002,
       "byte_priced": [
         "ws_notification",
@@ -53,8 +53,8 @@
       "backoff_max_s": 180
     },
     "dexscreener": {
-      "_comment": "official limit 300/min for token endpoints; we self-limit to 100/min",
-      "rate_per_s": 1.6667,
+      "_comment": "official limit 300/min for the token endpoints; milestone 13 raises the self-imposed gate from 100/min to 200/min (3.3333 per second, burst 10) so the tracker samples every subject of its window every 300 s (67 requests of 30 mints per run at 2,000 mints); a 429 arms the backoff",
+      "rate_per_s": 3.3333,
       "burst": 10,
       "daily_requests": 100000,
       "daily_cost": null,

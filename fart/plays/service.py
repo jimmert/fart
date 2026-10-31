@@ -19,6 +19,13 @@ Per tick:
 
 Without an active rule the daemon idles with a heartbeat (kv `plays.heartbeat`, `plays.rules_active` = 0) and the website
 says so. `fart status` shows the heartbeat, the rules, the open positions and the alerts of the day.
+
+Milestone 13: the daemon also FOLLOWS signals (`fart/plays/follow.py`). Every tick it evaluates the pre-registered follow
+triggers of `fart/research/hypotheses.py::FOLLOW_TRIGGERS` on its candidates (with or without an active rule), follows every
+coin that meets one, every coin a rule fired on and every coin with an observe decision of the engine, and polls the
+BondingCurve accounts of the followed coins outside the trade stream, so every signal keeps a price path for 24 hours. The
+open positions are fed the combined path (trades, polls, samples, candles): a live play never turns unknown while the coin
+exists. The follow step reports in `fart status` (`follow:` line) and kv `follow.*`.
 """
 from __future__ import annotations
 
@@ -33,6 +40,7 @@ from ..chain.curve import CurveParams, CurveState
 from ..config import Settings
 from ..log import get_logger
 from ..measure.paper import Costs, Position, PricePoint
+from ..net.budget import Budget
 from ..notify import outbox
 from ..notify.format import age as age_label, esc, fmt_time, n as fmt_n, with_footer
 from ..research import features as rf
@@ -40,6 +48,7 @@ from ..research import harness as rh
 from ..research import hypotheses as hyps
 from ..util import day_key, now as wall_now, utc_iso
 from ..version import rules_version
+from . import follow as follow_mod
 from . import rules as rules_mod
 
 log = get_logger("plays")
@@ -55,7 +64,7 @@ MAX_CANDIDATES = 400
 
 
 class PlaysEngine:
-    def __init__(self, conn: sqlite3.Connection, settings: Settings, clock=wall_now):
+    def __init__(self, conn: sqlite3.Connection, settings: Settings, clock=wall_now, rpc: Any = None, follow_cfg: follow_mod.FollowConfig | None = None):
         self.conn = conn
         self.settings = settings
         self.clock = clock
@@ -74,6 +83,13 @@ class PlaysEngine:
         self.theme_seen: dict[str, float] = {}
         self.rules_version = rules_version()
         self.stats: dict[str, int] = {}
+        # milestone 13: the follow step (its own budget gate for the keyed RPC; a test injects a fake `rpc`)
+        fcfg = follow_cfg or follow_mod.FollowConfig.from_settings(settings)
+        budget = None
+        if rpc is None and fcfg.enabled and not (settings.rpc_is_public and fcfg.require_keyed_rpc):
+            budget = Budget.from_settings(conn, settings, clock=clock)
+        self.follower = follow_mod.Follower(conn, settings, budget=budget, rpc=rpc, clock=clock, cfg=fcfg)
+        self.follow_enabled = fcfg.enabled and follow_mod.table_exists(conn)
 
     def reload_rules(self) -> None:
         self.rules = rules_mod.load_rules(self.settings)
@@ -83,8 +99,17 @@ class PlaysEngine:
         self.stats[k] = self.stats.get(k, 0) + n
 
     # ----- candidates -------------------------------------------------------------------------------------------------
-    def candidates(self, now: float) -> dict[str, rh.Coin]:
+    def families(self) -> set[str]:
+        """The hypothesis families the tick needs candidates for: those of the active rules, plus (milestone 13) those of the
+        follow triggers while the follow step is on."""
         fams = {r.hypothesis for r in self.rules}
+        if self.follow_enabled:
+            for t in hyps.FOLLOW_TRIGGERS:
+                fams.update(t.hypotheses)
+        return fams
+
+    def candidates(self, now: float, fams: set[str] | None = None) -> dict[str, rh.Coin]:
+        fams = self.families() if fams is None else fams
         out: dict[str, rh.Coin] = {}
         if fams & {"H1", "H4", "H5", "H7"}:
             horizon = max(hyps.get(h).horizon_s for h in fams & {"H1", "H4", "H5", "H7"})
@@ -93,8 +118,9 @@ class PlaysEngine:
             for r in rows:
                 out.setdefault(str(r[0]), None)  # type: ignore[arg-type]
         if "H2" in fams:
+            # the follow trigger of H2 starts at 60 SOL in the curve (virtual 90 SOL), the rule itself at the 75 SOL crossing
             rows = self.conn.execute("SELECT DISTINCT mint FROM trades WHERE received_at >= ? AND virtual_sol >= ? AND mint IN (SELECT mint FROM watchlist WHERE active=1) LIMIT ?",
-                                     (now - 900, int((30.0 + 70.0) * 1e9), MAX_CANDIDATES)).fetchall()
+                                     (now - 900, int((30.0 + hyps.FOLLOW_CURVE_SOL) * 1e9), MAX_CANDIDATES)).fetchall()
             for r in rows:
                 out.setdefault(str(r[0]), None)  # type: ignore[arg-type]
         if "H6" in fams:
@@ -160,6 +186,8 @@ class PlaysEngine:
     # ----- features -------------------------------------------------------------------------------------------------------
     def context(self, coin: rh.Coin, now: float, needs_creator: bool, needs_theme: bool) -> hyps.Ctx:
         f = rf.replay_features(coin.trades, now, coin.created_t, self.params) if coin.trades else {"as_of": now, "age_s": round(now - coin.created_t, 1), "trades_total": 0, "unique_buyers_5m": 0, "net_sol_5m": 0.0}
+        if coin.points:
+            rf.apply_poll_state(f, coin.points, now, self.params)   # milestone 13: a newer poll of the curve account carries the state (H2's crossing may be seen on it)
         prev = self.prev.get(coin.mint)
         f_prev = prev[1] if prev is not None and now - prev[0] <= 2 * self.tick_s + 1 else None
         bundle = rf.bundle_flags(coin.trades, now, coin.created_t, coin.dev_buy_sol, coin.slot, graduation_sol=self.params.graduation_real_sol / self.params.sol_unit, creator=coin.creator)
@@ -186,13 +214,19 @@ class PlaysEngine:
     # ----- the tick -------------------------------------------------------------------------------------------------------
     def tick(self, now: float | None = None) -> dict[str, Any]:
         now = self.clock() if now is None else now
-        summary: dict[str, Any] = {"as_of": now, "rules": len(self.rules), "candidates": 0, "signals": 0, "followed": 0, "closed": 0, "alerts": 0, "unknown": 0, "no_fill": 0}
+        summary: dict[str, Any] = {"as_of": now, "rules": len(self.rules), "candidates": 0, "signals": 0, "followed": 0, "closed": 0, "alerts": 0, "unknown": 0, "no_fill": 0,
+                                   "follow_new": 0, "follow_triggers": 0, "polls": None}
         t0 = time.perf_counter()
-        if self.rules:
-            coins = self.candidates(now)
+        fams = self.families()
+        triggers = list(hyps.FOLLOW_TRIGGERS) if self.follow_enabled else []
+        follow_items: list[tuple[str, float, str]] = []
+        if fams:
+            coins = self.candidates(now, fams)
             summary["candidates"] = len(coins)
             needs_creator = any(r.hyp.needs_creator for r in self.rules)
-            needs_theme = any(r.hyp.needs_theme for r in self.rules)
+            needs_theme = any(r.hyp.needs_theme for r in self.rules) or any(t.needs_theme for t in triggers)
+            if needs_theme and not any(r.hyp.needs_theme for r in self.rules):
+                self.refresh_theme_roles(now)
             existing = {(str(r["rule"]), int(r["version"]), str(r["mint"])) for r in self.conn.execute("SELECT rule, version, mint FROM plays WHERE as_of >= ?", (now - 2 * 86400,))}
             new_rows: list[tuple[rules_mod.Rule, rh.Coin, hyps.Ctx]] = []
             for mint, coin in coins.items():
@@ -207,13 +241,30 @@ class PlaysEngine:
                         fired = False
                     if fired:
                         new_rows.append((rule, coin, ctx))
+                        follow_items.append((mint, now, f"play:{rule.id}"))
+                for trig in triggers:
+                    try:
+                        hit = bool(trig.fires(ctx))
+                    except Exception:  # noqa: BLE001  a trigger bug must never turn into a silent miss
+                        log.error("follow.trigger_failed", trigger=trig.id, mint=mint, exc_info=True)
+                        hit = False
+                    if hit:
+                        follow_items.append((mint, now, trig.id))
+                        summary["follow_triggers"] += 1
             if new_rows:
                 summary["signals"] = db.write_tx(self.conn, lambda c: sum(1 for rule, coin, ctx in new_rows if self.open_play(c, rule, coin, ctx, now)), what="plays.signals")
-            summary.update(self.follow(now))
-            summary["alerts"] = self.alerts(now)
             # forget the previous features of coins that left the candidate set
             for mint in [m for m, (t, _) in self.prev.items() if now - t > 3 * self.tick_s]:
                 self.prev.pop(mint, None)
+        if self.follow_enabled:
+            summary["follow_new"] = int(self.follower.follow_many(follow_items, now)["new"]) + self.follower.add_observe_decisions(now) + self.follower.add_plays(now)
+            self.follower.refresh(now)
+            polls = self.follower.poll(now)
+            summary["polls"] = ({k: polls.get(k) for k in ("enabled", "active", "due", "calls", "polled", "points", "graduated", "errors", "blocked", "level", "paused", "over_cap")}
+                                if polls.get("enabled") else {"enabled": False, "active": polls.get("active"), "reason": polls.get("disabled_reason")})
+        if self.rules:
+            summary.update(self.follow(now))
+            summary["alerts"] = self.alerts(now)
         summary["seconds"] = round(time.perf_counter() - t0, 3)
 
         def _hb(c: sqlite3.Connection) -> None:
@@ -373,9 +424,10 @@ def run_plays(settings: Settings, once: bool = False) -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     log.info("plays.started", rules=len(eng.rules), interval_s=interval, size_sol=eng.cfg["size_sol"], entry_delay_s=eng.cfg["entry_delay_s"],
-             telegram="enabled" if settings.telegram_enabled else "disabled")
+             telegram="enabled" if settings.telegram_enabled else "disabled",
+             follow=("polls " + ("on" if eng.follower.polls_enabled else f"off: {eng.follower.disabled_reason}")) if eng.follow_enabled else "disabled")
     if not eng.rules:
-        log.info("plays.idle", reason="config/plays.json has no active rule: nothing is proven yet; idling with a heartbeat")
+        log.info("plays.idle", reason="config/plays.json has no active rule: nothing is proven yet; idling with a heartbeat" + (" and following signals" if eng.follow_enabled else ""))
     last_log = 0.0
     last_reload = 0.0
     failures = 0

@@ -8,11 +8,19 @@ Milestone 5 (fidelity, not a method change): a run that cannot sample every subj
 `measure.track.skipped` (all time) and `measure.track.skipped.<day>`, with the reasons in
 `measure.track.skipped.last`; `fart status` shows them. The reports count a graduation without samples at
 least every 10 minutes as "uitkomst onbekend", never as "geen winnaar" (`fart/measure/report.py`).
+
+Milestone 13 (capacity, not a method change either): the tracker samples every subject of its window every run
+(`sampling.max_mints_per_run` 2,000 against some 1,100 subjects on the VPS; the DexScreener gate at 200 per minute),
+newest anchor first when a bound bites, inside a time budget per step (`sampling.time_budget_s` for the sampling,
+`tracker.run_budget_s` for the whole run against the unit's `TimeoutStartSec=240`: the creator statistics and the candle
+queue get what is left). Every run records the duration of each step and its counts in kv `measure.track.last`, which
+`fart status` prints next to the share of the last 24 hours' graduations with a sample at least every 10 minutes.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from typing import Any
 
 from .. import db
@@ -28,6 +36,10 @@ from .prices import PriceFeed
 log = get_logger("measure")
 
 ET = "COALESCE(block_time, received_at)"
+KV_LAST = "measure.track.last"          # milestone 13: the last run's step durations and counts (JSON)
+RUN_BUDGET_S = 220.0                    # the whole run must end inside the unit's TimeoutStartSec=240
+SAMPLE_BUDGET_S = 150.0                 # the sampling step's share of it; the rest goes to the outcomes, the creator statistics and the candles
+CREATOR_STATS_MAX_S = 60.0
 
 
 def sol_usd_at(conn: sqlite3.Connection, t: float, tolerance_s: float = 3600.0) -> tuple[float | None, str]:
@@ -162,21 +174,31 @@ class Tracker:
         c.setdefault("bundled_dev_buy_fraction", self.pf.get("bundled_dev_buy_fraction", 0.5))
         return c
 
-    def run(self, sample: bool = True) -> dict[str, Any]:
+    def run(self, sample: bool = True, deadline: float | None = None) -> dict[str, Any]:
+        """One run: sample every subject of the window (newest anchor first; the cap and the time budget cut the oldest),
+        then write the outcomes that fell due. `deadline` is a `time.perf_counter()` value for the sampling step (default:
+        `sampling.time_budget_s` from now); the step durations land in `stats["seconds"]`."""
+        t0 = time.perf_counter()
         now = self.clock()
-        window = float(self.cfg["sampling"].get("track_window_s", 90000))
+        scfg = self.cfg["sampling"]
+        window = float(scfg.get("track_window_s", 90000))
+        if deadline is None:
+            deadline = t0 + float(scfg.get("time_budget_s", SAMPLE_BUDGET_S))
         subs = subjects(self.conn, now, window)
-        stats: dict[str, Any] = {"subjects": len(subs), "sampled": None, "outcomes": 0, "paper": 0, "sol_usd": None}
+        stats: dict[str, Any] = {"subjects": len(subs), "sampled": None, "outcomes": 0, "paper": 0, "sol_usd": None, "seconds": {}}
         if sample and subs:
             sol_usd, src = self.feed.sol_usd()
             stats["sol_usd"] = sol_usd
             stats["sol_usd_src"] = src
-            all_mints = sorted({s["mint"] for s in subs})
-            mints = all_mints[: int(self.cfg["sampling"].get("max_mints_per_run", 600))]
-            stats["sampled"] = self.feed.sample_mints(mints, sol_usd)
-            skipped = {"over_cap": len(all_mints) - len(mints), "dexscreener": int(stats["sampled"].get("skipped", 0))}
+            newest: dict[str, float] = {}
+            for s in subs:
+                newest[s["mint"]] = max(newest.get(s["mint"], 0.0), float(s["anchor_time"]))
+            all_mints = sorted(newest, key=lambda m: (-newest[m], m))     # newest anchor first: a bound cuts the subjects whose window is nearly over
+            mints = all_mints[: int(scfg.get("max_mints_per_run", 2000))]
+            stats["sampled"] = self.feed.sample_mints(mints, sol_usd, deadline=deadline)
+            skipped = {"over_cap": len(all_mints) - len(mints), "dexscreener": int(stats["sampled"].get("skipped", 0)), "time_budget": int(stats["sampled"].get("time_budget", 0))}
             stats["skipped"] = skipped
-            n_skipped = skipped["over_cap"] + skipped["dexscreener"]
+            n_skipped = sum(skipped.values())
             if n_skipped:
                 def _count(c, n=n_skipped, detail=dict(skipped)) -> None:
                     db.counter_bump_daily(c, "measure.track.skipped", n, now)
@@ -184,7 +206,10 @@ class Tracker:
 
                 db.write_tx(self.conn, _count, what="measure.skipped")
                 log.warning("track.skipped", **skipped, subjects=len(all_mints), max_mints_per_run=len(mints))
+        stats["seconds"]["sample"] = round(time.perf_counter() - t0, 2)
+        t1 = time.perf_counter()
         stats["outcomes"], stats["paper"] = self.measure_due(now)
+        stats["seconds"]["outcomes"] = round(time.perf_counter() - t1, 2)
         db.kv_set(self.conn, "measure.track.last_run", str(now), now)
         log.info("track.done", **{k: (v if not isinstance(v, dict) else json.dumps(v)) for k, v in stats.items()})
         return stats
@@ -240,26 +265,99 @@ def run_track(settings: Settings) -> int:
     conn = db.connect(settings.db_path)
     try:
         budget = Budget.from_settings(conn, settings)
-        Tracker(conn, settings, budget).run()
+        t0 = time.perf_counter()
+        tracker = Tracker(conn, settings, budget)
+        run_budget = float((tracker.cfg.get("tracker") or {}).get("run_budget_s", RUN_BUDGET_S))
+        sample_budget = float(tracker.cfg["sampling"].get("time_budget_s", SAMPLE_BUDGET_S))
+        now = wall_now()
+        stats = tracker.run(deadline=t0 + min(sample_budget, run_budget))
         # milestone 12: two bounded steps of their own next to the tracker (never by the engine): the creator statistics and the
         # minute candles after graduation. Each one is isolated: a failure is logged and counted and never stops the tracker.
-        run_extra_steps(conn, budget, settings, wall_now())
+        # milestone 13: they get what is left of the run budget, so the whole run ends inside the unit's start timeout.
+        extra = run_extra_steps(conn, budget, settings, wall_now(), deadline=t0 + run_budget)
+        record_run(conn, now, stats, extra, time.perf_counter() - t0, run_budget)
     finally:
         conn.close()
     return 0
 
 
-def run_extra_steps(conn: sqlite3.Connection, budget: Budget, settings: Settings, now: float) -> dict[str, Any]:
+def run_extra_steps(conn: sqlite3.Connection, budget: Budget, settings: Settings, now: float, deadline: float | None = None) -> dict[str, Any]:
     """The milestone-12 steps of the track timer: `creator_stats` (fart/measure/creators.py) and the candle queue
-    (fart/measure/candles.py), each bounded per run and visible in `fart status`."""
+    (fart/measure/candles.py), each bounded per run and visible in `fart status`. `deadline` (perf_counter) is the end of the
+    whole run: the creator statistics get at most CREATOR_STATS_MAX_S of what is left, the candles the rest."""
     from . import candles, creators
 
     out: dict[str, Any] = {}
-    for name, fn in (("creator_stats", lambda: creators.update(conn, settings, now)), ("candles", lambda: candles.run(conn, budget, settings, now))):
+
+    def _left() -> float:
+        return float("inf") if deadline is None else max(0.0, deadline - time.perf_counter())
+
+    steps = (("creator_stats", lambda: creators.update(conn, settings, now, time_budget_s=max(5.0, min(CREATOR_STATS_MAX_S, _left() - 20.0)))),
+             ("candles", lambda: candles.run(conn, budget, settings, now, deadline=None if deadline is None else deadline - 5.0)))
+    for name, fn in steps:
+        t0 = time.perf_counter()
         try:
             out[name] = fn()
         except Exception as e:  # noqa: BLE001  one step must never take the tracker down
             log.error(f"track.{name}_failed", exc_info=True)
             db.record_failure(conn, f"measure.{name}_failed", now, detail=f"{type(e).__name__}: {str(e)[:150]}")
             out[name] = {"error": f"{type(e).__name__}: {str(e)[:120]}"}
+        if isinstance(out[name], dict):
+            out[name]["seconds"] = round(time.perf_counter() - t0, 2)
     return out
+
+
+def record_run(conn: sqlite3.Connection, now: float, stats: dict[str, Any], extra: dict[str, Any], total_s: float, run_budget_s: float) -> dict[str, Any]:
+    """kv `measure.track.last` (milestone 13): the step durations and counts of the run, for `fart status`."""
+    sampled = stats.get("sampled") or {}
+    seconds = dict(stats.get("seconds") or {})
+    for name in ("creator_stats", "candles"):
+        v = extra.get(name) or {}
+        if isinstance(v, dict) and v.get("seconds") is not None:
+            seconds[name] = v["seconds"]
+    seconds["total"] = round(total_s, 2)
+    rec = {"at": now, "seconds": seconds, "run_budget_s": run_budget_s, "over_budget": total_s > run_budget_s, "subjects": stats.get("subjects"),
+           "sampled": {k: sampled.get(k) for k in ("requested", "stored", "no_pair", "calls", "blocked", "errors", "skipped", "time_budget")} if sampled else None,
+           "skipped": stats.get("skipped"), "outcomes": stats.get("outcomes"), "paper": stats.get("paper"), "sol_usd_src": stats.get("sol_usd_src"),
+           "creator_stats": {k: (extra.get("creator_stats") or {}).get(k) for k in ("creators_updated", "stopped_early", "backlog_sources", "error")} if isinstance(extra.get("creator_stats"), dict) else None,
+           "candles": {k: (extra.get("candles") or {}).get(k) for k in ("due", "fetched", "candles", "errors", "blocked", "time_budget", "error")} if isinstance(extra.get("candles"), dict) else None}
+    try:
+        db.write_tx(conn, lambda c: db.kv_set(c, KV_LAST, json.dumps(rec, default=str), now), what="measure.track.last")
+    except Exception:  # noqa: BLE001  a status record must never fail the run
+        log.error("track.record_failed", exc_info=True)
+    if rec["over_budget"]:
+        log.warning("track.over_budget", total_s=round(total_s, 1), run_budget_s=run_budget_s, seconds=json.dumps(seconds))
+    else:
+        log.info("track.steps", **{k: v for k, v in seconds.items()})
+    return rec
+
+
+def last_run(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    raw = db.kv_get(conn, KV_LAST)
+    if not raw:
+        return None
+    try:
+        v = json.loads(raw)
+    except ValueError:
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def graduation_coverage_24h(conn: sqlite3.Connection, now: float, max_gap_s: float, min_age_s: float = 900.0, lag_s: float = 600.0) -> dict[str, Any]:
+    """The share of the graduations of the last 24 hours with a tracker sample at least every `max_gap_s` from the graduation
+    until now (minus one tracker interval, `lag_s`, so the gap that is still running does not count) or until the end of
+    their 24 h window: the coverage rule of the day and week reports, read live. Graduations younger than `min_age_s` are
+    left out (nothing to cover yet)."""
+    from .report import tracker_coverage
+
+    rows = conn.execute(f"SELECT mint, {ET} AS t FROM migrations WHERE received_at >= ? AND {ET} >= ? AND {ET} <= ?",
+                        (now - 86400 - 3600, now - 86400, now - min_age_s)).fetchall()
+    covered = 0
+    for r in rows:
+        t = float(r["t"])
+        end = min(t + 86400.0, now - lag_s)
+        if end <= t:
+            continue
+        if tracker_coverage(conn, str(r["mint"]), t, end, max_gap_s)["covered"]:
+            covered += 1
+    return {"graduations": len(rows), "covered": covered, "share": (covered / len(rows)) if rows else None, "max_gap_s": max_gap_s}

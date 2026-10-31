@@ -904,12 +904,50 @@ def _rowcls(rows: list[dict[str, Any]], mapping: dict[str, str]) -> list[dict[st
     return [{**r, "_class": mapping.get(str(r.get("_class") or ""), "")} for r in rows]
 
 
+HYP_COLS: list[Col] = [("id", "hypothese"), ("title", "titel", "wide"), ("variants", "varianten", "num"), ("groups_label", "groepen", "wide"), ("exits_label", "uitstappen", "wide"),
+                       ("last_selected", "gekozen variant"), ("last_verdict", "oordeel"), ("last_unknown_label", "onbekend", "num"), ("last_date_label", "laatste run")]
+RESEARCH_REPORT_COLS: list[Col] = [("name", "rapport", "wide"), ("kind_label", "soort"), ("days_label", "venster"), ("selected_label", "gekozen"), ("proven_label", "bewezen"),
+                                   ("variants_tested", "varianten getoetst", "num"), ("date_label", "gegenereerd")]
+
+
+def research_list_card(rs: dict[str, Any]) -> str:
+    """Milestone 13: `fart research list` on the owner page: the catalogue of pre-registered hypotheses and every report written."""
+    cat = [{**c, "id": Raw(f"<code>{esc(c['id'])}</code>" + (' <span class="muted">(ronde 2)</span>' if c.get("round") == 2 else ""))} for c in rs.get("catalogue") or []]
+    intro = (f'<p class="small muted">{esc(fmt_n(rs.get("hypotheses")))} vooraf vastgelegde hypotheses met samen {esc(fmt_n(rs.get("variants_total")))} varianten (`fart research list`); '
+             f'de wekelijkse run (maandag 07:00 UTC, fart-research.timer) schrijft out/research/&lt;dag&gt;-&lt;H&gt;.md|json en de autopsie. Een rapport met “niet bewezen” is een afgerond resultaat.</p>')
+    body = intro + "<h3>Hypotheses</h3>" + table(HYP_COLS, cat, empty="geen catalogus") + "<h3>Rapporten</h3>" + table(RESEARCH_REPORT_COLS, rs.get("reports") or [], empty="nog geen onderzoeksrapport")
+    return card("Onderzoek (fart research list)", body, anchor="onderzoek")
+
+
+def follow_card(fs: dict[str, Any]) -> str:
+    """Milestone 13: the follow step on the owner page: followed coins, polls, the CU share, the degradation, the last point."""
+    if not fs.get("exists"):
+        return card("Volgen van signalen", empty_state("nog geen followed-tabel (schema v10): start de plays-daemon één keer" if not fs.get("error") else f"niet leesbaar: {fs['error']}"), anchor="volgen")
+    by = fs.get("by_state") or {}
+    lp = fs.get("last_point") or {}
+    reasons = ", ".join(f"{k} {fmt_n(v)}" for k, v in sorted((fs.get("reasons") or {}).items(), key=lambda kv: -kv[1])) or "–"
+    items = [("gevolgde munten", f'{esc(fmt_n(fs.get("total")))} (actief {esc(fmt_n(by.get("active", 0)))}, gegradueerd {esc(fmt_n(by.get("graduated", 0)))}, klaar {esc(fmt_n(by.get("done", 0)))}, gesloten {esc(fmt_n(by.get("closed", 0)))})'),
+             ("redenen (actief en gegradueerd)", esc(reasons)),
+             ("polls vandaag", f'{esc(fmt_n(fs.get("polls_today")))} adressen in {esc(fmt_n(fs.get("calls_today")))} aanroepen, {esc(fmt_n(fs.get("points_today")))} punten'),
+             ("CU vandaag tegenover het eigen dagaandeel", f'{esc(fmt_n(round(float(fs.get("cu_today") or 0))))} van {esc(fmt_n(round(float(fs.get("share_cu") or 0))))}'),
+             ("degradatiestand", f'niveau {esc(fmt_n(fs.get("level")))} (snel interval {esc(fmt_n(fs.get("interval_s")))} s)' + (" · GEPAUZEERD: dagaandeel op" if fs.get("paused") else "")),
+             ("nu aan de beurt / boven de bovengrens", f'{esc(fmt_n(fs.get("due_now")))} / {esc(fmt_n(fs.get("over_cap")))}'),
+             ("laatste punt", (f'via {esc(lp.get("source"))}, {esc(fmt_n(lp.get("age_s")))} s geleden' if lp else "nog geen punt")),
+             ("fouten / geweigerd / ontbrekend vandaag", f'{esc(fmt_n(fs.get("errors_today")))} / {esc(fmt_n(fs.get("blocked_today")))} / {esc(fmt_n(fs.get("misses_today")))}'),
+             ("poll-punten in totaal", esc(fmt_n(fs.get("points_total")))),
+             ("gestart", esc(fmt_time(fs["started_at"])) if fs.get("started_at") else "nog niet")]
+    if fs.get("disabled_reason"):
+        items.append(("polls uitgeschakeld", esc(fs["disabled_reason"])))
+    state = "unknown" if fs.get("disabled_reason") else ("not_covered" if fs.get("paused") else "fresh")
+    return card("Volgen van signalen (mijlpaal 13)", kv(items), pill_html=pill(state, "polls uit" if fs.get("disabled_reason") else ("gepauzeerd" if fs.get("paused") else "volgt")), anchor="volgen")
+
+
 def owner_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
     st, cv, x, rp, wk, sv, lg = v["status"], v["coverage"], v["x"], v["report"], v["week"], v["settings"], v["logs"]
     note = f'<p class="notice">{esc(st["note"])}</p>' if st.get("note") else ""
     anchors = "".join(f'<a href="#{a}">{t}</a>' for a, t in (("gezondheid", "Gezondheid"), ("engine", "Engine-tick"), ("dekking", "Dekking"), ("beslissingen", "Beslissingen"), ("budgetten", "Budgetten"),
-                                                                 ("x", "X en planner"), ("rapport", "Rapporten"), ("weergaven", "Weergaven"), ("instellingen", "Instellingen"),
-                                                                 ("logboek", "Logboek")))
+                                                                 ("x", "X en planner"), ("rapport", "Rapporten"), ("onderzoek", "Onderzoek"), ("volgen", "Volgen"), ("weergaven", "Weergaven"),
+                                                                 ("instellingen", "Instellingen"), ("logboek", "Logboek")))
     head = (f'<section class="hero"><p class="eyebrow">Eigenaar</p><h1>Operationeel overzicht</h1><p class="lede">Alles wat de openbare pagina’s niet tonen: versheid van daemons en timers, budgetten, de X-planner, de instellingen en het logboek. Alleen-lezen, ook voor jou.</p>'
             f'<div class="hero-meta"><span>gegevens van {esc(st["generated_label"])}</span><span>schema {esc(fmt(st.get("schema_version")))}</span><span>rules_version {esc(st.get("rules_version"))}</span></div></section>'
             f'<nav class="owner-nav" aria-label="Secties">{anchors}</nav>{note}')
@@ -969,8 +1007,10 @@ def owner_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
                 + table(LOG_COLS, _rowcls(lg.get("rows") or [], {"errors": "is-stale"}), empty="geen logbestanden", widths=("15", "10", "20", "10", "10", "35")), anchor="logboek", live="eigenaar-logboek")
     views = views_card(v.get("views") or {})
     engine = engine_tick_card(st.get("engine_tick") or {})
-    return (head + f'<div class="grid grid-2 section owner">{health}{engine}{decisions}{budgets}{report}</div><div class="section owner">{coverage}</div>'
-            f'<div class="section owner">{xcard}</div><div class="section owner">{week}</div><div class="section owner">{reports_raw}</div>'
+    research = research_list_card(v.get("research") or {})
+    following = follow_card(v.get("follow") or {})
+    return (head + f'<div class="grid grid-2 section owner">{health}{engine}{decisions}{budgets}{report}{following}</div><div class="section owner">{coverage}</div>'
+            f'<div class="section owner">{xcard}</div><div class="section owner">{week}</div><div class="section owner">{research}</div><div class="section owner">{reports_raw}</div>'
             f'<div class="section owner">{views}</div><div class="section owner">{settings_card}</div><div class="section owner">{logs}</div>')
 
 
@@ -1105,10 +1145,11 @@ def plays_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
             f'<p class="lede">{esc(v.get("definition") or "")}</p>'
             f'<div class="hero-meta">{dpill}<span>{esc(fmt_n(v.get("active_rules", 0)))} actieve regel{"" if v.get("active_rules") == 1 else "s"}</span>'
             f'<span>papierpositie {esc(fmt_n(v.get("size_sol"), 2))} SOL, instap {esc(fmt_n(v.get("entry_delay_s"), 0))} s na het signaal</span><span>gegevens van {esc(v["generated_label"])}</span></div></section>')
+    research = research_card(v.get("research") or {})
     if not v.get("rules"):
         body = card("Nog niets bewezen", explain(esc(v.get("note") or "")) + empty_state("config/plays.json is leeg: de Plays-laag staat klaar en wacht op het eerste onderzoeksrapport met een bewezen variant."),
                     pill_html=pill("unknown", "leeg"), foot='<a href="/methode#begrip-observatie">Wat een observatie is</a><a href="/terminal">De Terminal</a>')
-        return hero + f'<div class="section" data-live="plays">{body}</div><div class="section">{warning_block(ctx.get("warning") or "")}</div>'
+        return hero + f'<div class="section" data-live="plays">{body}</div><div class="section">{research}</div><div class="section">{warning_block(ctx.get("warning") or "")}</div>'
     cards = ""
     for r in v.get("per_rule") or []:
         kpis = (kpi(r["pnl_sum_label"], "", "resultaat na kosten (gesloten)") + kpi(r["pnl_mean_label"], "", "gemiddeld per play") + kpi(r["live_hit_label"], "", "trefkans live")
@@ -1124,4 +1165,22 @@ def plays_page(ctx: dict[str, Any], v: dict[str, Any]) -> str:
     summary = card("Samenvatting", explain("Elke play is een papierpositie met dezelfde kosten als in het onderzoek: curvefee 1% per kant, priority fee, prijsimpact; na graduatie de PumpSwap-fee en de impact uit de liquiditeit. Onbekend = het prijspad eindigde vóór een uitstap; geen vulling = geen trade binnen 10 minuten na het signaal. Beide tellen nooit als resultaat.")
                    + f'<div class="kpi-row">{kpi(fmt_n(c.get("signals")), "", "signalen")}{kpi(fmt_n(c.get("open")), "", "open")}{kpi(fmt_n(c.get("closed")), "", "gesloten")}{kpi(fmt_n(c.get("unknown")), "", "onbekend")}{kpi(fmt_n(c.get("no_fill")), "", "geen vulling")}</div>',
                    pill_html=dpill)
-    return hero + f'<div class="section" data-live="plays">{summary}<div class="section">{cards}</div></div><div class="section">{warning_block(ctx.get("warning") or "")}</div>'
+    return hero + f'<div class="section" data-live="plays">{summary}<div class="section">{cards}</div></div><div class="section">{research}</div><div class="section">{warning_block(ctx.get("warning") or "")}</div>'
+
+
+RESEARCH_COLS: list[Col] = [("hypothesis", "hypothese"), ("title", "titel", "wide"), ("selected_label", "gekozen variant", "wide"), ("verdict_pill", "oordeel", "status"),
+                            ("unknown_label", "onbekend", "num"), ("cases", "gevallen", "num"), ("ev_label", "verwachte waarde", "num"), ("date_label", "datum")]
+
+
+def research_card(rs: dict[str, Any]) -> str:
+    """Milestone 13: the last research run per pre-registered hypothesis (the chosen variant, the verdict, the unknown share, the date)."""
+    rows = []
+    for r in rs.get("rows") or []:
+        kind = {"proven": "ok", "rejected": "fail", "none": "unknown"}.get(str(r.get("state")), "unknown")
+        rows.append({**r, "hypothesis": Raw(f"<code>{esc(r['hypothesis'])}</code>" + (' <span class="muted">(ronde 2)</span>' if r.get("round") == 2 else "")),
+                     "verdict_pill": Raw(pill(kind, r.get("verdict_label") or "onbekend")), "selected_label": r.get("selected_label") or (r.get("selected") or "–"),
+                     "_class": {"proven": "is-winner", "rejected": "", "none": "is-never"}.get(str(r.get("state")), "")})
+    intro = explain(esc(rs.get("definition") or ""))
+    body = intro + table(RESEARCH_COLS, rows, empty="nog geen onderzoeksrapport: de eerste run volgt de uitrol", widths=("9", "22", "24", "12", "8", "8", "9", "8"))
+    return card("Onderzoeksstand per hypothese", body, pill_html=pill("fresh" if rs.get("any") else "unknown", f"laatste run {rs.get('updated_label', '–')}" if rs.get("any") else "nog geen run"),
+                anchor="onderzoek", foot='<a href="/methode">De methode</a>')

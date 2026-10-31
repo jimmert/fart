@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from typing import Any
 
 from .. import db
@@ -121,15 +122,20 @@ class PriceFeed:
         return None, "none"
 
     # ----- market cap samples -------------------------------------------------------------------
-    def sample_mints(self, mints: list[str], sol_usd: float | None) -> dict[str, int]:
+    def sample_mints(self, mints: list[str], sol_usd: float | None, deadline: float | None = None) -> dict[str, int]:
         """Fetch DexScreener pairs for up to N mints per call and store one mcap_samples row per mint
         that has a pair. Mints without a pair are counted (not stored: unknown stays unknown). `skipped`
         counts the mints no call was made for (the gate blocked the source: the rest of the run is skipped)
-        or whose call failed (milestone 5: the tracker books them in `measure.track.skipped`)."""
+        or whose call failed (milestone 5: the tracker books them in `measure.track.skipped`). Milestone 13:
+        `deadline` (a `time.perf_counter()` value) bounds the step; the mints left when it passes are counted
+        in `time_budget` and skipped, so the run stays inside the timer unit's start timeout."""
         batch = int(self.cfg["sampling"].get("dexscreener_batch", 30))
-        stats = {"requested": len(mints), "stored": 0, "no_pair": 0, "calls": 0, "blocked": 0, "errors": 0, "skipped": 0}
+        stats = {"requested": len(mints), "stored": 0, "no_pair": 0, "calls": 0, "blocked": 0, "errors": 0, "skipped": 0, "time_budget": 0}
         for i in range(0, len(mints), batch):
             chunk = mints[i:i + batch]
+            if deadline is not None and time.perf_counter() > deadline:
+                stats["time_budget"] += len(mints) - i
+                break
             try:
                 pairs = request_json(self.budget, "dexscreener", "tokens", DEXSCREENER_TOKENS + ",".join(chunk))
             except Blocked:

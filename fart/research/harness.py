@@ -10,10 +10,13 @@ What a run does, for one hypothesis over a window of UTC days:
    that tick (`features.knowable` -> `features.replay_features`, the bundle flags, the creator's sells, the creator's
    history when the hypothesis needs it). The first tick at which a variant fires is its signal for that coin; one signal
    per coin per variant.
-3. **Execution**: `paper.Position` on the coin's price path from the signal on (curve points from the trades, the
-   graduation point, DexScreener samples and GeckoTerminal candles after it): the fill `entry_delay_s` after the signal
-   on the first point then, the exits of the variant, every cost. A path that ends without an exit is an UNKNOWN
-   outcome; a signal without a point to fill on within ten minutes is NO FILL. Both are counted apart, never as a result.
+3. **Execution**: `paper.Position` on the coin's price path from the signal on (curve points from the trades, since
+   milestone 13 the polls of the BondingCurve account between the trades (`path_points`, kind "poll": the curve is always
+   the counterparty, so an entry or an exit may fill on one; a dev sell is only visible on a trade point), the graduation
+   point, DexScreener samples and GeckoTerminal candles after it): the fill `entry_delay_s` after the signal on the first
+   point then, the exits of the variant, every cost. A path that ends without an exit is an UNKNOWN outcome; a signal
+   without a point to fill on within ten minutes is NO FILL. Both are counted apart, never as a result; their meaning did
+   not change with the polls, only the paths got longer.
 4. **Metrics** per variant: expected value per trade (SOL and % of the size), hit rate, median, p10, p90, maximum drawdown of
    the equity curve, cases, the 95% block-bootstrap interval of the mean with the UTC days as blocks (fixed seed), the
    lead time (signal to the peak within 24 h), the capacity (SOL until 5% impact at the signal), the unknown share.
@@ -84,6 +87,8 @@ class RunConfig:
     sizes_sol: tuple[float, ...] = (0.1, 0.5, 1.0)
     creator_prior_cap: int = 50
     variants: list[str] | None = None     # restrict the grid (tests, sensitivity runs)
+    days_requested: int | None = None     # milestone 13: the weekly run asks for 30 days and gets what the database has; the report says so
+    window_note: str | None = None
 
     @classmethod
     def from_settings(cls, settings: Settings, hypothesis: str, days: list[str], **overrides: Any) -> "RunConfig":
@@ -116,7 +121,8 @@ class Coin:
     pool: str | None = None
     samples: list[dict[str, Any]] = field(default_factory=list)
     candles: list[dict[str, Any]] = field(default_factory=list)
-    paths: dict[float, list[PricePoint]] = field(default_factory=dict, repr=False)   # price_path per signal time (the exits of one entry share it)
+    points: list[rf.PollPoint] = field(default_factory=list)                        # milestone 13: the polls of the curve account (path_points)
+    paths: dict[Any, list[PricePoint]] = field(default_factory=dict, repr=False)      # price_path per (signal time, with polls) (the exits of one entry share it)
 
 
 @dataclass
@@ -147,6 +153,10 @@ class Case:
     name: str | None = None
     symbol: str | None = None
     features: dict[str, Any] = field(default_factory=dict)
+    entry_kind: str | None = None     # milestone 13: the kind of the point the entry filled on (curve | poll | sample | candle)
+    exit_kind: str | None = None      # ... and the final exit
+    curve_source: str | None = None   # H2: the state the crossing was seen on (trade | poll)
+    post_follow: bool | None = None   # the signal fell after the follow step started (its path could have polls); None when unknown
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -229,6 +239,7 @@ def metrics(cases: list[Case], cfg: RunConfig, with_ci: bool = True) -> dict[str
         "hold_median_s": _quantile(holds, 0.5),
         "fees_mean_sol": (sum(c.fees_sol for c in known) / n) if n else None,
         "exit_reasons": _count(c.exit_reason for c in known),
+        "fill_sources": {"entry": _count(c.entry_kind for c in cases if c.entry_kind is not None), "exit": _count(c.exit_kind for c in known if c.exit_kind is not None)},
         "days": sorted({c.day for c in cases}),
     }
     if with_ci:
@@ -282,6 +293,7 @@ def load_coin(conn: sqlite3.Connection, mint: str, with_path: bool = True) -> Co
         c.samples = [dict(s) for s in conn.execute("SELECT ts, mcap_usd, fdv_usd, liquidity_usd, sol_usd, json FROM mcap_samples WHERE mint=? ORDER BY ts", (mint,))]
         if c.pool and _table_exists(conn, "pool_candles"):
             c.candles = [dict(x) for x in conn.execute("SELECT minute, open, high, low, close, volume_usd FROM pool_candles WHERE pool=? ORDER BY minute", (c.pool,))]
+    c.points = rf.load_points(conn, mint)   # milestone 13: the polls are part of the state a live tick sees, so they load with or without the path
     return c
 
 
@@ -320,22 +332,45 @@ def sample_volume_h1(s: dict[str, Any]) -> float | None:
     return None if v is None else float(v)
 
 
-def price_path(coin: Coin, from_t: float) -> list[PricePoint]:
+def graduation_time(coin: Coin) -> float | None:
+    """The graduation as the path knows it: the migration when the stream saw it, else (milestone 13) the first poll of the
+    BondingCurve account that found `complete` (the stream missed the migration; the poll's time is an upper bound)."""
+    if coin.grad_t is not None:
+        return coin.grad_t
+    for p in coin.points:
+        if p.complete:
+            return p.t
+    return None
+
+
+def price_path(coin: Coin, from_t: float, include_polls: bool = True) -> list[PricePoint]:
     """The realised price path of a coin from `from_t` on: curve points from the trades with reserves (the creator's sells
-    flagged), the graduation point (the last curve state before the migration), then the tracker samples and the candles
-    after the graduation. Sorted by time; the future relative to the signal is what a position lives through."""
+    flagged), the polls of the curve account between them (kind "poll", milestone 13; `include_polls=False` gives the path
+    the stream alone would have given), the graduation point (the last curve state before the migration, or before the poll
+    that found the curve complete), then the tracker samples and the candles after the graduation. Sorted by time; the
+    future relative to the signal is what a position lives through."""
     pts: list[PricePoint] = []
-    last_curve: rf.Trade | None = None
+    grad_t = graduation_time(coin)
+    last_state: tuple[float, int, int] | None = None   # (t, virtual_sol, virtual_token) of the last curve state before the graduation
     for x in coin.trades:
         if not (x.virtual_sol and x.virtual_token):
             continue
-        if coin.grad_t is not None and x.t > coin.grad_t:
+        if grad_t is not None and x.t > grad_t:
             continue
-        last_curve = x
+        if last_state is None or x.t >= last_state[0]:
+            last_state = (x.t, int(x.virtual_sol), int(x.virtual_token))
         if x.t >= from_t:
             pts.append(PricePoint(x.t, "curve", x.virtual_sol, x.virtual_token, dev_sell=(not x.is_buy and x.buyer is not None and x.buyer == coin.creator)))
-    if coin.grad_t is not None and last_curve is not None and coin.grad_t >= from_t:
-        pts.append(PricePoint(coin.grad_t, "curve", last_curve.virtual_sol, last_curve.virtual_token, graduation=True))
+    if include_polls:
+        for p in coin.points:
+            if not p.has_state or (grad_t is not None and p.t > grad_t):
+                continue
+            if last_state is None or p.t >= last_state[0]:
+                last_state = (p.t, int(p.virtual_sol), int(p.virtual_token))
+            if p.t >= from_t:
+                pts.append(PricePoint(p.t, "poll", p.virtual_sol, p.virtual_token))
+    if grad_t is not None and last_state is not None and grad_t >= from_t:
+        pts.append(PricePoint(grad_t, "curve", last_state[1], last_state[2], graduation=True))
     if coin.grad_t is not None:
         sol_usd_ref: float | None = None
         liq_ref: float | None = None
@@ -355,7 +390,7 @@ def price_path(coin: Coin, from_t: float) -> list[PricePoint]:
                 if t < coin.grad_t or t < from_t or cd.get("close") is None:
                     continue
                 pts.append(PricePoint(t, "candle", price_sol=float(cd["close"]) / sol_usd_ref, liquidity_sol=liq_ref))
-    pts.sort(key=lambda p: (p.t, 0 if p.kind == "curve" else 1))
+    pts.sort(key=lambda p: (p.t, {"curve": 0, "poll": 1}.get(p.kind, 2)))
     return pts
 
 
@@ -391,20 +426,26 @@ class Harness:
         self.coins_per_hour: dict[str, int] = {}
         self.sol_trend_cache: dict[str, str] = {}
         self.stats: dict[str, Any] = {"coins_considered": 0, "coins_with_trades": 0, "coins_prefiltered": 0, "coins_evaluated": 0, "ticks": 0,
-                                      "signals": 0, "seconds": None, "theme_decisions": 0, "graduations": 0}
+                                      "signals": 0, "seconds": None, "theme_decisions": 0, "graduations": 0, "signals_with_polls": 0}
+        self.follow_started_at = follow_started_at(conn)
+        self.has_points = _table_exists(conn, "path_points")
 
     # ----- candidates -----------------------------------------------------------------------------------------------------
     def candidate_mints(self) -> list[str]:
         h = self.hyp
         if h.id == "H3":
             return sorted(self.theme_roles().keys())
-        if h.id == "H6":
+        if h.id == "H6" or h.post_graduation:
             return [str(r[0]) for r in self.conn.execute(f"SELECT mint FROM migrations WHERE {ET} >= ? AND {ET} < ? ORDER BY {ET}", (self.start, self.end))]
         if h.id == "H2":
-            # coins whose curve passed 75 SOL (virtual 105 SOL) inside the window
+            # coins whose curve passed 75 SOL (virtual 105 SOL) inside the window, seen on a trade or (milestone 13) on a poll
             rows = self.conn.execute("SELECT DISTINCT mint FROM trades WHERE received_at >= ? AND received_at < ? AND virtual_sol >= ?",
                                      (self.start - 60, self.end + 60, int((30.0 + hyps.H2_CROSS_SOL) * 1e9))).fetchall()
-            return sorted(str(r[0]) for r in rows)
+            mints = {str(r[0]) for r in rows}
+            if self.has_points:
+                mints.update(str(r[0]) for r in self.conn.execute("SELECT DISTINCT mint FROM path_points WHERE t >= ? AND t < ? AND virtual_sol >= ?",
+                                                                  (self.start - 60, self.end + 60, int((30.0 + hyps.H2_CROSS_SOL) * 1e9))))
+            return sorted(mints)
         # new coins of the window that have trades
         with_trades = {str(r[0]) for r in self.conn.execute("SELECT DISTINCT mint FROM trades WHERE received_at >= ? AND received_at < ?", (self.start - 60, self.end + 3600))}
         rows = self.conn.execute(f"SELECT mint FROM coins WHERE {ET} >= ? AND {ET} < ? ORDER BY {ET}", (self.start, self.end)).fetchall()
@@ -495,16 +536,20 @@ class Harness:
         pending = {v.id: v for v in self.variants}
         if h.id == "H6":
             return self._signals_h6(coin, pending)
+        if h.post_graduation:
+            return self._signals_post_grad(coin, pending)
         if h.id == "H3":
             role = self.theme_roles().get(coin.mint)
             if role is None:
                 return out
             ticks = [float(role["signal_t"])]
         elif h.id == "H2":
-            first_hi = next((x.t for x in coin.trades if x.virtual_sol and x.virtual_sol >= int((30.0 + 70.0) * 1e9)), None)
+            hi = int((30.0 + 70.0) * 1e9)
+            first_hi = min([x.t for x in coin.trades if x.virtual_sol and x.virtual_sol >= hi] + [p.t for p in coin.points if p.has_state and p.virtual_sol >= hi], default=None)
             if first_hi is None:
                 return out
-            until = coin.grad_t if coin.grad_t is not None else (coin.trades[-1].t if coin.trades else first_hi)
+            last_seen = max([coin.trades[-1].t if coin.trades else first_hi] + [p.t for p in coin.points if p.has_state])   # the polls extend what the stream saw
+            until = coin.grad_t if coin.grad_t is not None else last_seen
             ticks = rf.tick_times(first_hi - self.cfg.tick_s, min(until + self.cfg.tick_s, first_hi + 6 * 3600), self.cfg.tick_s, self.cfg.tick_s)
         else:
             until = coin.created_t + h.horizon_s
@@ -522,9 +567,10 @@ class Harness:
             if h.id != "H3" and not kn:
                 f_prev, prev_t = None, t
                 continue
-            f = rf.replay_features(kn, t, coin.created_t, self.params)
+            f = self._features_at(coin, kn, t)
             if prev_t is not None and f_prev is None and h.id in ("H1", "H2"):
-                f_prev = rf.replay_features(rf.knowable(coin.trades, prev_t), prev_t, coin.created_t, self.params) if rf.knowable(coin.trades, prev_t) else None
+                kn_prev = rf.knowable(coin.trades, prev_t)
+                f_prev = self._features_at(coin, kn_prev, prev_t) if kn_prev else None
             bundle = rf.bundle_flags(kn, t, coin.created_t, coin.dev_buy_sol, coin.slot, graduation_sol=self.params.graduation_real_sol / self.params.sol_unit, creator=coin.creator)
             dev = rf.dev_sell(kn, t, coin.created_t, coin.creator, self.dev_sell_window_s)
             graduated = coin.grad_t is not None and coin.grad_t <= t
@@ -547,6 +593,14 @@ class Harness:
             f_prev, prev_t = f, t
         return out
 
+    def _features_at(self, coin: Coin, kn: list[rf.Trade], t: float) -> dict[str, Any]:
+        """The replay features at `t`; with polls of the curve account (milestone 13) the newer of the last trade and the last
+        poll carries the curve state (`curve_source` says which), so H2 may see its crossing on a poll."""
+        f = rf.replay_features(kn, t, coin.created_t, self.params)
+        if coin.points:
+            rf.apply_poll_state(f, coin.points, t, self.params)
+        return f
+
     def _signals_h6(self, coin: Coin, pending: dict[str, hyps.Variant]) -> dict[str, tuple[float, dict[str, Any]]]:
         out: dict[str, tuple[float, dict[str, Any]]] = {}
         if coin.grad_t is None or not (self.start <= coin.grad_t < self.end):
@@ -567,13 +621,103 @@ class Harness:
                 out[vid] = (t, {**f, "sample": sample})
         return out
 
+    def _signals_post_grad(self, coin: Coin, pending: dict[str, hyps.Variant]) -> dict[str, tuple[float, dict[str, Any]]]:
+        """Milestone 13 (H8-H10): one tick per minute after the graduation on the post-graduation path (candles, samples), with the
+        price as the last point at or before the tick, the peak since the graduation, the drawdown from it, the volume since the
+        graduation (candles, else the sample's pool volume) and of the last five minutes (candles only), the creator's sells on
+        the curve up to the graduation and, for H10, the theme role by graduation order. Nothing is interpolated."""
+        out: dict[str, tuple[float, dict[str, Any]]] = {}
+        h = self.hyp
+        if coin.grad_t is None or not (self.start <= coin.grad_t < self.end):
+            return out
+        path = price_path(coin, coin.grad_t)
+        grad_pt = next((p for p in path if p.graduation), None)
+        grad_price = grad_pt.spot(self.params) if grad_pt is not None else None
+        if grad_price is None:
+            return out
+        post = [(p.t, p.spot(self.params)) for p in path if p.t > coin.grad_t and p.spot(self.params) is not None]
+        candles = sorted(((float(c["minute"]), c.get("volume_usd")) for c in coin.candles if c.get("minute") is not None and float(c["minute"]) >= coin.grad_t - 60), key=lambda x: x[0])
+        samples = sorted(((float(s["ts"]), sample_volume_h1(s)) for s in coin.samples if float(s["ts"]) >= coin.grad_t), key=lambda x: x[0])
+        dev_sold = any(x.t <= coin.grad_t and not x.is_buy and x.buyer is not None and x.buyer == coin.creator for x in coin.trades)
+        role = self.theme_grad_roles().get(coin.mint) if h.needs_theme else None
+        if h.needs_theme and role is None:
+            return out
+        self.stats["graduations"] += 1
+        minutes = int(h.post_grad_horizon_s // 60)
+        for k in range(1, minutes + 1):
+            t = coin.grad_t + 60.0 * k
+            if t < self.start or t >= self.end + 86400:
+                continue
+            self.stats["ticks"] += 1
+            seen = [(pt, sp) for pt, sp in post if pt <= t]
+            price = seen[-1][1] if seen else grad_price
+            peak = max([grad_price] + [sp for _, sp in seen])
+            vol_c = [v for m, v in candles if m + 60.0 <= t and v is not None] if candles else None
+            vol_since = sum(vol_c) if vol_c else None
+            if vol_since is None and samples:
+                last_s = [v for ts, v in samples if ts <= t and v is not None]
+                vol_since = last_s[-1] if last_s else None
+            vol_5m = sum(v for m, v in candles if m + 60.0 <= t and m + 60.0 > t - 300.0 and v is not None) if candles and any(m + 60.0 <= t for m, _ in candles) else None
+            f = {"as_of": t, "age_s": round(t - coin.created_t, 1), "minutes_after_graduation": round((t - coin.grad_t) / 60.0, 3), "price_sol": price, "grad_price_sol": grad_price,
+                 "peak_since_graduation_sol": peak, "drawdown_from_peak": None if not peak else round(1.0 - price / peak, 4), "points_since_graduation": len(seen),
+                 "volume_since_graduation_usd": vol_since, "volume_5m_usd": vol_5m, "dev_sold_before_graduation": dev_sold, "theme_role": role.get("role") if role else None,
+                 "has_candles": bool(candles)}
+            ctx = hyps.Ctx(coin.mint, coin.created_t, t, f, None, {}, {}, True, coin.grad_t, None, role, None, grad_price, int(time.gmtime(t).tm_hour))
+            for vid in list(pending):
+                try:
+                    fired = bool(h.fires(pending[vid], ctx))
+                except Exception:  # noqa: BLE001
+                    log.error("research.predicate_failed", hypothesis=h.id, variant=vid, mint=coin.mint, exc_info=True)
+                    fired = False
+                if fired:
+                    out[vid] = (t, {**f, "theme": role})
+                    del pending[vid]
+            if not pending:
+                break
+        return out
+
+    def theme_grad_roles(self) -> dict[str, dict[str, Any]]:
+        """H10: mint -> {role: leader | copy, term, decision_as_of} by graduation order: of the coins that carry a theme's word (the
+        coins of the window before the observation and the copies up to two hours after it) the first to graduate is the leader,
+        every later graduation of the same theme a copy. The first theme a coin belongs to wins."""
+        if getattr(self, "_grad_roles", None) is not None:
+            return self._grad_roles
+        from ..engine.meta import load_stopwords, tokenize
+
+        ecfg = self.settings.config("engine")
+        mcfg = ecfg.get("meta") or {}
+        window_s = float(mcfg.get("window_s", 10800))
+        min_len = int(mcfg.get("min_token_len", 4))
+        stop = load_stopwords(self.settings.config("stopwords"))
+        roles: dict[str, dict[str, Any]] = {}
+        decs = self.conn.execute("SELECT term, as_of FROM decisions WHERE kind='observe_meta' AND verdict='observe' AND as_of >= ? AND as_of < ? ORDER BY as_of",
+                                 (self.start - window_s, self.end)).fetchall()
+        seen_terms: set[str] = set()
+        for d in decs:
+            term, as_of = str(d["term"]), float(d["as_of"])
+            if term in seen_terms:
+                continue
+            seen_terms.add(term)
+            grads = []
+            for r in self.conn.execute(f"SELECT c.mint, c.name, c.symbol, {ET.replace('block_time', 'm.block_time').replace('received_at', 'm.received_at')} AS gt FROM coins c"
+                                       f" JOIN migrations m ON m.mint = c.mint WHERE COALESCE(c.block_time, c.received_at) > ? AND COALESCE(c.block_time, c.received_at) <= ? ORDER BY gt",
+                                       (as_of - window_s, as_of + 7200.0)):
+                if term in tokenize(r["name"], r["symbol"], stop, min_len):
+                    grads.append((str(r["mint"]), float(r["gt"])))
+            for i, (mint, gt) in enumerate(grads):
+                if mint not in roles:
+                    roles[mint] = {"role": "leader" if i == 0 else "copy", "term": term, "decision_as_of": as_of, "graduated_t": gt}
+        self._grad_roles = roles
+        return roles
+
     def execute(self, coin: Coin, variant: hyps.Variant, signal_t: float, feats: dict[str, Any], entry_delay_s: float | None = None,
-                size_sol: float | None = None) -> Case:
+                size_sol: float | None = None, include_polls: bool = True) -> Case:
         delay = self.cfg.entry_delay_s if entry_delay_s is None else float(entry_delay_s)
         size = self.cfg.size_sol if size_sol is None else float(size_sol)
-        path = coin.paths.get(signal_t)
+        key = (signal_t, bool(include_polls))
+        path = coin.paths.get(key)
         if path is None:
-            path = coin.paths[signal_t] = price_path(coin, signal_t)
+            path = coin.paths[key] = price_path(coin, signal_t, include_polls=include_polls)
         pos = Position(signal_t, size, self.params, variant.rules, self.cfg.costs, delay, self.cfg.exit_delay_s if self.cfg.exit_delay_s is not None else delay, MAX_ENTRY_WAIT_S)
         pos.feed_all(path)
         status = "closed" if pos.status == "closed" else ("no_fill" if pos.status == "no_fill" else "unknown")
@@ -584,13 +728,16 @@ class Harness:
         cap = capacity_sol(CurveState(int(vs), int(vt)), self.params) if vs and vt else None
         compact = {k: feats.get(k) for k in ("unique_buyers_5m", "net_sol_5m", "largest_buyer_share_15m", "dev_buy_frac_of_curve", "bundled_any", "bundle_reasons",
                                              "dev_first_sell_t", "mcap_sol", "graduation_progress", "curve_sol", "trades_total", "creator_track_record",
-                                             "creator_graduations", "creator_winners", "theme", "volume_h1_usd") if k in feats}
+                                             "creator_graduations", "creator_winners", "theme", "volume_h1_usd", "curve_source", "minutes_after_graduation",
+                                             "drawdown_from_peak", "volume_since_graduation_usd", "volume_5m_usd", "dev_sold_before_graduation", "theme_role") if k in feats}
+        last_sell = next((f for f in reversed(pos.fills) if f.kind == "sell"), None) if status == "closed" else None
         return Case(variant.id, variant.group, coin.mint, day_key(signal_t), signal_t, int(time.gmtime(signal_t).tm_hour), status, pos.pnl_sol, pos.pnl_pct,
                     pos.exit_reason, round(pos.fees_sol, 9), entry_spot, entry.fill_price if entry else None, entry.impact if entry else None,
                     entry.venue if entry else None, None if peak_t is None else round(peak_t - signal_t, 1),
                     None if peak is None or not entry_spot else round(peak / entry_spot - 1.0, 4), None if cap is None else round(cap, 4),
                     pos.exit_t, None if pos.exit_t is None or entry is None else round(pos.exit_t - entry.t, 1), self._sol_trend(signal_t), self._coins_in_hour(signal_t),
-                    coin.name, coin.symbol, compact)
+                    coin.name, coin.symbol, compact, entry.point_kind if entry else None, last_sell.point_kind if last_sell else None, feats.get("curve_source"),
+                    None if self.follow_started_at is None else signal_t >= self.follow_started_at)
 
     def prefilter(self, coin: Coin) -> bool:
         """Cheap necessary conditions per hypothesis so most coins skip the tick replay (a coin that never meets them cannot fire)."""
@@ -602,6 +749,8 @@ class Harness:
             buyers = {x.buyer for x in early if x.is_buy and x.buyer}
             need = min(int(v.entry.get("min_buyers", 0)) for v in self.variants) if self.variants else 0
             return len(buyers) >= need
+        if h.post_graduation:
+            return coin.grad_t is not None
         return bool(coin.trades) or h.id == "H6"
 
     def run(self) -> dict[str, Any]:
@@ -654,7 +803,8 @@ class Harness:
             test = metrics([c for c in cs if c.day in test_set], self.cfg)
             verdict = proven_verdict(test, self.cfg) if test_days else {"proven": False, "criteria": [], "note": "geen toetshelft: te weinig dagen voor een walk-forward"}
             rows.append({"variant": v.id, "label": v.label_nl, "group": v.group, "exit": v.exit, "exit_label": hyps.EXIT_LABELS_NL.get(v.exit, v.exit),
-                         "exit_rules": v.rules.to_dict(), "exit_text": v.rules.describe_nl(), "entry": dict(v.entry), "full": full, "selection": sel, "test": test, "verdict": verdict})
+                         "exit_rules": v.rules.to_dict(), "exit_text": v.rules.describe_nl(), "entry": dict(v.entry), "full": full, "selection": sel, "test": test, "verdict": verdict,
+                         "follow_split": self.follow_split(cs)})
         # the walk-forward choice: the best expected value on the selection half among variants with enough cases there
         eligible = [r for r in rows if int(r["selection"].get("cases") or 0) >= self.cfg.min_select_cases and r["selection"].get("ev_sol") is not None]
         selected = max(eligible, key=lambda r: float(r["selection"]["ev_sol"])) if eligible else None
@@ -677,7 +827,8 @@ class Harness:
                        "bootstrap": {"draws": self.cfg.draws, "seed": self.cfg.seed, "alpha": self.cfg.alpha},
                        "proven": {"min_cases": self.cfg.min_cases, "max_unknown_share": self.cfg.max_unknown_share, "min_lead_s": self.cfg.min_lead_s},
                        "min_select_cases": self.cfg.min_select_cases, "variants_tested": len(self.variants), "variants_in_grid": len(self.hyp.variants),
-                       "limit_coins": self.cfg.limit_coins},
+                       "limit_coins": self.cfg.limit_coins, "days_requested": self.cfg.days_requested, "window_note": self.cfg.window_note,
+                       "follow_started_at": self.follow_started_at, "poll_points_in_window": self.poll_points_in_window()},
             "variants": rows,
             "selected": None if selected is None else selected["variant"],
             "selected_proven": bool(selected and selected["verdict"].get("proven")),
@@ -696,6 +847,22 @@ class Harness:
             out["conditioning"] = self.conditioning(sel_cases)
             out["sensitivity"] = self.sensitivity(selected["variant"])
         return out
+
+    def follow_split(self, cases: list[Case]) -> dict[str, Any] | None:
+        """Milestone 13: the signals before and after the follow step started (kv `follow.started_at`), with their unknown shares;
+        older signals never get a path with hindsight, so the two halves are the honest comparison. None before the first run."""
+        if self.follow_started_at is None:
+            return None
+        out: dict[str, Any] = {"since": self.follow_started_at}
+        for key, sel in (("before", [c for c in cases if c.post_follow is False]), ("after", [c for c in cases if c.post_follow])):
+            m = metrics(sel, self.cfg, with_ci=False)
+            out[key] = {k: m.get(k) for k in ("signals", "cases", "unknown", "no_fill", "unknown_share", "ev_sol", "hit_rate", "fill_sources")}
+        return out
+
+    def poll_points_in_window(self) -> int | None:
+        if not self.has_points:
+            return None
+        return int(self.conn.execute("SELECT COUNT(*) FROM path_points WHERE t >= ? AND t < ?", (self.start, self.end + 86400)).fetchone()[0])
 
     def conditioning(self, cases: list[Case]) -> dict[str, Any]:
         peak = set(self.cfg.peak_hours_utc)
@@ -741,7 +908,13 @@ class Harness:
             m = metrics(cs, self.cfg, with_ci=False)
             impacts = sorted(float(c.entry_impact) for c in cs if c.entry_impact is not None)
             sizes.append({"size_sol": s, **{k: m.get(k) for k in ("cases", "ev_sol", "ev_pct", "hit_rate")}, "entry_impact_median": _quantile(impacts, 0.5)})
-        return {"entry_delay": delays, "size": sizes}
+        # milestone 13: the same signals on the path the stream alone gives (no poll points), so what the polls change is visible
+        sources = []
+        for label, with_polls in (("alle punten (trades, polls, samples, candles)", True), ("alleen trade-punten (zonder polls)", False)):
+            cs = [self.execute(coin, v, t, f, include_polls=with_polls) for coin, _, t, f in sigs]
+            m = metrics(cs, self.cfg, with_ci=False)
+            sources.append({"label": label, "include_polls": with_polls, **{k: m.get(k) for k in ("signals", "cases", "unknown", "no_fill", "unknown_share", "ev_sol", "ev_pct", "hit_rate", "median_pct", "fill_sources")}})
+        return {"entry_delay": delays, "size": sizes, "sources": sources}
 
 
 def creator_history_capped(conn: sqlite3.Connection, coin: Coin, as_of: float, method_version: str, h24: int, dev_sell_window_s: float, cap: int) -> dict[str, Any]:
@@ -786,6 +959,20 @@ def creator_history_capped(conn: sqlite3.Connection, coin: Coin, as_of: float, m
     return out
 
 
+def follow_started_at(conn: sqlite3.Connection) -> float | None:
+    """When the follow step first ran (kv `follow.started_at`, milestone 13), else the first poll point; None without either."""
+    try:
+        raw = conn.execute("SELECT value FROM kv WHERE key='follow.started_at'").fetchone()
+        if raw is not None and raw[0]:
+            return float(raw[0])
+        if _table_exists(conn, "path_points"):
+            r = conn.execute("SELECT MIN(t) FROM path_points").fetchone()
+            return None if r is None or r[0] is None else float(r[0])
+    except (sqlite3.OperationalError, TypeError, ValueError):
+        return None
+    return None
+
+
 def run_hypothesis(conn: sqlite3.Connection, settings: Settings, hypothesis: str, days: list[str], **overrides: Any) -> dict[str, Any]:
     cfg = RunConfig.from_settings(settings, hypothesis, days, **overrides)
     return Harness(conn, settings, cfg).run()
@@ -797,5 +984,5 @@ def window_days(end_day: str, days: int) -> list[str]:
     return wd(end_day, days)
 
 
-__all__ = ["RunConfig", "Harness", "Case", "Coin", "metrics", "bootstrap_mean", "proven_verdict", "price_path", "run_hypothesis", "window_days",
-           "max_drawdown", "load_coin"]
+__all__ = ["RunConfig", "Harness", "Case", "Coin", "metrics", "bootstrap_mean", "proven_verdict", "price_path", "graduation_time", "run_hypothesis", "window_days",
+           "max_drawdown", "load_coin", "follow_started_at"]

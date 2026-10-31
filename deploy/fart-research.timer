@@ -1,0 +1,11 @@
+[Unit]
+Description=Run fart research weekly on Monday 07:00 UTC (every hypothesis over 30 days, or the days the database has, and the autopsy)
+
+[Timer]
+OnCalendar=Mon *-*-* 07:00:00 UTC
+Persistent=true
+AccuracySec=5min
+Unit=fart-research.service
+
+[Install]
+WantedBy=timers.target

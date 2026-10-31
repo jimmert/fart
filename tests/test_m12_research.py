@@ -257,9 +257,9 @@ def test_walk_forward_split_and_the_pre_registered_catalogue(lab):
     assert rh.Harness(lab["conn"], lab["settings"], rh.RunConfig.from_settings(lab["settings"], "H2", DAYS)).split_days() == (DAYS[:2], DAYS[2:])
     assert rh.Harness(lab["conn"], lab["settings"], rh.RunConfig.from_settings(lab["settings"], "H2", DAYS[:1])).split_days() == (DAYS[:1], [])
     assert rh.window_days("2026-10-23", 4) == DAYS
-    assert hyps.ORDER == ["H4", "H5", "H1", "H3", "H7", "H2", "H6"] and len(hyps.HYPOTHESES) == 7
+    assert hyps.ORDER[:7] == ["H4", "H5", "H1", "H3", "H7", "H2", "H6"] and hyps.ORDER[7:] == ["H8", "H9", "H10"] and len(hyps.HYPOTHESES) == 10   # milestone 13 adds the second round after the seven
     counts = {hid: len(hyps.get(hid).variants) for hid in hyps.ORDER}
-    assert counts == {"H4": 12, "H5": 18, "H1": 81, "H3": 12, "H7": 7, "H2": 9, "H6": 6} and sum(counts.values()) == 145
+    assert {k: v for k, v in counts.items() if k in hyps.ORDER[:7]} == {"H4": 12, "H5": 18, "H1": 81, "H3": 12, "H7": 7, "H2": 9, "H6": 6} and sum(counts[k] for k in hyps.ORDER[:7]) == 145
     for hid in hyps.ORDER:
         hyp = hyps.get(hid)
         assert hyp.title_nl and hyp.statement_nl and hyp.scope_nl and hyp.expectation_nl, hid
@@ -270,7 +270,7 @@ def test_walk_forward_split_and_the_pre_registered_catalogue(lab):
     assert [c["id"] for c in cat] == hyps.ORDER and all(c["variants"] == counts[c["id"]] for c in cat)
     assert hyps.get("H4").needs_creator and hyps.get("H3").needs_theme and hyps.get("H6").post_graduation
     with pytest.raises(KeyError):
-        hyps.get("H9")
+        hyps.get("H99")
     # H2 fires on the crossing itself (the previous tick under 75 SOL, this one at or above), once, never after graduation
     v = hyps.get("H2").variant("m5_ts5")
     ctx = hyps.Ctx("m", 0.0, 600.0, {"curve_sol": 76.0, "net_sol_5m": 8.0}, {"curve_sol": 70.0}, {}, {}, False)

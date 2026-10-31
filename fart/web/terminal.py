@@ -149,6 +149,8 @@ class TerminalFeed:
         self.plays_rows: list[dict[str, Any]] = []
         self.plays_by_mint: dict[str, list[str]] = {}
         self.rules_meta: dict[str, dict[str, Any]] = {}
+        self.followed: dict[str, dict[str, Any]] = {}          # milestone 13: mint -> {since, reason, state} of the followed coins
+        self.last_points: dict[str, tuple[float, str]] = {}    # milestone 13: mint -> (t, source) of the newest non-trade point (poll, sample, candle)
         self.sol_usd: dict[str, Any] = {"price": None, "known": False}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -292,6 +294,7 @@ class TerminalFeed:
             self._refresh_x(conn)
             self._refresh_plays(conn, now)
             self._refresh_creators(conn, [c.creator for c in self.coins.values() if c.creator])
+            self._refresh_follow(conn, list(universe), graduated)
         else:
             observed = graduated = None
         rows: list[dict[str, Any]] = []
@@ -504,6 +507,35 @@ class TerminalFeed:
             self._plays_json = js
             self._emit(EVENT_PLAYS, js)
 
+    def _refresh_follow(self, conn: Any, mints: list[str], graduated: dict[str, float]) -> None:
+        """Milestone 13: which coins in view the plays daemon follows (`followed`), and per coin the newest point from a source other
+        than the trades (a poll of the curve account, a tracker sample, a candle), so the detail view can say where the last
+        point came from. Read every full cycle; nothing is computed per request."""
+        self.followed = {}
+        self.last_points = {}
+        if not mints:
+            return
+        if data.table_exists(conn, "followed"):
+            for chunk in rf.iter_chunks(mints, 400):
+                marks = ",".join("?" for _ in chunk)
+                for r in conn.execute(f"SELECT mint, since, reason, state, until FROM followed WHERE mint IN ({marks})", chunk):
+                    self.followed[str(r["mint"])] = {"since": float(r["since"]), "reason": str(r["reason"] or ""), "state": str(r["state"]), "until": float(r["until"])}
+                for r in conn.execute(f"SELECT mint, MAX(t) FROM path_points WHERE source='poll' AND mint IN ({marks}) GROUP BY mint", chunk):
+                    self.last_points[str(r[0])] = (float(r[1]), "poll")
+        grads = [m for m in mints if m in (graduated or {})]
+        if grads:
+            for chunk in rf.iter_chunks(grads, 400):
+                marks = ",".join("?" for _ in chunk)
+                for r in conn.execute(f"SELECT mint, MAX(ts) FROM mcap_samples WHERE mint IN ({marks}) GROUP BY mint", chunk):
+                    cur = self.last_points.get(str(r[0]))
+                    if cur is None or float(r[1]) > cur[0]:
+                        self.last_points[str(r[0])] = (float(r[1]), "sample")
+                if data.table_exists(conn, "pool_candles"):
+                    for r in conn.execute(f"SELECT m.mint, MAX(c.minute) + 60 FROM migrations m JOIN pool_candles c ON c.pool = m.pool_address WHERE m.mint IN ({marks}) GROUP BY m.mint", chunk):
+                        cur = self.last_points.get(str(r[0]))
+                        if r[1] is not None and (cur is None or float(r[1]) > cur[0]):
+                            self.last_points[str(r[0])] = (float(r[1]), "candle")
+
     def _refresh_creators(self, conn: Any, creators: list[str]) -> None:
         from ..measure import creators as creators_mod
 
@@ -576,7 +608,35 @@ class TerminalFeed:
             "status": status, "status_label": STATUS_NL.get(status, status), "observed": c.mint in obs, "graduated": grad_t is not None,
             "d_buyers": None if past is None else buyers - past[1], "d_net": None if past is None else round(net - past[2], 3),
             "plays": self.plays_by_mint.get(c.mint, []),
+            "followed": self._followed_of(c.mint, now), "last_point": self._last_point_of(c, now),
         }
+
+    def _followed_of(self, mint: str, now: float) -> dict[str, Any] | None:
+        """Milestone 13: the follow row of a coin for the detail view, with the reasons in Dutch; None when the coin is not followed."""
+        f = self.followed.get(mint)
+        if f is None:
+            return None
+        from ..research.hypotheses import FOLLOW_REASONS_NL
+
+        reasons = [r for r in f["reason"].split(",") if r]
+        labels = [FOLLOW_REASONS_NL.get(r.split(":")[0], r) + (f" ({r.split(':', 1)[1]})" if r.startswith("play:") else "") for r in reasons]
+        state_nl = {"active": "gevolgd (polls van de curve)", "graduated": "gevolgd, gegradueerd (samples en candles)", "done": "24 uur gevolgd, klaar", "closed": "volgen gestopt"}
+        return {"state": f["state"], "state_label": state_nl.get(f["state"], f["state"]), "since": utc_iso(f["since"]), "since_age_s": round(max(0.0, now - f["since"])),
+                "reasons": reasons, "reasons_label": "; ".join(labels) or "–"}
+
+    def _last_point_of(self, c: CoinState, now: float) -> dict[str, Any] | None:
+        """Milestone 13: the newest price point of a coin and its source (trade / poll / sample / candle); None without any point."""
+        cands: list[tuple[float, str]] = []
+        if c.last_state is not None:
+            cands.append((c.last_state[2], "trade"))
+        lp = self.last_points.get(c.mint)
+        if lp is not None:
+            cands.append(lp)
+        if not cands:
+            return None
+        t, src = max(cands)
+        return {"source": src, "source_label": {"trade": "trade", "poll": "poll van de curve", "sample": "sample van de tracker", "candle": "minuutcandle"}.get(src, src),
+                "t": utc_iso(t), "age_s": round(max(0.0, now - t))}
 
     def _theme(self, c: CoinState) -> dict[str, Any] | None:
         if not self.terms:

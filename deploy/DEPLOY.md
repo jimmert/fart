@@ -1127,6 +1127,96 @@ daemon idles. No new `.env` name. Design and the definition of "bewezen": `docs/
    of 30 days is a config value; an M11 checkout carries 14 again and prunes back on its next weekly run (archived, as always).
    Restore the previous Caddy site file from `Caddyfile.before-fart-*` or re-copy the M11 `fart.caddy` and reload.
 
+## 5l. Milestone 13: volgen en tracker (M13)
+
+M13 makes every signal measurable. The first real research run (31 Oct 2026) left 54 to 97% of the outcomes unknown because
+the price path of a coin stopped the moment the trade stream let it go, and the tracker covered a third of the graduations.
+M13 adds (1) the **follow step** of the plays daemon (`fart/plays/follow.py`): every coin that meets a pre-registered follow
+trigger (`fart/research/hypotheses.py` → `FOLLOW_TRIGGERS`: at least 10 unique buyers in 5 minutes for H1/H4/H5/H7, a theme
+coin with trades for H3, a curve of 60 SOL for H2), every coin an active play rule fired on and every coin with an observe
+decision is followed for 24 hours; outside the trade stream and before graduation its BondingCurve account is polled through
+`getMultipleAccounts` (100 addresses per call, 20 CU per call, every 60 s in the first two hours and every 300 s after that)
+and stored in `path_points`; (2) **tracker capacity**: `max_mints_per_run` 600 → 2,000, the DexScreener gate 100 → 200 per
+minute, a time budget per step inside the unit's `TimeoutStartSec=240`, the step durations in `fart status`; (3) the harness and
+the plays layer read the poll points (an entry or an exit may fill on one; a dev sell is only visible on a trade point) and every
+report shows per variant where its fills came from, a "trade points only" row and the split of signals before and after the
+follow started; (4) the **second round of hypotheses** after graduation (H8 dev holds, H9 pullback, H10 theme leader; 28
+variants); (5) a **weekly research run** (`fart-research.timer`, Monday 07:00 UTC, 30 days or what the database has) with the
+research state on `/plays` and the full list on `/eigenaar`; the Terminal's detail view says whether a coin is followed and the
+source of its last point. Schema v10 adds `followed` and `path_points` (additive). The frozen rule files are byte-identical
+(fingerprint `sha256:d45c41793c64`). No new `.env` name; the polls need the keyed RPC that is already in `.env`. Design and the
+reasons: `docs/DECISIONS.md`, "Milestone 13".
+
+1. **Pull and install:**
+   ```bash
+   cd /opt/fart-src && git pull --ff-only && sudo deploy/install.sh
+   ```
+   The installer applies the v10 migration before the restarts (`user_version` 9 → 10), installs and enables
+   `fart-research.timer`, restarts `fart-ingest`, `fart-engine`, `fart-plays` and the optional services and starts the timers.
+   ```bash
+   sudo -u fart /opt/fart/bin/fart --json status | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["schema_version"])'   # 10
+   systemctl list-timers 'fart-*' --no-pager          # fart-research.timer: next Monday 07:00 UTC
+   ```
+   **Cost of a poll, read from the Alchemy compute-unit page on 31 Oct 2026:** `getMultipleAccounts` 20 CU per call, flat (the page
+   gives no per-account price; `config/budget.json` records it with the date). Check the figure once against the dashboard after
+   the first full day (section 6, the compute-unit item): the ledger books every call under `getMultipleAccounts`, so
+   `fart status` → `rpc CU today by method` shows the calls and the CU next to the dashboard's.
+2. **The follow step starts with the plays daemon** (it needs no rule: it follows signals whether or not anything is proven):
+   ```bash
+   journalctl -u fart-plays -n 5 --no-pager                          # plays.started ... follow="polls on"
+   sudo -u fart /opt/fart/bin/fart plays --once                       # one tick: "follow_new": N, "polls": {"enabled": true, "calls": ..., "polled": ..., "points": ...}
+   sudo -u fart /opt/fart/bin/fart status | grep -E '^  (follow|tracker|tracker run):'
+   #   follow: 412 followed (active 388, graduated 19, done 0, closed 5; early_buyers 371, curve60 24, observe 12, play 0); polls today 2,310 addresses in 27 calls = 540 CU of the 300,000 share (2,290 points); level 0 (60 s fast interval); due now 0, over cap 0; last point via poll 4 s ago; errors today 0, blocked 0, misses 5; last tick 3 s ago
+   ```
+   `follow="polls off: the polls need the keyed RPC"` means `RPC_HTTP_URL` is not set in `/opt/fart/.env`; the rows are still
+   written but no account is polled. Within an hour the `follow:` line should show hundreds of followed coins (the VPS sees some
+   39,000 creates a day, of which a few hundred reach ten unique buyers in five minutes) and `last point via poll` a few seconds
+   old. **Degradation**: `level 1 (120 s)` or `level 2 (300 s)` means the last hour exceeded the hourly envelope of the 10% share
+   (12,500 CU at the 3,000,000 cap; 625 calls); the step lengthens the fast interval instead of stopping and shortens it again
+   under half of the envelope. `PAUSED: daily share spent` means the whole share (300,000 CU) is used for the UTC day; every
+   refused call is a blocked ledger row with reason `follow_daily_share`. The share is `config/measure.json` → `follow.daily_cu_share`.
+3. **Compare a poll with the last trade of the same coin** (the decoder was checked in the sandbox against a real account next to
+   its last TradeEvent, `tests/fixtures/bonding_curve_accounts.json`; do it once on the VPS too):
+   ```bash
+   sqlite3 /opt/fart/data/fart.db "SELECT p.mint, p.t, p.virtual_sol, p.virtual_token, t.virtual_sol, t.virtual_token, COALESCE(t.block_time, t.received_at) AS trade_t
+     FROM path_points p JOIN trades t ON t.mint = p.mint
+     WHERE p.source='poll' AND COALESCE(t.block_time, t.received_at) = (SELECT MAX(COALESCE(block_time, received_at)) FROM trades x WHERE x.mint = p.mint AND COALESCE(x.block_time, x.received_at) <= p.t)
+     ORDER BY p.t DESC LIMIT 5;"
+   ```
+   A poll taken right after the coin's last trade carries the same virtual reserves as that trade (the account is the state after
+   it); a poll minutes later may differ because trades happened that the stream no longer saw. That difference is the point of the
+   step. If the reserves never match, the decoder's layout is wrong for this program version: `docs/UNVERIFIED.md`, "Milestone 13".
+4. **The tracker samples every subject** (the subjects of its window were around 1,100 on 31 Oct; the cap is 2,000 now):
+   ```bash
+   grep -E 'track.steps|track.skipped|track.over_budget' /opt/fart/logs/measure-track.log | tail -n 5
+   sudo -u fart /opt/fart/bin/fart status | grep -E '^  tracker'
+   #   tracker: skipped mints total=846,559 today=0 (measure.track.skipped; max_mints_per_run 2000)
+   #   tracker run: last 71 s ago, 68 s (sample 42 s: 1,090 mints/37 req/1,021 stored; outcomes 3 s: 12; creator_stats 11 s: 40 updated; candles 9 s: 20 fetched; budget 220 s); subjects 1,100; graduations of the last 24 h with a sample every 10 min: 93% (812 of 873)
+   ```
+   `skipped ... today` must stay 0 (an `over_cap` or `time_budget` figure in `last=` means the cap or the 150 s sampling budget
+   bit: raise `sampling.time_budget_s` or `max_mints_per_run` in `config/measure.json`); `OVER BUDGET` in the run line means a run
+   exceeded `tracker.run_budget_s` (220 s) and the unit's 240 s is near: lower `candles.max_fetches_per_run` first. The coverage
+   figure is the rule of the day and week reports (a sample at least every 10 minutes); the target is ≥ 90% within two hours of
+   the rollout, and the day report of the next day must show it under "Dekking van de tracker".
+5. **The first research run after 48 hours** (the follow step needs a day of signals and their 24 hours of points; older signals
+   never get a path with hindsight):
+   ```bash
+   sudo -u fart /opt/fart/bin/fart research run --hypothesis all --days 3
+   sudo -u fart /opt/fart/bin/fart research autopsy --days 3
+   sudo -u fart /opt/fart/bin/fart research list
+   ```
+   Read in every report of H1, H4, H5, H7 and H2 the section "Signalen vóór en ná de start van het volgen": the "ná" column is what
+   M13 delivers. Expected: the unknown share of the curve-phase hypotheses under 20% for the signals after the rollout (31 Oct it was
+   54 to 97%), "vulling instap · uitstap" with a poll share for the exits, and the sensitivity table's row "alleen trade-punten
+   (zonder polls)" with the old unknown share next to it. H8, H9 and H10 run on the post-graduation path; their first reports count
+   the graduations of the window and say when the candles are missing. The weekly timer then runs every Monday 07:00 UTC with
+   `--days 30` and clamps the window to the days the database has (the report says "venster beperkt tot N dagen"); until the first
+   Monday the runs above are the deliverable. `/plays` shows the research state per hypothesis under the rules; `/eigenaar`
+   the whole `fart research list` and the follow card; the Terminal's detail view says "gevolgd" and the source of the last point.
+6. **Rollback:** a code rollback to M12 works on the same database (v10 is additive; M12 ignores `followed`, `path_points` and the
+   kv keys `follow.*`, `measure.track.last`); disable the new timer first: `systemctl disable --now fart-research.timer`. The
+   tracker's cap and the DexScreener gate are config values; an M12 checkout carries 600 and 100/min again.
+
 ## 6. First-day checklist (docs/UNVERIFIED.md)
 
 1. `fart chain global`: reserves, supply, `fee_basis_points` 95 and `creator_fee_basis_points` 5 must

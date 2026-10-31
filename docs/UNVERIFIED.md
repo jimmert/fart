@@ -394,3 +394,50 @@ Verify at the rollout (`deploy/DEPLOY.md`, "Milestone 12: terminal and research"
   full 30-day window exists a month later; runtime on the VPS is unknown (the sandbox replays about 80 coins with 20,000 trades
   in seconds; the real window holds tens of thousands of coins, hundreds of thousands of trades; the run logs progress every
   5,000 coins). It runs in the `fart` user's shell, not in a timer, and writes `out/research/<day>-<H>.md|json`.
+
+## Milestone 13 (volgen, tracker, tweede ronde)
+
+Built and tested in the sandbox against a synthetic world, two real BondingCurve accounts from the public RPC and a real loopback
+server; nothing here touched the VPS database. Verify at the rollout (`deploy/DEPLOY.md`, "Milestone 13: volgen en tracker"):
+
+- [~] **The BondingCurve account layout against the IDL** (`fart/chain/bonding_curve.py`): read on 31 Oct 2026 from
+  github.com/pump-fun/pump-public-docs `idl/pump.json` (account `BondingCurve`, 19 fields, discriminator `17b7f83760d8ac60`) and
+  checked in the sandbox against two real accounts fetched through the public RPC (`tests/fixtures/bonding_curve_accounts.json`):
+  a live curve whose `virtual_quote_reserves` / `virtual_token_reserves` / `real_quote_reserves` / `real_token_reserves` equal
+  the `virtual_sol_reserves` ... of its last TradeEvent (decoded from the same chain), and a completed curve (`complete` true,
+  every reserve zero: a graduated account carries no price any more). Both accounts are 166 bytes, exactly the IDL layout, and
+  both carry the zero pubkey as `quote_mint` (the default means SOL; WSOL is accepted as SOL too, any other mint is "not priced
+  in SOL" and never stored as a SOL point). Still open: the first poll on the VPS next to the last trade of the same coin (DEPLOY
+  step 3); a program upgrade that appends fields is harmless (decoded tolerantly), one that reorders them is not (the reserves
+  would stop matching the trades: then the step closes rows as `undecodable` and `fart status` shows the errors).
+- [x] **The cost of `getMultipleAccounts`**: 20 CU per call, flat, read from https://www.alchemy.com/docs/reference/compute-unit-costs
+  on 31 Oct 2026 (`config/budget.json`); the page gives no per-account price, so the follow step packs 100 addresses per call. The
+  same read gave `getSlot` 20 and `getBlockTime` 20 (they were estimates of 10). To confirm on the dashboard after the first full
+  day: the dashboard's CU for `getMultipleAccounts` divided by its calls should be 20 and the calls should match the ledger's rows
+  (`fart status` → `rpc CU today by method`). At 1,500 followed coins and a 60 s interval the step would need 432,000 CU a day;
+  the 10% share (300,000 CU) lets the degradation settle at 120 s. If the dashboard shows a per-account price, lower
+  `follow.max_addresses_per_call` and raise `daily_cu_share`, or accept the longer interval.
+- [~] **The DexScreener gate at 200 per minute** (`config/budget.json`, was 100): the official limit for the token endpoints is 300
+  per minute (their documentation); 200 leaves a third as margin. A 429 arms the backoff and the tracker's `sampled.blocked` counts
+  it; `fart status` → `budget dexscreener` shows `blocked` and `errors`. 67 requests of 30 mints per run at 3.33 per second take about
+  40 s, inside `sampling.time_budget_s` (150 s). If 429s appear, lower `rate_per_s` to 2.5 (150 per minute) and the step still
+  finishes inside the budget.
+- [ ] **The unknown share after 48 hours** (the deliverable of M13): `fart research run --hypothesis all --days 3` two days after the
+  rollout; in every report of H1, H4, H5, H7 and H2 the section "Signalen vóór en ná de start van het volgen" must show the "ná"
+  half under 20% unknown (31 Oct 2026, before: H4 83.5%, H5 54.5%, H7 59.9%, H3 96.7%). The sensitivity table's row "alleen
+  trade-punten (zonder polls)" shows the old figure next to it. If the share stays high: check the `follow:` line (level, paused,
+  errors, misses), whether the triggers fire (reasons per coin) and whether `path_points` grows (`SELECT COUNT(*), MAX(t) FROM
+  path_points`).
+- [ ] **The tracker's coverage**: `fart status` → `tracker run` prints the share of the last 24 hours' graduations with a sample at
+  least every 10 minutes (the reports' rule); the target is ≥ 90%. 31 Oct 2026, before M13: 29 to 34%. The run must stay inside
+  220 s (`OVER BUDGET` in the line otherwise); the first runs also backfill the creator statistics (bounded to 60 s of work).
+- [ ] **Time stops on a sparse path**: a time-based exit is seen at the first point after its moment and the human delay then waits
+  for the point after that; on a 60 s poll grid the sell lands at most two intervals after the moment the full trades would have
+  shown (the synthetic world's test allows 120 s). The M12 execution model is unchanged; this is the price of polls instead of
+  trades, and it is the same for every variant.
+- [~] **The trading-terminal link patterns**: Photon (`https://photon-sol.tinyastro.io/en/lp/{mint}`, forwards the mint to its pool
+  page) and GMGN (`https://gmgn.ai/sol/token/{mint}`, shows the coin) were confirmed in a browser on 31 Oct 2026 and carry
+  `verified: true`; Axiom (a Cloudflare bot check in the sandbox) and BullX (a Telegram login) stay `false`.
+- [ ] **The weekly research timer** (`deploy/fart-research.timer`, Monday 07:00 UTC, `TimeoutStartSec=5400`): the first real run
+  of 7 days took 9 m 47 s on the VPS; 30 days and ten hypotheses are estimated at under an hour but not measured. Check
+  `journalctl -u fart-research` after the first Monday; a timeout means raising `TimeoutStartSec` or lowering `--days` in the unit.

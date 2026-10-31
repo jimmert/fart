@@ -291,6 +291,13 @@ the X planner and the reports under `out/recall/` already know, in Dutch, with t
 Alles wordt achteraf gemeten." on every page and the honesty rules of the reports applied to every number: an hour
 or a day NIET GEDEKT stays empty, an unknown outcome stays "onbekend", a decision inside its 24 h is "nog bezig".
 
+* **fart-research** (`fart/research/`, `deploy/fart-research.timer`, milestone 13): every Monday 07:00 UTC the backtest harness
+  runs every pre-registered hypothesis over the last 30 days (or the days the database has) and the autopsy, writes
+  `out/research/<day>-<H>.md|json`, `<day>-autopsy.md|json` and `latest.json`; reads the database read-only, sends and promotes
+  nothing.
+* **the follow step of fart-plays** (`fart/plays/follow.py`, milestone 13): inside the plays daemon's tick, follows every signal of
+  a pre-registered follow trigger, every play and every observe decision for 24 hours, polls the BondingCurve accounts of the
+  followed coins through `getMultipleAccounts` within its own share of the daily CU cap, and writes `followed` and `path_points`.
 * **Read-only, provably.** Every request opens its own connection with `mode=ro` and `PRAGMA query_only`
   (`fart/web/data.py::open_db`); a write raises. The unit has `ReadWritePaths=/opt/fart/logs` only and
   `ReadOnlyPaths=/opt/fart/data /opt/fart/out`, so even a bug could not write the database or the reports. Because the
@@ -386,6 +393,39 @@ a kv the engine reads, and the frozen rule files are byte-identical (`docs/DECIS
   (the Terminal's maker column and H4), and `pool_candles` from GeckoTerminal for the hour after each graduation through a
   bounded job queue behind the budget gate `geckoterminal` (30 per minute, shared with the tracker). Schema v9 holds their
   tables and `plays`; the retention keeps `trades` 30 days (the harness's window) and prunes candles after 60 days.
+
+## Following signals and the second round (milestone 13)
+
+Milestone 13 makes every signal measurable; nothing in it writes a decision or touches a rule file (`docs/DECISIONS.md`, 178
+to 189).
+
+* **The follow step** (`fart/plays/follow.py::Follower`, run by the plays daemon every tick, with or without an active rule)
+  evaluates the pre-registered follow triggers (`fart/research/hypotheses.py::FOLLOW_TRIGGERS`) on the daemon's candidates with
+  the same `Ctx` the predicates see, follows every coin that meets one, every coin a rule fired on and every coin with an
+  observe decision (`followed`: one row per coin, 24 hours from the signal, the reasons in order), and polls the BondingCurve
+  accounts of the followed coins outside the trade stream and before graduation: `getMultipleAccounts` with 100 addresses per
+  call (one ledger row, 20 CU), decoded against the IDL (`fart/chain/bonding_curve.py`), one `path_points` row per poll (the
+  reserves, `complete`, the slot). Cadence 60 s in the first two hours after the signal, then 300 s; a coin with an open
+  trade-stream subscription gets a watch poll every 300 s; a curve unchanged for two hours goes to 300 s. Bounds: a share of the
+  daily CU cap (`follow.daily_cu_share`, booked per call under its own method), at most 1,500 coins per tick (newest first), a
+  degradation level 60 → 120 → 300 s on the share's hourly envelope or a gate refusal, `closed` after three missing or
+  undecodable answers. The polls need the keyed RPC; the state is in kv `follow.*` and the `follow:` line of `fart status`.
+* **The price path** (`fart/research/harness.py::price_path`) now has four sources in time order: curve points from the trades,
+  poll points (kind `poll`, the same curve quotes, never a dev-sell flag), the graduation point (the migration, or the first poll
+  that found the curve complete, with the last known state), then samples and candles. `include_polls=False` gives the path the
+  stream alone would have given; the reports show both. The plays daemon feeds its open positions the same combined path.
+* **The tracker** (`fart/measure/outcomes.py`) samples every subject of its window newest first inside a time budget per step
+  (`sampling.time_budget_s`, `tracker.run_budget_s` against the unit's 240 s; the creator statistics and the candle queue get
+  what is left) and records the duration of every step in kv `measure.track.last`; `fart status` prints it next to the live
+  coverage of the last 24 hours' graduations.
+* **The second round** (H8, H9, H10; `Harness._signals_post_grad`) replays one tick per minute after the graduation on the
+  post-graduation path: the price is the last point at or before the tick, the volume since graduation comes from the candles
+  (else the sample's hourly pool volume), the maker's sells are the curve's (the radar has no pool trades). The autopsy got a
+  post-graduation part (`autopsy.post_graduation_facts`).
+* **The weekly run** (`deploy/fart-research.timer`, Monday 07:00 UTC) runs every hypothesis over 30 days or the days the database
+  has (`cli.research_window`) and the autopsy, and keeps `out/research/latest.json` (one summary per hypothesis) for `/plays`
+  (the research state under the rules) and `/eigenaar` (the full `fart research list` and the follow card). The Terminal's rows
+  carry `followed` and `last_point` for the detail view.
 
 ## What comes after milestone 6
 

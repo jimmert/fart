@@ -486,6 +486,28 @@ def report_dir(settings: Settings) -> Path:
     return settings.out_dir / "recall"
 
 
+def research_view(settings: Settings, now: float) -> dict[str, Any]:
+    """Milestone 13, the owner page: what `fart research list` prints: every pre-registered hypothesis with its grid (variants,
+    groups, exits) and every report written so far (name, kind, chosen variant, verdict, variants tested, date), plus the
+    latest summary per hypothesis. Read from out/research/; nothing is computed."""
+    from ..research import hypotheses as hyps
+    from ..research.report import list_reports, load_latest
+
+    latest = load_latest(settings)
+    cat = []
+    for h in hyps.catalogue():
+        r = latest.get(h["id"]) or {}
+        cat.append({**h, "round": 2 if h["id"] in hyps.ROUND_TWO else 1, "groups_label": ", ".join(h["groups"]), "exits_label": ", ".join(h["exits"]),
+                    "last_verdict": r.get("verdict") or "nog niet getoetst", "last_selected": r.get("selected") or "–", "last_unknown_label": ("–" if r.get("unknown_share") is None else f"{round(100 * float(r['unknown_share']))}%"),
+                    "last_date_label": fmt_time(iso_to_ts(r.get("generated_at"))) if r.get("generated_at") else "–"})
+    reps = []
+    for r in list_reports(settings):
+        reps.append({**r, "kind_label": "onderzoek" if r.get("kind") == "research" else "autopsie", "proven_label": ("ja" if r.get("selected_proven") else "nee") if r.get("kind") == "research" else "–",
+                     "selected_label": r.get("selected") or "–", "days_label": (f"{len(r['days'])} dagen" if r.get("days") else "–"),
+                     "date_label": fmt_time(iso_to_ts(r.get("generated_at"))) if r.get("generated_at") else "–"})
+    return {**stamp(now), "catalogue": cat, "reports": reps, "variants_total": sum(c["variants"] for c in cat), "hypotheses": len(cat)}
+
+
 def report_files(settings: Settings) -> list[dict[str, Any]]:
     """The Markdown reports under out/recall/, newest first, week reports before day reports of the same day."""
     d = report_dir(settings)
