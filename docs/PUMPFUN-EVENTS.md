@@ -375,7 +375,8 @@ discriminators are stored and counted; known but irrelevant events are counted o
    that we do not name is a real gap: add the name to `events.py`.
 2. Take a fresh create signature:
    `sqlite3 /opt/fart/data/fart.db "select signature from coins where signature is not null order by received_at desc limit 1"`.
-3. Fetch it: `curl -s $RPC_HTTP_URL -X POST -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getTransaction","params":["<sig>",{"encoding":"jsonParsed","maxSupportedTransactionVersion":0}]}' > tx_create_real.json`
+3. Fetch it: `curl -s $RPC_HTTP_URL -X POST -H 'content-type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getTransaction","params":["<sig>",{"encoding":"jsonParsed","maxSupportedTransactionVersion":1}]}' > tx_create_real.json`
+   (1, as `fart/chain/rpc.py` asks since 31 Oct 2026: with 0 a version-1 transaction is refused with JSON-RPC error -32015)
 4. Decode it with our code:
    ```
    cd /opt/fart/app && /opt/fart/venv/bin/python - <<'EOF'

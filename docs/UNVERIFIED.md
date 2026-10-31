@@ -146,6 +146,45 @@ against synthetic fixtures. Each item names the file to adjust when reality diff
   `getSignaturesForAddress` with large limits.
 - [ ] **`getSignaturesForAddress` on the mint authority** lists create transactions newest-first
   with `slot`/`blockTime`, and one transaction creates one coin (`fart/ingest/sweep.py`).
+- [~] **Transaction version 1 on mainnet** (31 Oct 2026; `fart/chain/rpc.py` → `MAX_SUPPORTED_TRANSACTION_VERSION`).
+  While a bonding-curve fixture for milestone 13 was captured, `getTransaction` against
+  `https://api.mainnet-beta.solana.com` with `{"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0,
+  "commitment": "confirmed"}` answered JSON-RPC error -32015: "Transaction version (1) is not supported by the
+  requesting client. Please try the request again with the following configuration parameter:
+  maxSupportedTransactionVersion: 1". The same call with 1 answered; `meta.logMessages` and `meta.innerInstructions`
+  were present and the self-CPI events decoded as before. Until that day the client hard-coded 0 (legacy and v0
+  transactions only), so every version-1 transaction was refused: the enrich step (`fart/ingest/sweep.py`, the missed
+  creates and migrations of the sweep) counted an error per attempt, booked the 40 CU of each refused call all the
+  same, kept the message in `enrich_queue.last_error` and gave the row up after `enrich.max_attempts` (3) attempts;
+  `fart events classify --fetch N` printed the refusal as `fetch_error`. Since this fix the client asks for 1 (one
+  constant; `tests/test_rpc.py` pins the request body at 1 or higher and the -32015 refusal at its code and text)
+  and `TxEvents.version` keeps what the node reports (`legacy`, 0 or 1). Not verified from the sandbox (no VPS
+  access from there):
+  1. **Whether the VPS accumulated such rows, and since when.** `fart status` → `enrich (getTransaction)` shows the
+     backlog of rows under the attempt limit only; a row refused three times is invisible there and sits in the table:
+     ```
+     sudo -u fart sqlite3 /opt/fart/data/fart.db "select kind, attempts, count(*), datetime(min(requested_at),'unixepoch'), datetime(max(last_attempt),'unixepoch') from enrich_queue where done=0 and last_error like 'rpc error -32015:%' group by kind, attempts"
+     ```
+     Write the counts and the first `requested_at` here: that is when version-1 transactions reached the pump.fun create
+     or migration path, and the creates of those rows are missing from `coins` unless a stream caught them
+     (`fart coverage --hours 24` → `grads_without_create` over the same days says how much it hurt). Zero rows means
+     the sweep never met one yet, and the fix is a precaution.
+  2. **The recovery of those rows.** A row at 3 attempts is never retried by itself. After the upgrade, once, by hand:
+     ```
+     sudo -u fart sqlite3 /opt/fart/data/fart.db "update enrich_queue set attempts=0 where done=0 and attempts>=3 and last_error like 'rpc error -32015:%'"
+     ```
+     The next enrich runs fetch them (migrations first, 100 per run, within the daily limit): `fart status` → `enrich`
+     shows `used_today` climbing and the backlog going down, `journalctl -u fart-ingest | grep enrich.done` shows
+     `errors=0`, and `select count(*) from enrich_queue where done=0 and last_error like 'rpc error -32015:%'` must
+     reach 0 and stay there. A row that fails again with -32015 after the bump means the node wants a higher version
+     than 1: the message names it; bump the constant in a commit (not a rule file: the fingerprint stays).
+  3. **The shape of a version-1 transaction beyond the one capture.** `jsonParsed` returned the inner instructions
+     with base58 `data` for the pump.fun self-CPI (what `events_from_transaction` reads); addresses loaded through
+     lookup tables arrive in `meta.loadedAddresses`, which the decoder does not use. Commit the captured transaction as
+     `tests/fixtures/tx_create_v1_real.json` (the recording convention of docs/PUMPFUN-EVENTS.md) once a create of
+     version 1 is in hand, so the decoder is tested on the real shape and not only on the synthetic fixtures.
+  Not taken: reading the version the node suggests out of the -32015 message and retrying once. One constant is enough
+  while a new transaction version is an event of once in years, and the test says where it lives.
 
 ## X (Twitter) API v2
 

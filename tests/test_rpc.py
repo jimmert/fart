@@ -5,7 +5,7 @@ import urllib.error
 
 import pytest
 
-from fart.chain.rpc import RpcClient, RpcError
+from fart.chain.rpc import MAX_SUPPORTED_TRANSACTION_VERSION, RpcClient, RpcError
 from fart.net import http as nh
 from fart.net.budget import Blocked, Budget, load_source_configs
 
@@ -44,9 +44,35 @@ def test_get_transaction_records_cost(settings, conn, monkeypatch, fixtures_dir)
     res = rpc.get_transaction("sig")
     assert res["slot"] == 370_000_001
     assert calls[0]["method"] == "getTransaction"
-    assert calls[0]["params"][1]["maxSupportedTransactionVersion"] == 0
+    assert calls[0]["params"][1]["maxSupportedTransactionVersion"] >= 1
     usage = budget.daily_usage("rpc")
     assert usage["requests"] == 1 and usage["cost"] == 40  # cost table: the published Alchemy figure (milestone 4)
+
+
+def test_get_transaction_asks_for_versioned_transactions(settings, conn, monkeypatch, fixtures_dir):
+    """Mainnet served version-1 transactions on 31 Oct 2026. With maxSupportedTransactionVersion 0 the node answers
+    JSON-RPC -32015 and the enrich queue counts an error per attempt, so the request body must ask for 1 or higher."""
+    tx = json.loads((fixtures_dir / "tx_create.json").read_text())
+    rpc, _, calls = make(settings, conn, [tx], monkeypatch)
+    rpc.get_transaction("sig")
+    opts = calls[0]["params"][1]
+    v = opts["maxSupportedTransactionVersion"]
+    assert isinstance(v, int) and not isinstance(v, bool) and v >= 1
+    assert v == MAX_SUPPORTED_TRANSACTION_VERSION
+    assert opts["encoding"] == "jsonParsed" and opts["commitment"] == "confirmed"
+
+
+def test_unsupported_version_refusal_keeps_code_and_text(settings, conn, monkeypatch):
+    """The node's refusal surfaces as RpcError -32015 with the message the enrich queue stores in last_error
+    (`rpc error -32015: Transaction version ...`), so a higher version on mainnet is visible in the table."""
+    msg = ("Transaction version (2) is not supported by the requesting client. Please try the request again with the"
+           " following configuration parameter: maxSupportedTransactionVersion: 2")
+    rpc, _, _ = make(settings, conn, [{"jsonrpc": "2.0", "id": 1, "error": {"code": -32015, "message": msg}}], monkeypatch)
+    with pytest.raises(RpcError) as ei:
+        rpc.get_transaction("sig")
+    assert ei.value.code == -32015
+    assert str(ei.value).startswith("rpc error -32015: Transaction version (2) is not supported")
+    assert len(str(ei.value)) <= 200  # the enrich queue keeps the first 200 characters: the suggested version survives
 
 
 def test_rpc_error_is_raised_and_recorded_ok(settings, conn, monkeypatch):

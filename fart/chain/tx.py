@@ -2,6 +2,12 @@
 
 Events are collected from meta.logMessages and from self-CPI inner instructions whose data is
 the anchor event-CPI payload. Duplicates (same event seen both ways) are collapsed.
+
+Nothing here depends on the transaction version: only `meta` (logMessages, innerInstructions, err,
+fee), the first signature, `slot` and `blockTime` are read, and a jsonParsed response carries them
+the same way for legacy, version-0 and version-1 transactions (mainnet served version 1 on 31 Oct
+2026; the client asks for it, see chain/rpc.py). Accounts loaded through lookup tables arrive in
+`meta.loadedAddresses`, which is not needed. The node's `version` field is kept on TxEvents.
 """
 from __future__ import annotations
 
@@ -21,6 +27,7 @@ class TxEvents:
     events: list[DecodedEvent] = field(default_factory=list)
     undecoded: list[Undecoded] = field(default_factory=list)
     fee_lamports: int | None = None
+    version: Any = None  # what the node reports: "legacy", 0 or 1 (absent on older responses and fixtures)
 
     def first(self, name: str) -> DecodedEvent | None:
         for e in self.events:
@@ -50,6 +57,7 @@ def events_from_transaction(tx: dict[str, Any] | None) -> TxEvents:
         block_time=tx.get("blockTime"),
         err=meta.get("err"),
         fee_lamports=meta.get("fee"),
+        version=tx.get("version"),
     )
     events, undecoded = decode_logs(meta.get("logMessages"))
     seen = {_event_key(e) for e in events}

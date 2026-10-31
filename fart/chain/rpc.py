@@ -9,6 +9,15 @@ from ..net.http import HttpError, request_json
 
 log = get_logger("rpc")
 
+# getTransaction refuses a transaction newer than this with JSON-RPC error -32015 ("Transaction version (N) is not
+# supported by the requesting client. Please try the request again with the following configuration parameter:
+# maxSupportedTransactionVersion: N"). Mainnet served version-1 transactions on 31 Oct 2026 (a pump.fun bonding-curve
+# transaction captured for the milestone-13 fixture; `https://api.mainnet-beta.solana.com`), so 0 (legacy and v0 only)
+# refused them: the enrich queue counted an error per attempt, `fart events classify --fetch` a fetch_error. Bump this
+# one number when a node asks for a higher version; the decoder (chain/tx.py) reads only `meta` and does not depend on
+# the version. docs/UNVERIFIED.md, "Solana RPC / Alchemy".
+MAX_SUPPORTED_TRANSACTION_VERSION = 1
+
 
 class RpcError(Exception):
     def __init__(self, code: int | None, message: str):
@@ -41,9 +50,11 @@ class RpcClient:
 
     # ----- read-only helpers ------------------------------------------------------------
     def get_transaction(self, signature: str) -> dict[str, Any] | None:
+        """jsonParsed transaction at confirmed commitment, up to MAX_SUPPORTED_TRANSACTION_VERSION (None when unknown)."""
         return self.call(
             "getTransaction",
-            [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0, "commitment": "confirmed"}],
+            [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": MAX_SUPPORTED_TRANSACTION_VERSION,
+                         "commitment": "confirmed"}],
         )
 
     def get_signatures_for_address(
@@ -79,4 +90,4 @@ class RpcClient:
         return int(res) if isinstance(res, int) else None
 
 
-__all__ = ["RpcClient", "RpcError", "Blocked", "HttpError"]
+__all__ = ["RpcClient", "RpcError", "Blocked", "HttpError", "MAX_SUPPORTED_TRANSACTION_VERSION"]
