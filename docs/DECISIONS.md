@@ -1365,3 +1365,140 @@ alleen-lezen; er komt geen nieuwe naam in `.env`.
 177. **Branch and PR**: all work on the branch `claude/magical-lovelace-vqukei`; part B (schema, research, plays, data steps)
     and part A (the Terminal) are two commits in that order because the Terminal shows the plays and the maker statistics;
     the PR targets `main`.
+
+## Milestone 13 (31 oktober 2026)
+
+**Samenvatting (Nederlands).** Mijlpaal 13 maakt elk signaal meetbaar. De eerste echte onderzoeksrun op de VPS (31 oktober
+2026, 09:48 tot 09:58 UTC, venster 24 tot en met 30 oktober, 224.658 munten waarvan 53.711 met trades) bewees niets, en de
+cijfers zeiden waarom: van de signalen van H4 bleef 83,5% onbekend, van H5 54,5%, van H7 59,9%, van H3 96,7%; alleen H6 (na
+graduatie) had 0% onbekend. Het prijspad brak af zodra de trade-stream een munt losliet (`rpc_trades_cap` 150, watchlist 200
+met 100 proeftijdplekken; op 31 oktober sloot de stream 2.379 abonnementen om `stream_cap`), en een positie zonder punt tot de
+uitstap is onbekend. De bekende gevallen waren daardoor een overleversselectie: de munt bleef handelen, dus bleef gevolgd. De
+tracker haalde zijn onderwerpen niet (600 per run tegenover ongeveer 1.100 in het venster; dekking 29 tot 34% van de
+graduaties). En de autopsie vond 0 organische winnaars en 266 gebundelde, met een mediane leeftijd bij graduatie van 0,00
+minuten: vóór de graduatie was er voor een mens niets te doen, ná de graduatie wel, en daar is de data compleet.
+
+**Wat M13 bouwt, naast de bevroren engine.** (1) Het **volgen van signalen** (`fart/plays/follow.py`, een stap van de
+plays-daemon): elke munt die op het ruimste niveau een instapvoorwaarde van een hypothesefamilie haalt
+(`fart/research/hypotheses.py` → `FOLLOW_TRIGGERS`: minstens 10 unieke kopers in 5 minuten voor H1/H4/H5/H7, een thema-munt
+met trades voor H3, een curve van 60 SOL voor H2), elke munt waarop een actieve play-regel vuurt en elke munt met een
+observe-beslissing van de engine wordt 24 uur gevolgd (tabel `followed`). Buiten de trade-stream en vóór de graduatie wordt
+het BondingCurve-account gepolld via `getMultipleAccounts` (hoogstens 100 adressen per aanroep, 20 CU per aanroep volgens de
+Alchemy-pagina van 31 oktober 2026), elke 60 s in de eerste 2 uur na het eerste signaal en daarna elke 300 s, gedecodeerd
+tegen de IDL (`fart/chain/bonding_curve.py`) en opgeslagen in `path_points` (bron `poll`). Een poll die `complete` ziet is het
+graduatiepunt als de stream de migratie miste. Na graduatie geven de tracker en de candles de punten. Begrenzingen: een eigen
+dagaandeel van de CU-cap (0,10 van 3.000.000 CU; daarboven geweigerd en als `follow_daily_share` in het ledger geboekt),
+hoogstens 1.500 gelijktijdig gepollde munten (nieuwste signaal eerst), een degradatiestand die het snelle interval verlengt
+(60 → 120 → 300 s) als het uurvenster van het aandeel wordt overschreden of de poort weigert, het trage interval voor een
+curve waarvan de reserves 2 uur niet veranderden, en `closed` voor een account dat ontbreekt of niet te decoderen is. Een poll
+faalt nooit stil: aanroepen, weigeringen, fouten en ontbrekende accounts staan per dag in kv en in `fart status` (regel
+`follow:`). (2) **Trackercapaciteit**: `max_mints_per_run` 600 → 2.000, de DexScreener-poort 100 → 200 per minuut (officieel
+300), nieuwste onderwerp eerst, een tijdsbudget per stap binnen de `TimeoutStartSec` van 240 s van de unit (sampling 150 s, de
+hele run 220 s; de makerstatistieken en de candles krijgen wat overblijft), de duur per stap in kv `measure.track.last` en in
+`fart status`, met de dekking van de graduaties van de laatste 24 uur ernaast. Doel ≥ 90%; `method_version` m1.0 blijft (meer
+samples is trouw aan de methode, geen methodewijziging, het M5-precedent). (3) **Het harnas en de plays-laag lezen de
+polls**: `price_path()` neemt poll-punten op als `PricePoint(kind="poll")` met de reserves; de curve is altijd tegenpartij, dus
+een instap of uitstap mag erop vullen; een dev-verkoop is alleen op een trade-punt zichtbaar en `devsell`-uitstappen vuren dus
+nooit op een poll (het rapport zegt dat). Elk rapport telt per variant op welke bron de instappen en uitstappen vulden
+(trade / poll / sample / candle), de gevoeligheidstabel krijgt de rij "alleen trade-punten (zonder polls)", H2 ziet een
+kruising van 75 SOL ook op poll-punten (gemarkeerd `curve_source`; live hetzelfde via `features.apply_poll_state`), en het
+rapport splitst de signalen van vóór en ná de start van het volgen (kv `follow.started_at`): oudere signalen krijgen geen pad
+met terugwerkende kracht. De betekenis van onbekend en geen vulling verandert niet. (4) De **tweede ronde hypotheses**, vooraf
+vastgelegd in volgorde van verwachting: **H8** Dev houdt vast na graduatie (instap N minuten na graduatie, N 2/5/10, als de
+maker op de curve niet verkocht, de prijs boven de graduatieprijs staat en het volume sinds de graduatie ≥ $10.000/$25.000;
+tegenproef: de maker verkocht wél; twaalf varianten), **H9** Terugval na graduatie (≥ 20/30/40% onder de piek sinds de
+graduatie binnen 30 minuten, volume van de laatste 5 minuten ≥ $2.500; uitstap tr20/tr30/ts15/ts60; twaalf varianten), **H10**
+Themaleider na graduatie (de eerst gegradueerde munt van een brandend thema tegenover de kopieën, instap 2 minuten na
+graduatie, uitstap tr30/ts60; vier varianten). Samen 28 varianten erbij (173 in totaal), alle geteld in de multipliciteitsnoot.
+De autopsie krijgt een deel "na graduatie". De zeven bestaande hypotheses zijn onveranderd. (5) Een **wekelijkse onderzoeksrun**
+(`deploy/fart-research.timer`, maandag 07:00 UTC, `fart research run --hypothesis all --days 30` en `fart research autopsy
+--days 30`; zolang er minder dagen zijn: zoveel als er zijn, en het rapport zegt dat), de onderzoeksstand per hypothese op
+`/plays`, de volledige `fart research list` en een volgkaart op `/eigenaar`, en in de Terminal per munt of hij gevolgd wordt
+en de bron van het laatste punt. Schema v10 (`followed`, `path_points`) is additief; de bevroren regelbestanden zijn byte-gelijk
+(vingerafdruk `sha256:d45c41793c64`); geen wallet, geen order; geen nieuwe `.env`-naam (de polls gebruiken de bestaande
+`RPC_HTTP_URL`); de webdienst blijft alleen-lezen.
+
+178. **Elk signaal krijgt 24 uur prijspad uit de goedkoopste toereikende bron** (`fart/plays/follow.py`, tabel `followed`,
+    `path_points`): (a) de trade-stream zolang die het abonnement heeft (ongewijzigd; een munt met een open abonnement krijgt
+    alleen een waakpoll elke 300 s, zodat een tijdstop ook vult als de trades stoppen), (b) daarbuiten en vóór graduatie polls
+    van het BondingCurve-account elke 60 s in de eerste 2 uur en elke 300 s daarna, (c) na graduatie de samples van de tracker
+    en de candles. De reden is de meting van 31 oktober: het onbekend-aandeel van de curvefase-hypotheses lag tussen 54,5 en
+    96,7% omdat het pad afbrak zodra de stream losliet; een pad dat eindigt vóór een uitstap blijft onbekend, en dat moet zo,
+    dus moet het pad langer worden. Een poll kost 20 CU voor honderd munten en de curve heeft altijd een prijs; dat is de
+    goedkoopste bron die er is.
+179. **De triggers liggen vast naast de hypotheses, niet in de daemon** (`hypotheses.FOLLOW_TRIGGERS`): het ruimste niveau van
+    elke familie (10 unieke kopers in 5 minuten voor H1/H4/H5/H7, een thema-munt met trades voor H3, 60 SOL in de curve voor H2),
+    plus elke munt waarop een regel vuurt en elke observe-beslissing. Zo bepaalt de daemon elke tick op dezelfde `Ctx` wat
+    gemeten wordt, en nooit wat gehandeld wordt. H4's eigen instap (3 trades in 5 minuten) is bewust niet de trigger: die zou
+    39.000 munten per dag volgen; H4 wordt beoordeeld op de munten die de kopersdrempel haalden.
+180. **Het BondingCurve-account wordt gelezen zoals de IDL het geeft** (`fart/chain/bonding_curve.py`): negentien velden in de
+    volgorde van `idl/pump.json` van 31 oktober 2026 (de SOL-kant heet daar `quote`: `virtual_quote_reserves`,
+    `real_quote_reserves`), tolerant tot de bytes op zijn, nooit geraden. Gecontroleerd in de sandbox tegen een echt account
+    naast de laatste TradeEvent van dezelfde munt (de reserves gelijk, `tests/fixtures/bonding_curve_accounts.json`) en tegen
+    een gegradueerd account (`complete` true, alle reserves nul: het graduatiepunt krijgt de tijd van de poll en de prijs van de
+    laatste bekende stand, nooit de nullen). Het veld `quote_mint` is op de echte accounts de nulsleutel (de standaard: SOL);
+    WSOL geldt ook als SOL; een andere quote-munt wordt nooit als SOL-punt opgeslagen.
+181. **Een eigen dagaandeel, een bovengrens en degradatie in plaats van stoppen** (`config/measure.json` → `follow`): 0,10 van de
+    dagcap per aanroep geboekt onder `getMultipleAccounts` (de ledgerrij per aanroep); boven het aandeel wordt elke aanroep
+    geweigerd en als `follow_daily_share` geboekt; hoogstens 1.500 munten per tick, nieuwste signaal eerst, de rest telt als
+    `over_cap`; als het laatste uur het uurvenster van het aandeel (12.500 CU, 625 aanroepen) overschrijdt of de poort weigert,
+    gaat het snelle interval een stap omhoog (60 → 120 → 300 s, hoogstens één stap per 5 minuten) en onder de helft van het
+    venster weer omlaag (hoogstens één stap per 15 minuten); een curve waarvan de reserves 2 uur niet veranderden gaat naar
+    300 s; een account dat drie polls ontbreekt of niet te decoderen is sluit de rij met de reden. Bij 1.500 munten op 60 s zou
+    de stap 432.000 CU per dag kosten; met het aandeel landt hij op 120 s.
+182. **De polls vragen de gekeyde RPC** (`follow.require_keyed_rpc`): met de publieke fallback (geen `RPC_HTTP_URL`) worden de
+    rijen wél geschreven maar wordt niets gepolld, en de reden staat in `fart status` en in `plays.started`; dezelfde regel als
+    de trade-stream van M3. De tests injecteren een nep-RPC door de echte budgetpoort.
+183. **De tracker samplet elk onderwerp, nieuwste eerst, binnen een tijdsbudget** (`fart/measure/outcomes.py`,
+    `fart/measure/prices.py`): cap 2.000 bij ongeveer 1.100 onderwerpen, de poort 200 per minuut (67 verzoeken van 30 munten
+    duren ongeveer 40 s), `sampling.time_budget_s` 150 en `tracker.run_budget_s` 220 tegenover de 240 s van de unit; de munten
+    die het budget niet haalt tellen als `time_budget` in `measure.track.skipped` (en de reden in `.last`), de makerstatistieken
+    krijgen hoogstens 60 s van wat overblijft, de candles de rest (een poll die niet meer past wacht op de volgende run en
+    telt). Elke run schrijft de duur per stap in kv `measure.track.last`; `fart status` toont die naast de dekking van de
+    graduaties van de laatste 24 uur (de regel van de rapporten: een sample minstens elke 10 minuten). Meer samples onder
+    dezelfde regels is `method_version` m1.0.
+184. **Het harnas vult op poll-punten, telt de bron van elke vulling en laat zien wat de polls veranderen**
+    (`paper.PricePoint` kind `poll`, `Fill.point_kind`, `Case.entry_kind` / `exit_kind`, `metrics()["fill_sources"]`,
+    `Harness.sensitivity()["sources"]`, `Harness.follow_split()`): een instap of uitstap mag op een poll vullen (de curve is
+    tegenpartij, de quote is dezelfde `buy_quote` / `sell_quote`), een dev-verkoop is alleen op een trade-punt zichtbaar en
+    vuurt dus nooit op een poll (het rapport zegt dat bij elke variant). Elk rapport toont per variant het aandeel van de
+    instappen en uitstappen per bron, de gevoeligheidstabel krijgt de rij "alleen trade-punten (zonder polls)" (dezelfde
+    signalen op het pad van de stroom alleen: zonder polls zijn de cijfers voor trade-punten exact die van M12, een test bewijst
+    het), en de signalen worden gesplitst in vóór en ná `follow.started_at`. De uitvoeringsregels van M12 zijn onveranderd: een
+    uitstap wordt gezien op het punt dat haar toont en telt haar vertraging vanaf dat punt; op een raster van 60 s landt een
+    tijdstop daardoor hoogstens twee intervallen na het moment dat volledige trades getoond hadden (de test op de synthetische
+    wereld laat 120 s toe). Een geprobeerde variant die de tijdstop op haar bekende moment liet vuren veranderde acht uitkomsten
+    van de M12-lab en is daarom niet doorgegaan: de betekenis van onbekend mag niet verschuiven.
+185. **H2 ziet de kruising ook op polls, in het harnas en live hetzelfde** (`features.apply_poll_state`, `Harness._features_at`,
+    `PlaysEngine.context`): de curvestand van een tick komt van de nieuwste van de laatste trade en de laatste poll
+    (`curve_source` trade | poll), de vensterkenmerken (kopers, SOL, aantallen, grootste koper) blijven wat de trades zeggen,
+    want een poll ziet geen trade. De ticks van H2 lopen door tot het laatste trade- óf poll-punt, en de kandidaten van H2
+    komen uit de trades én uit `path_points` boven 105 SOL virtueel.
+186. **De tweede ronde toetst na graduatie, waar het pad compleet is** (`hypotheses.H8`, `H9`, `H10`, `Harness._signals_post_grad`,
+    `theme_grad_roles`): één tick per minuut na de graduatie op het pad van candles en samples; de prijs op een tick is het
+    laatste punt op of vóór de tick (nooit geïnterpoleerd), het volume sinds de graduatie de som van de candlevolumes van de
+    verstreken minuten (kenbaar op de tick) of anders het uurvolume van de laatste sample, het 5-minutenvolume alleen uit
+    candles (zonder candles geen H9-signaal, het rapport zegt het), "de maker heeft niet verkocht" is: geen verkoop van de
+    maker-wallet op de curve tot de graduatie (verkopen op de pool ziet de radar niet; dat staat in H8's noten en in de
+    autopsie als "niet gemeten"). H8's raster is twaalf varianten: N 2/5/10 bij $10k met tr30 en ts60, bij N 5 ook de ladder en
+    ts30, N 5 bij $25k, en de tegenproef bij N 5 / $10k; H9: X 20/30/40% × tr20/tr30/ts15/ts60 bij één Y van $2.500 (een pool die
+    nog leeft); H10: leider tegenover kopie bij graduatie + 2 minuten, naar graduatievolgorde binnen de munten van het thema. De
+    nieuwe uitstap `ts30` (tijdstop 30 min) komt erbij; de zeven hypotheses van M12 veranderen niet.
+187. **De wekelijkse run neemt wat er is en zegt dat** (`deploy/fart-research.service`, `.timer`, `cli.research_window`): maandag
+    07:00 UTC, `--days 30`; met een jongere database wordt het venster beperkt tot de dagen met trades en staat dat boven in het
+    rapport ("Gevraagd venster 30 dagen; de database heeft trades vanaf …"). De run schrijft per hypothese een samenvatting in
+    `out/research/latest.json` (gekozen variant, oordeel, onbekend-aandeel, datum, het onbekend-aandeel ná het volgen), zodat
+    `/plays` en `/eigenaar` de stand lezen zonder de rapport-JSON met duizenden gevallen te openen. De timer verstuurt niets en
+    promoveert niets.
+188. **Zichtbaarheid zonder nieuwe woorden**: `/plays` toont onder de regels de onderzoeksstand per hypothese (ronde 1 en 2),
+    `/eigenaar` de volledige `fart research list` en de volgkaart (gevolgde munten, polls, CU tegenover het dagaandeel,
+    degradatiestand, laatste punt), de Terminal per munt "gevolgd" met de redenen en "laatste punt" met de bron (trade / poll /
+    sample / candle). De openbare JSON houdt de eigenaarsregel (de test van M9 draait over de nieuwe velden); de pagina's zeggen
+    geen nieuw koopwoord. Photon en GMGN zijn op 31 oktober in een browser bevestigd (`verified: true` in `config/web.json`);
+    Axiom (botcontrole) en BullX (Telegram-login) blijven onbevestigd.
+189. **Branch en PR**: alle werk op de branch `claude/compassionate-gates-zj3lle`; de meting eerst (schema, decoder, tracker,
+    volgen, harnas en plays op de polls) en de tweede ronde daarna (H8 tot en met H10, de autopsie na graduatie, de wekelijkse
+    run en de pagina's) in twee commits; de PR richt zich op `main`. Klaar is: PR open, tests groen, en binnen 48 uur na de
+    uitrol een onderzoeksrun waarin het onbekend-aandeel van de curvefase-hypotheses onder 20% ligt voor signalen van ná de
+    uitrol.
+

@@ -101,7 +101,7 @@ chmod 0640 "$FART_ROOT/.env"
 # (the website reads only); milestone 10 (user_version 8) adds the indexes trades(received_at) and trades(block_time)
 # (seconds on the VPS; the time windows of the public dashboard); milestone 12 (user_version 9) adds the tables
 # creator_stats, pool_candles, candle_jobs and plays (research and the plays layer; the engine's tables are untouched);
-# a second run changes nothing.
+# milestone 13 (user_version 10) adds the tables followed and path_points (the follow step of the plays daemon); a second run changes nothing.
 if [ -f "$FART_ROOT/data/fart.db" ]; then
   if STATUS_JSON="$(sudo -u "$FART_USER" "$FART_ROOT/bin/fart" --quiet --json status 2>/dev/null)"; then
     log "database schema: $(printf '%s' "$STATUS_JSON" | "$VENV/bin/python" -c 'import json,sys
@@ -125,7 +125,7 @@ systemctl daemon-reload
 if command -v systemd-analyze >/dev/null 2>&1; then
   systemd-analyze verify /etc/systemd/system/fart-*.service /etc/systemd/system/fart-*.timer 2>&1 | grep -v -e 'is not loaded properly' || true
 fi
-systemctl enable fart-ingest.service fart-engine.service fart-plays.service fart-measure-track.timer fart-measure-report.timer fart-measure-week.timer fart-backup.timer >/dev/null
+systemctl enable fart-ingest.service fart-engine.service fart-plays.service fart-measure-track.timer fart-measure-report.timer fart-measure-week.timer fart-research.timer fart-backup.timer >/dev/null
 OPTIONAL_SERVICES=""
 for u in fart-social.service fart-notify.service; do
   if [ -f "/etc/systemd/system/$u" ]; then
@@ -154,7 +154,7 @@ if [ "$START_SERVICES" = "1" ]; then
   systemctl restart fart-engine.service
   systemctl restart fart-plays.service
   for u in $OPTIONAL_SERVICES; do systemctl restart "$u"; done
-  systemctl start fart-measure-track.timer fart-measure-report.timer fart-measure-week.timer fart-backup.timer
+  systemctl start fart-measure-track.timer fart-measure-report.timer fart-measure-week.timer fart-research.timer fart-backup.timer
   log "services (re)started:$OPTIONAL_SERVICES fart-ingest fart-engine fart-plays + timers"
 fi
 
@@ -174,7 +174,8 @@ echo "  sudo -u $FART_USER $FART_ROOT/bin/fart social dryrun                    
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart social calibrate --day <day> --console-usd <N>   # our X ledger against the console's amount, writes nothing (M7)"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart engine explain --day $(date -u +%F)             # why (no) observations today (M6)"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart measure week --end $(date -u -d yesterday +%F 2>/dev/null || date -u +%F) --days 1   # week report smoke test (M5), sends nothing"
-echo "  systemctl list-timers 'fart-*' --no-pager                          # fart-measure-week.timer daily 06:30 UTC"
+echo "  systemctl list-timers 'fart-*' --no-pager                          # fart-measure-week.timer daily 06:30 UTC; fart-research.timer Monday 07:00 UTC (M13)"
+echo "  sudo -u $FART_USER $FART_ROOT/bin/fart status | grep -E '^  (follow|tracker run):'      # M13: the follow step and the tracker's step durations"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart research run --hypothesis H5 --days 3 --limit 300   # M12: the harness on real data (a bounded smoke run; the report says so), out/research/"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart research list                                  # M12: the research reports and their verdicts"
 echo "  sudo -u $FART_USER $FART_ROOT/bin/fart plays --once                                   # M12: one tick of the plays layer (empty config: 0 rules, nothing fires)"

@@ -48,12 +48,14 @@
   web hash-password      ask for the owner's password invisibly (twice) and print only its scrypt hash for .env
   web new-secret         print a fresh cookie-signing secret for .env (a new secret logs every browser out)
   research run --hypothesis H [--days N] [--end D] [--delay S] [--size SOL] [--limit N]
-                         milestone 12: the backtest harness on our own data for one pre-registered hypothesis (H1..H7; `--hypothesis all`
+                         milestone 12: the backtest harness on our own data for one pre-registered hypothesis (H1..H10; `--hypothesis all`
                          runs them in the pre-registered order); writes out/research/<date>-<H>.md|json (Dutch, every variant, the
                          rejected included); reads the database, writes only under out/research/. Milestone 13: the paths include the
-                         polls of the followed coins and every report says where its fills came from
+                         polls of the followed coins, every report says where its fills came from, and a window longer than the
+                         database's trades is clamped (the report says so); fart-research.timer runs `all --days 30` every Monday 07:00 UTC
   research autopsy [--days N] [--end D]
-                         the organic winners' first five minutes next to the non-winners (out/research/<date>-autopsy.md|json)
+                         the organic winners' first five minutes next to the non-winners, and since milestone 13 the part after
+                         graduation (out/research/<date>-autopsy.md|json)
   research promote H VARIANT [--report NAME]
                          write a PROVEN variant of a report into config/plays.json as a new rule version; refuses anything not proven
   research list          the hypotheses with their grids and the reports written so far
@@ -961,12 +963,17 @@ def cmd_research(settings, args) -> int:
     except ValueError:
         print(f"bad day: {end} (YYYY-MM-DD)")
         return 2
-    days = rh.window_days(end, n_days)
     conn = db.connect_ro(settings.db_path)
     try:
         t = now()
+        # milestone 13: the weekly run asks for 30 days; a younger database gives what it has, and the report says so
+        days, window_note = research_window(conn, end, n_days)
+        if window_note:
+            print(window_note)
         if args.rcmd == "autopsy":
             res = ra.build_autopsy(conn, settings, days, t, limit=args.limit)
+            res["days_requested"] = n_days
+            res["window_note"] = window_note
             md, js = ra.write_autopsy(settings, res)
             print(f"autopsie geschreven: {md} ({res['groups']['organic_winner']} organische winnaars, {res['groups']['bundled_winner']} gebundelde, {res['groups']['not_winner']} geen winnaar; {res['seconds']} s)")
             return 0
@@ -977,13 +984,31 @@ def cmd_research(settings, args) -> int:
             except KeyError as e:
                 print(f"research run: {e}")
                 return 2
-            res = rh.run_hypothesis(conn, settings, hid, days, entry_delay_s=args.delay, size_sol=args.size, limit_coins=args.limit)
+            res = rh.run_hypothesis(conn, settings, hid, days, entry_delay_s=args.delay, size_sol=args.size, limit_coins=args.limit, days_requested=n_days, window_note=window_note)
             md, js = rr.write_report(settings, res, t)
             st = res["stats"]
             print(f"{hid}: {md}  signalen={st['signals']} munten={st['coins_evaluated']}/{st['coins_with_trades']} gekozen={res['selected']} bewezen={'ja' if res['selected_proven'] else 'nee'} ({st['seconds']} s)")
     finally:
         conn.close()
     return 0
+
+
+def research_window(conn, end: str, n_days: int) -> tuple[list[str], str | None]:
+    """The UTC days of a research window ending at `end`: `n_days` of them, or fewer when the database's trades do not reach back
+    that far (milestone 13: the weekly timer asks for 30 days from the first Monday on). Returns (days, a Dutch note or None)."""
+    from .research import harness as rh
+
+    days = rh.window_days(end, n_days)
+    first = conn.execute("SELECT MIN(received_at) FROM trades").fetchone()[0]
+    if first is None:
+        return days, None
+    first_day = day_key(float(first))
+    have = [d for d in days if d >= first_day]
+    if len(have) == len(days) or not have:
+        return days, None
+    note = (f"Gevraagd venster {n_days} dagen; de database heeft trades vanaf {first_day}: venster beperkt tot {len(have)} dagen ({have[0]} t/m {have[-1]}); "
+            f"de walk-forward splitst deze {len(have)} dagen.")
+    return have, note
 
 
 def main(argv: list[str] | None = None) -> int:

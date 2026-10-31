@@ -833,10 +833,22 @@ class App:
         try:
             return {"status": data.status_view(conn, self.settings, now), "coverage": data.coverage_view(conn, now), "x": data.x_view(conn, self.settings, now),
                     "report": data.report_latest_view(self.settings, now), "week": data.week_latest_view(self.settings, now), "settings": data.settings_view(self.settings),
-                    "logs": data.logs_view(self.settings, now), "report_files": data.report_files(self.settings), "views": self.views_status(now)}
+                    "logs": data.logs_view(self.settings, now), "report_files": data.report_files(self.settings), "views": self.views_status(now),
+                    "research": data.research_view(self.settings, now), "follow": self.follow_status(conn, now)}
         finally:
             if conn is not None:
                 conn.close()
+
+    def follow_status(self, conn, now: float) -> dict[str, Any]:
+        """Milestone 13: the follow step's state for the owner page (read-only; the plays daemon writes it)."""
+        from ..plays import follow as follow_mod
+
+        if conn is None:
+            return {"exists": False}
+        try:
+            return follow_mod.status(conn, self.settings, now)
+        except Exception as e:  # noqa: BLE001  the owner page must never die on a status read
+            return {"exists": False, "error": f"{type(e).__name__}: {str(e)[:80]}"}
 
     def views_status(self, now: float) -> dict[str, Any]:
         """The background computation of the public views, for /eigenaar and /api/status (milestone 10); the Terminal feed (milestone 12)."""

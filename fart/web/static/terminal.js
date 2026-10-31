@@ -565,6 +565,11 @@
     addFact(facts, 'X (1 u)', isNum(r.x_1h) ? fmtInt(r.x_1h) + ' vermeldingen' : 'meting niet beschikbaar');
     var la = lastAgeOf(r, now); addFact(facts, 'laatste trade', la === null ? '–' : fmtAge(la) + ' geleden');
     addFact(facts, 'plays', r.plays && r.plays.length ? r.plays.map(ruleName).join(', ') : 'geen regel vuurt');
+    /* milestone 13: whether the radar follows the coin (24 h of price points) and where its last point came from */
+    var fw = r.followed;
+    addFact(facts, 'gevolgd', fw ? (fw.state_label || fw.state) + ' · sinds ' + fmtAge(isNum(fw.since_age_s) ? fw.since_age_s + Math.max(0, now - serverNow()) : 0) + ' geleden · ' + (fw.reasons_label || '–') : 'nee: geen signaal van een vooraf vastgelegde hypothese, regel of observatie');
+    var lp = r.last_point;
+    addFact(facts, 'laatste punt', lp ? (lp.source_label || lp.source) + ' · ' + fmtAge(isNum(lp.age_s) ? lp.age_s + Math.max(0, now - serverNow()) : 0) + ' geleden' : 'nog geen punt');
     bindNote(r.mint);
   }
   function addFact(dl, k, v) { dl.appendChild(el('dt', null, k)); dl.appendChild(el('dd', null, v)); }

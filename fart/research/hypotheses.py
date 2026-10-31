@@ -1,4 +1,5 @@
-"""The pre-registered hypotheses of milestone 12 (B.2), in the order they are tested: H4, H5, H1, H3, H7, H2, H6.
+"""The pre-registered hypotheses of milestone 12 (B.2), in the order they are tested: H4, H5, H1, H3, H7, H2, H6; and the
+second round of milestone 13 after them: H8, H9, H10 (after graduation).
 
 Every hypothesis is a fixed statement, a scope (which coins, which moments), a grid of variants (entry parameters x exit
 rules) and one predicate `fires(variant, ctx)` that the backtest harness (fart/research/harness.py) and the plays layer
@@ -31,6 +32,7 @@ EXITS: dict[str, ExitRules] = {
     "ts5": ExitRules(trailing_frac=None, time_stop_s=300.0),
     "ts10": ExitRules(trailing_frac=None, time_stop_s=600.0),
     "ts15": ExitRules(trailing_frac=None, time_stop_s=900.0),
+    "ts30": ExitRules(trailing_frac=None, time_stop_s=1800.0),
     "ts60": ExitRules(trailing_frac=None, time_stop_s=3600.0),
     "grad_tr30": ExitRules(trailing_frac=0.30, sell_at_graduation=True),
     "devsell_tr30": ExitRules(trailing_frac=0.30, sell_at_dev_sell=True),
@@ -39,7 +41,7 @@ EXITS: dict[str, ExitRules] = {
 EXIT_LABELS_NL = {
     "ladder60_tr30": "50% verkopen bij +60%, rest trailing 30%", "ladder40_tr30": "50% verkopen bij +40%, rest trailing 30%",
     "ladder100_tr30": "50% verkopen bij +100%, rest trailing 30%", "tr20": "trailing stop 20%", "tr30": "trailing stop 30%", "tr50": "trailing stop 50%",
-    "ts5": "tijdstop 5 min", "ts10": "tijdstop 10 min", "ts15": "tijdstop 15 min", "ts60": "tijdstop 60 min",
+    "ts5": "tijdstop 5 min", "ts10": "tijdstop 10 min", "ts15": "tijdstop 15 min", "ts30": "tijdstop 30 min", "ts60": "tijdstop 60 min",
     "grad_tr30": "verkopen bij graduatie (trailing 30% tot dan)", "devsell_tr30": "verkopen bij eerste dev-verkoop (trailing 30% tot dan)",
     "tr25_24h": "trailing stop 25% op uurschaal (hoogstens 24 u)",
 }
@@ -60,7 +62,7 @@ class Ctx:
     creator: dict[str, Any] | None = None       # creator_history, lazily computed by the harness when `needs_creator`
     theme: dict[str, Any] | None = None         # H3: {"role": leader_first | leader_strongest | copy, "term", "decision_as_of"}
     sample: dict[str, Any] | None = None        # H6: the post-graduation sample at t: price_sol, volume_h1_usd, liquidity_sol
-    grad_price_sol: float | None = None         # H6: the spot at the graduation point
+    grad_price_sol: float | None = None         # H6, H8-H10: the spot at the graduation point
     hour_utc: int = 0
 
     @property
@@ -94,7 +96,8 @@ class Hypothesis:
     first_tick_s: float = 15.0
     needs_creator: bool = False
     needs_theme: bool = False
-    post_graduation: bool = False  # H6: the signal lives after the graduation
+    post_graduation: bool = False  # H6, H8-H10: the signal lives after the graduation
+    post_grad_horizon_s: float = 0.0   # milestone 13 (H8-H10): how long after the graduation the rule is evaluated, one tick per minute
     notes_nl: list[str] = field(default_factory=list)
 
     def variant(self, vid: str) -> Variant | None:
@@ -345,6 +348,118 @@ H6 = Hypothesis(
 )
 
 
+# =====================================================================================================================
+# Milestone 13: the second round, pre-registered on 31 October 2026 in the order of expectation: H8, H9, H10. They test
+# the one place where the week's winners were tradable: AFTER graduation (the autopsy of 31 Oct 2026 found 0 organic winners
+# and 266 bundled ones that graduated at a median age of 0.00 min; before graduation there was nothing to do). Their path is
+# complete (the tracker's samples every 300 s and the minute candles of the first hour; the harness replays one tick per
+# minute after the graduation on that path). What the data knows and does not know, said in every report:
+# * the price at a tick is the last post-graduation point at or before it (a candle close or a sample), never interpolated;
+# * the volume since graduation is the sum of the candle volumes of the minutes since the graduation (knowable at the tick),
+#   else the latest sample's hourly pool volume; the volume of the last 5 minutes needs candles (no candles: no H9 signal);
+# * "the maker has not sold" means: no sell by the creator wallet on the curve up to the graduation. The radar has no pool
+#   trades, so a dev sell AFTER graduation is invisible; H8's counter-proof is the maker who sold on the curve.
+# At most 12 variants per hypothesis; every variant counts in the multiplicity note.
+# =====================================================================================================================
+H8_V_USD = (10_000.0, 25_000.0)
+H8_N_MIN = (2, 5, 10)
+
+
+def _post_ready(ctx: Ctx, min_points: int = 1) -> bool:
+    f = ctx.f
+    return ctx.graduated and ctx.grad_price_sol is not None and f.get("price_sol") is not None and int(f.get("points_since_graduation") or 0) >= min_points
+
+
+def _h8_fires(v: Variant, ctx: Ctx) -> bool:
+    e = v.entry
+    if not _post_ready(ctx) or int(round(float(ctx.f.get("minutes_after_graduation") or -1))) != int(e["minutes"]):
+        return False
+    sold = bool(ctx.f.get("dev_sold_before_graduation"))
+    if (e["dev"] == "held") == sold:
+        return False
+    vol = ctx.f.get("volume_since_graduation_usd")
+    return float(ctx.f["price_sol"]) > float(ctx.grad_price_sol) and vol is not None and float(vol) >= float(e["min_volume_usd"])
+
+
+def _h8_variants() -> list[Variant]:
+    grid = [("held", 2, 10_000.0, "tr30"), ("held", 2, 10_000.0, "ts60"), ("held", 5, 10_000.0, "ladder60_tr30"), ("held", 5, 10_000.0, "tr30"), ("held", 5, 10_000.0, "ts30"),
+            ("held", 5, 10_000.0, "ts60"), ("held", 10, 10_000.0, "tr30"), ("held", 10, 10_000.0, "ts60"), ("held", 5, 25_000.0, "tr30"), ("held", 5, 25_000.0, "ts60"),
+            ("sold", 5, 10_000.0, "tr30"), ("sold", 5, 10_000.0, "ts60")]
+    out = []
+    for dev, n, vol, ex in grid:
+        who = "maker heeft niet verkocht" if dev == "held" else "maker heeft WEL verkocht (tegenproef)"
+        out.append(Variant(f"{dev}_n{n}_v{int(vol / 1000)}k_{ex}", f"{n} min na graduatie, {who}, boven de graduatieprijs, volume sinds graduatie ≥ ${int(vol):,}".replace(",", ".") + f", {EXIT_LABELS_NL[ex]}",
+                           {"dev": dev, "minutes": n, "min_volume_usd": vol}, ex, group=f"{dev}_n{n}" + ("_v25k" if vol == 25_000.0 else "")))
+    return out
+
+
+H8 = Hypothesis(
+    id="H8", title_nl="Dev houdt vast na graduatie",
+    statement_nl=("Een gegradueerde munt waarvan de maker op de curve niet verkocht heeft, die N minuten na de graduatie (N 2/5/10) boven de graduatieprijs staat "
+                  "en sinds de graduatie minstens V dollar volume heeft gedaan (V $10.000 / $25.000), geeft na kosten een positieve verwachte waarde bij een instap op "
+                  "dat moment. Tegenproef: dezelfde regel bij een maker die op de curve wél verkocht."),
+    scope_nl=("Elke graduatie in het venster met een prijspad na de graduatie (candles van het eerste uur, samples van de tracker); de toets staat op de tick van N minuten "
+              "na de graduatie. Twaalf vooraf vastgelegde varianten: N 2/5/10 bij V $10k met trailing 30% en tijdstop 60 min, bij N 5 ook de ladder +60% en de tijdstop 30 min, "
+              "N 5 bij V $25k, en de tegenproef (maker verkocht) bij N 5 / V $10k."),
+    expectation_nl="De 'maker houdt vast'-varianten hebben een positieve bewezen ondergrens; de tegenproef een lagere verwachte waarde.",
+    variants=_h8_variants(), fires=_h8_fires, horizon_s=86400.0, post_graduation=True, post_grad_horizon_s=600.0,
+    notes_nl=["'De maker heeft niet verkocht' is wat de radar weet: geen verkoop van de maker-wallet op de curve tot de graduatie. Verkopen op de pool ziet de radar niet.",
+              "Het volume sinds de graduatie komt uit de minuutcandles (kenbaar op de tick); zonder candles uit de laatste sample van de tracker; zonder beide vuurt de regel niet."],
+)
+
+
+# ----- H9 Terugval na graduatie -------------------------------------------------------------------------------------------------
+H9_X = (0.20, 0.30, 0.40)
+H9_Y_USD = 2_500.0
+H9_EXITS = ("tr20", "tr30", "ts15", "ts60")
+H9_WINDOW_S = 1800.0
+
+
+def _h9_fires(v: Variant, ctx: Ctx) -> bool:
+    f = ctx.f
+    if not _post_ready(ctx, min_points=2) or float(f.get("minutes_after_graduation") or 0) * 60.0 > H9_WINDOW_S:
+        return False
+    dd, vol5 = f.get("drawdown_from_peak"), f.get("volume_5m_usd")
+    return dd is not None and float(dd) >= float(v.entry["min_drawdown"]) and vol5 is not None and float(vol5) >= float(v.entry["min_volume_5m_usd"])
+
+
+H9 = Hypothesis(
+    id="H9", title_nl="Terugval na graduatie",
+    statement_nl=("Een gegradueerde munt die binnen 30 minuten na de graduatie minstens X% (20/30/40) onder haar piek sinds de graduatie staat terwijl het volume van de "
+                  "laatste 5 minuten nog minstens $2.500 is, herstelt vaker dan niet: een instap op die tick geeft na kosten een positieve verwachte waarde."),
+    scope_nl="Elke graduatie in het venster met minuutcandles in het eerste uur (de terugval en het 5-minutenvolume komen daaruit; zonder candles geen signaal); X uit 20/30/40%, één Y van $2.500.",
+    expectation_nl="Een positieve bewezen ondergrens op minstens één X; de kosten zijn de PumpSwap-fee van 0,25% per kant en de impact uit de liquiditeit.",
+    variants=[Variant(f"x{int(100 * x)}_{ex}", f"≥ {int(100 * x)}% onder de piek sinds graduatie binnen 30 min, volume 5 min ≥ $2.500, {EXIT_LABELS_NL[ex]}",
+                      {"min_drawdown": x, "min_volume_5m_usd": H9_Y_USD}, ex, group=f"x{int(100 * x)}") for x in H9_X for ex in H9_EXITS],
+    fires=_h9_fires, horizon_s=86400.0, post_graduation=True, post_grad_horizon_s=H9_WINDOW_S,
+    notes_nl=["De piek sinds de graduatie is de hoogste candle-slotkoers of sample tot de tick; de terugval is 1 − prijs / piek. Niets wordt geïnterpoleerd."],
+)
+
+
+# ----- H10 Themaleider na graduatie ----------------------------------------------------------------------------------------------
+H10_ROLES = (("leader", "de eerste gegradueerde munt van het thema"), ("copy", "een later gegradueerde kopie van hetzelfde thema (tegenbewijs)"))
+H10_EXITS = ("tr30", "ts60")
+H10_AFTER_MIN = 2
+
+
+def _h10_fires(v: Variant, ctx: Ctx) -> bool:
+    th = ctx.theme
+    if th is None or not ctx.graduated or ctx.grad_price_sol is None:
+        return False
+    return th.get("role") == v.entry["role"] and int(round(float(ctx.f.get("minutes_after_graduation") or -1))) == H10_AFTER_MIN
+
+
+H10 = Hypothesis(
+    id="H10", title_nl="Themaleider na graduatie",
+    statement_nl=("Van een brandend thema (een thema-observatie van de engine) wint de munt die als eerste gradueert; de kopieën van hetzelfde thema die later gradueren "
+                  "verliezen. De instap is 2 minuten na de graduatie; de uitstap een trailing stop van 30% of na 60 minuten."),
+    scope_nl="Elke thema-observatie in het venster; van de munten van de laatste 3 uur met het woord in naam of ticker (en de kopieën tot 2 uur na de observatie) de graduaties, in volgorde van graduatie.",
+    expectation_nl="De leider-varianten hebben een positieve bewezen ondergrens; de kopie-variant niet.",
+    variants=[Variant(f"{role}_{ex}", f"{label}, instap 2 min na graduatie, {EXIT_LABELS_NL[ex]}", {"role": role}, ex, group=role) for role, label in H10_ROLES for ex in H10_EXITS],
+    fires=_h10_fires, horizon_s=86400.0, needs_theme=True, post_graduation=True, post_grad_horizon_s=120.0,
+)
+
+
 # ----- Milestone 13: the follow triggers -----------------------------------------------------------------------------------
 # A coin is FOLLOWED (fart/plays/follow.py: 24 hours of price points from the cheapest sufficient source, so every signal of
 # every pre-registered hypothesis gets a measurable outcome) from the first tick at which it meets the widest entry condition
@@ -390,8 +505,9 @@ def follow_trigger(tid: str) -> FollowTrigger | None:
     return next((t for t in FOLLOW_TRIGGERS if t.id == tid), None)
 
 
-HYPOTHESES: dict[str, Hypothesis] = {h.id: h for h in (H4, H5, H1, H3, H7, H2, H6)}
-ORDER = ["H4", "H5", "H1", "H3", "H7", "H2", "H6"]
+HYPOTHESES: dict[str, Hypothesis] = {h.id: h for h in (H4, H5, H1, H3, H7, H2, H6, H8, H9, H10)}
+ORDER = ["H4", "H5", "H1", "H3", "H7", "H2", "H6", "H8", "H9", "H10"]
+ROUND_TWO = ("H8", "H9", "H10")     # milestone 13: the post-graduation round, replayed on the post-graduation path
 
 
 def get(hid: str) -> Hypothesis:

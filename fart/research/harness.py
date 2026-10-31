@@ -435,7 +435,7 @@ class Harness:
         h = self.hyp
         if h.id == "H3":
             return sorted(self.theme_roles().keys())
-        if h.id == "H6":
+        if h.id == "H6" or h.post_graduation:
             return [str(r[0]) for r in self.conn.execute(f"SELECT mint FROM migrations WHERE {ET} >= ? AND {ET} < ? ORDER BY {ET}", (self.start, self.end))]
         if h.id == "H2":
             # coins whose curve passed 75 SOL (virtual 105 SOL) inside the window, seen on a trade or (milestone 13) on a poll
@@ -536,6 +536,8 @@ class Harness:
         pending = {v.id: v for v in self.variants}
         if h.id == "H6":
             return self._signals_h6(coin, pending)
+        if h.post_graduation:
+            return self._signals_post_grad(coin, pending)
         if h.id == "H3":
             role = self.theme_roles().get(coin.mint)
             if role is None:
@@ -619,6 +621,95 @@ class Harness:
                 out[vid] = (t, {**f, "sample": sample})
         return out
 
+    def _signals_post_grad(self, coin: Coin, pending: dict[str, hyps.Variant]) -> dict[str, tuple[float, dict[str, Any]]]:
+        """Milestone 13 (H8-H10): one tick per minute after the graduation on the post-graduation path (candles, samples), with the
+        price as the last point at or before the tick, the peak since the graduation, the drawdown from it, the volume since the
+        graduation (candles, else the sample's pool volume) and of the last five minutes (candles only), the creator's sells on
+        the curve up to the graduation and, for H10, the theme role by graduation order. Nothing is interpolated."""
+        out: dict[str, tuple[float, dict[str, Any]]] = {}
+        h = self.hyp
+        if coin.grad_t is None or not (self.start <= coin.grad_t < self.end):
+            return out
+        path = price_path(coin, coin.grad_t)
+        grad_pt = next((p for p in path if p.graduation), None)
+        grad_price = grad_pt.spot(self.params) if grad_pt is not None else None
+        if grad_price is None:
+            return out
+        post = [(p.t, p.spot(self.params)) for p in path if p.t > coin.grad_t and p.spot(self.params) is not None]
+        candles = sorted(((float(c["minute"]), c.get("volume_usd")) for c in coin.candles if c.get("minute") is not None and float(c["minute"]) >= coin.grad_t - 60), key=lambda x: x[0])
+        samples = sorted(((float(s["ts"]), sample_volume_h1(s)) for s in coin.samples if float(s["ts"]) >= coin.grad_t), key=lambda x: x[0])
+        dev_sold = any(x.t <= coin.grad_t and not x.is_buy and x.buyer is not None and x.buyer == coin.creator for x in coin.trades)
+        role = self.theme_grad_roles().get(coin.mint) if h.needs_theme else None
+        if h.needs_theme and role is None:
+            return out
+        self.stats["graduations"] += 1
+        minutes = int(h.post_grad_horizon_s // 60)
+        for k in range(1, minutes + 1):
+            t = coin.grad_t + 60.0 * k
+            if t < self.start or t >= self.end + 86400:
+                continue
+            self.stats["ticks"] += 1
+            seen = [(pt, sp) for pt, sp in post if pt <= t]
+            price = seen[-1][1] if seen else grad_price
+            peak = max([grad_price] + [sp for _, sp in seen])
+            vol_c = [v for m, v in candles if m + 60.0 <= t and v is not None] if candles else None
+            vol_since = sum(vol_c) if vol_c else None
+            if vol_since is None and samples:
+                last_s = [v for ts, v in samples if ts <= t and v is not None]
+                vol_since = last_s[-1] if last_s else None
+            vol_5m = sum(v for m, v in candles if m + 60.0 <= t and m + 60.0 > t - 300.0 and v is not None) if candles and any(m + 60.0 <= t for m, _ in candles) else None
+            f = {"as_of": t, "age_s": round(t - coin.created_t, 1), "minutes_after_graduation": round((t - coin.grad_t) / 60.0, 3), "price_sol": price, "grad_price_sol": grad_price,
+                 "peak_since_graduation_sol": peak, "drawdown_from_peak": None if not peak else round(1.0 - price / peak, 4), "points_since_graduation": len(seen),
+                 "volume_since_graduation_usd": vol_since, "volume_5m_usd": vol_5m, "dev_sold_before_graduation": dev_sold, "theme_role": role.get("role") if role else None,
+                 "has_candles": bool(candles)}
+            ctx = hyps.Ctx(coin.mint, coin.created_t, t, f, None, {}, {}, True, coin.grad_t, None, role, None, grad_price, int(time.gmtime(t).tm_hour))
+            for vid in list(pending):
+                try:
+                    fired = bool(h.fires(pending[vid], ctx))
+                except Exception:  # noqa: BLE001
+                    log.error("research.predicate_failed", hypothesis=h.id, variant=vid, mint=coin.mint, exc_info=True)
+                    fired = False
+                if fired:
+                    out[vid] = (t, {**f, "theme": role})
+                    del pending[vid]
+            if not pending:
+                break
+        return out
+
+    def theme_grad_roles(self) -> dict[str, dict[str, Any]]:
+        """H10: mint -> {role: leader | copy, term, decision_as_of} by graduation order: of the coins that carry a theme's word (the
+        coins of the window before the observation and the copies up to two hours after it) the first to graduate is the leader,
+        every later graduation of the same theme a copy. The first theme a coin belongs to wins."""
+        if getattr(self, "_grad_roles", None) is not None:
+            return self._grad_roles
+        from ..engine.meta import load_stopwords, tokenize
+
+        ecfg = self.settings.config("engine")
+        mcfg = ecfg.get("meta") or {}
+        window_s = float(mcfg.get("window_s", 10800))
+        min_len = int(mcfg.get("min_token_len", 4))
+        stop = load_stopwords(self.settings.config("stopwords"))
+        roles: dict[str, dict[str, Any]] = {}
+        decs = self.conn.execute("SELECT term, as_of FROM decisions WHERE kind='observe_meta' AND verdict='observe' AND as_of >= ? AND as_of < ? ORDER BY as_of",
+                                 (self.start - window_s, self.end)).fetchall()
+        seen_terms: set[str] = set()
+        for d in decs:
+            term, as_of = str(d["term"]), float(d["as_of"])
+            if term in seen_terms:
+                continue
+            seen_terms.add(term)
+            grads = []
+            for r in self.conn.execute(f"SELECT c.mint, c.name, c.symbol, {ET.replace('block_time', 'm.block_time').replace('received_at', 'm.received_at')} AS gt FROM coins c"
+                                       f" JOIN migrations m ON m.mint = c.mint WHERE COALESCE(c.block_time, c.received_at) > ? AND COALESCE(c.block_time, c.received_at) <= ? ORDER BY gt",
+                                       (as_of - window_s, as_of + 7200.0)):
+                if term in tokenize(r["name"], r["symbol"], stop, min_len):
+                    grads.append((str(r["mint"]), float(r["gt"])))
+            for i, (mint, gt) in enumerate(grads):
+                if mint not in roles:
+                    roles[mint] = {"role": "leader" if i == 0 else "copy", "term": term, "decision_as_of": as_of, "graduated_t": gt}
+        self._grad_roles = roles
+        return roles
+
     def execute(self, coin: Coin, variant: hyps.Variant, signal_t: float, feats: dict[str, Any], entry_delay_s: float | None = None,
                 size_sol: float | None = None, include_polls: bool = True) -> Case:
         delay = self.cfg.entry_delay_s if entry_delay_s is None else float(entry_delay_s)
@@ -637,7 +728,8 @@ class Harness:
         cap = capacity_sol(CurveState(int(vs), int(vt)), self.params) if vs and vt else None
         compact = {k: feats.get(k) for k in ("unique_buyers_5m", "net_sol_5m", "largest_buyer_share_15m", "dev_buy_frac_of_curve", "bundled_any", "bundle_reasons",
                                              "dev_first_sell_t", "mcap_sol", "graduation_progress", "curve_sol", "trades_total", "creator_track_record",
-                                             "creator_graduations", "creator_winners", "theme", "volume_h1_usd", "curve_source") if k in feats}
+                                             "creator_graduations", "creator_winners", "theme", "volume_h1_usd", "curve_source", "minutes_after_graduation",
+                                             "drawdown_from_peak", "volume_since_graduation_usd", "volume_5m_usd", "dev_sold_before_graduation", "theme_role") if k in feats}
         last_sell = next((f for f in reversed(pos.fills) if f.kind == "sell"), None) if status == "closed" else None
         return Case(variant.id, variant.group, coin.mint, day_key(signal_t), signal_t, int(time.gmtime(signal_t).tm_hour), status, pos.pnl_sol, pos.pnl_pct,
                     pos.exit_reason, round(pos.fees_sol, 9), entry_spot, entry.fill_price if entry else None, entry.impact if entry else None,
@@ -657,6 +749,8 @@ class Harness:
             buyers = {x.buyer for x in early if x.is_buy and x.buyer}
             need = min(int(v.entry.get("min_buyers", 0)) for v in self.variants) if self.variants else 0
             return len(buyers) >= need
+        if h.post_graduation:
+            return coin.grad_t is not None
         return bool(coin.trades) or h.id == "H6"
 
     def run(self) -> dict[str, Any]:

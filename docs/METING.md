@@ -287,3 +287,40 @@ cijfers en de uitstapregel in gewone woorden en linkt naar onze Terminal, nooit 
 naar externe terminals, op eigen rekening. Een rapport met "niet bewezen" is een afgerond resultaat: de fabriek werkte, de
 edge toonde zich niet in deze data. De regels van de engine zijn onveranderd (vingerafdruk `sha256:d45c41793c64`, de
 bewezen gelijkwaardige van de meetweek); het onderzoek leest ze alleen.
+
+## Mijlpaal 13: elk signaal meetbaar, en de tweede ronde
+
+**Waarom.** De eerste echte onderzoeksrun (31 oktober 2026) liet 54 tot 97% van de uitkomsten onbekend, omdat het prijspad van
+een munt ophield zodra de trade-stream haar losliet. Onbekend blijft onbekend (nooit interpoleren), dus moest het pad langer
+worden, niet de definitie soepeler.
+
+**Gevolgde munt.** Een munt die op het ruimste niveau een instapvoorwaarde van een hypothese haalt (minstens 10 unieke kopers in 5
+minuten voor H1/H4/H5/H7, een thema-munt met trades voor H3, een curve van 60 SOL voor H2), een munt waarop een play-regel
+vuurt of een munt met een observe-beslissing wordt 24 uur gevolgd. Haar prijspad komt uit de goedkoopste toereikende bron:
+de trade-stream zolang die het abonnement heeft; daarbuiten en vóór graduatie **polls** van het curve-account (elke 60 s in de
+eerste 2 uur, daarna elke 300 s): de curve heeft altijd een prijs, ook zonder trade; na graduatie de samples van de tracker en
+de minuutcandles. In het rapport staat per variant op welke bron de instappen en uitstappen vulden (trade / poll / sample /
+candle), en de gevoeligheidstabel heeft een rij "alleen trade-punten (zonder polls)": het verschil is wat de polls veranderen.
+Een dev-verkoop is alleen op een trade-punt zichtbaar; een uitstap "bij de eerste dev-verkoop" vuurt dus nooit op een poll.
+Het rapport splitst de signalen in vóór en ná de start van het volgen: oudere signalen krijgen geen pad met terugwerkende
+kracht, en alleen de "ná"-helft zegt iets over het doel (onder 20% onbekend).
+
+**Tracker.** De tracker samplet elk onderwerp van zijn venster elke 300 s (cap 2.000, nieuwste eerst, binnen een tijdsbudget);
+`fart status` toont de duur per stap en het aandeel graduaties van de laatste 24 uur met een sample minstens elke 10 minuten
+(de dekkingsregel van het dag- en weekrapport; doel ≥ 90%). Meer samples onder dezelfde regels is dezelfde methode (m1.0).
+
+**Tweede ronde (na graduatie, vooraf vastgelegd op 31 oktober 2026).** **H8** Dev houdt vast na graduatie: instap N minuten na
+graduatie (2/5/10) als de maker op de curve niet verkocht heeft, de prijs boven de graduatieprijs staat en het volume sinds de
+graduatie minstens $10.000 (of $25.000) is; tegenproef: de maker verkocht wél. **H9** Terugval na graduatie: binnen 30 minuten
+minstens 20/30/40% onder de piek sinds graduatie, met nog $2.500 volume in de laatste 5 minuten. **H10** Themaleider na
+graduatie: de eerst gegradueerde munt van een brandend thema tegenover de kopieën, instap 2 minuten na graduatie. Samen 28
+varianten (173 in totaal); elke variant telt in de multipliciteitsnoot. De prijs op een tick is het laatste bekende punt op of
+vóór die tick; het volume sinds graduatie komt uit de candles (zonder candles uit de laatste sample; zonder beide geen
+signaal); het 5-minutenvolume alleen uit candles. "De maker heeft niet verkocht" betekent: niet op de curve; de radar ziet geen
+pool-trades, en de autopsie noemt een dev-verkoop na graduatie dan ook "niet gemeten".
+
+**Wekelijks.** Elke maandag 07:00 UTC draait het harnas alle hypotheses over 30 dagen (of zoveel dagen als de database heeft; het
+rapport zegt dat) en de autopsie. `/plays` toont per hypothese de gekozen variant, het oordeel, het onbekend-aandeel en de datum;
+`/eigenaar` de volledige lijst. Niets hiervan verstuurt of promoveert iets: promotie blijft `fart research promote`, en die
+weigert alles wat niet bewezen is.
+

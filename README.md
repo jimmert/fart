@@ -1,5 +1,33 @@
 # fart
 
+## Voor Jim: wat milestone 13 toevoegt
+
+Mijlpaal 13 maakt elk signaal meetbaar. De eerste echte onderzoeksrun (31 oktober) bewees niets, en de cijfers zeiden waarom: tot
+97% van de uitkomsten bleef onbekend omdat het prijspad van een munt ophield zodra de trade-stream haar losliet, en de tracker
+dekte een derde van de graduaties. Onbekend blijft onbekend, dus wordt het pad langer, niet de definitie soepeler. De beslissingen
+staan in `docs/DECISIONS.md` ("Milestone 13"), de uitrol in `deploy/DEPLOY.md` ("Milestone 13: volgen en tracker"):
+
+1. **Volgen van signalen.** Elke munt die het ruimste niveau van een hypothese haalt (10 unieke kopers in 5 minuten, een thema-munt
+   met trades, een curve van 60 SOL), elke munt waarop een regel vuurt en elke observe-beslissing wordt 24 uur gevolgd. Buiten de
+   stream en vóór graduatie leest de plays-daemon het curve-account zelf (honderd munten per aanroep, 20 CU, elke 60 s in de eerste
+   twee uur en daarna elke 300 s); na graduatie doen de tracker en de candles het. Een eigen dagaandeel van de CU-cap (10%),
+   hoogstens 1.500 munten tegelijk, en bij druk wordt het interval langer in plaats van dat er iets stopt. `fart status` heeft de
+   regel `follow:` met gevolgde munten, polls, CU, de bron van het laatste punt, achterstand en degradatiestand.
+2. **Tracker.** Elk onderwerp elke 5 minuten (cap 600 → 2.000, DexScreener 100 → 200 per minuut), binnen een tijdsbudget; `fart
+   status` toont de duur per stap en het aandeel graduaties met een sample elke 10 minuten (doel ≥ 90%).
+3. **Harnas en plays lezen de polls.** Een instap of uitstap mag op een poll vullen; elk rapport zegt per variant waar de vullingen
+   vandaan kwamen, heeft een rij "alleen trade-punten" en splitst de signalen van vóór en ná de uitrol. Een dev-verkoop is alleen op
+   een trade zichtbaar; het rapport zegt dat.
+4. **Tweede ronde hypotheses, na graduatie** (waar de winnaars van deze week verhandelbaar waren): H8 de dev houdt vast, H9 de
+   terugval, H10 de themaleider; 28 varianten, vooraf vastgelegd, met een autopsie-deel "na graduatie".
+5. **Wekelijks en zichtbaar.** Elke maandag 07:00 UTC draait het harnas alles over 30 dagen (of zoveel dagen als er zijn);
+   `/plays` toont per hypothese de stand, `/eigenaar` de volledige lijst, en de Terminal zegt per munt of hij gevolgd wordt en waar
+   het laatste punt vandaan kwam. Photon en GMGN zijn als link bevestigd; Axiom en BullX nog niet.
+
+Na de uitrol: `fart status | grep -E 'follow|tracker'` binnen een uur, en na 48 uur `fart research run --hypothesis all --days 3`:
+in de rapporten moet de "ná"-helft van de curvefase-hypotheses onder 20% onbekend liggen. Het platform plaatst nog altijd nooit een
+order en kent geen wallet; de bevroren regels zijn byte-gelijk.
+
 ## Voor Jim: wat milestone 12 toevoegt
 
 Mijlpaal 12 geeft je twee dingen naast de bevroren engine: een **Terminal** om live te kijken en te handelen via je eigen

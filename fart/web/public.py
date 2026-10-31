@@ -1407,6 +1407,7 @@ def plays_view(conn: sqlite3.Connection | None, settings: Settings, now: float) 
     if not rules:
         out["note"] = ("Nog geen bewezen regel: config/plays.json is leeg. Het onderzoeksharnas (fart research) toetst de vooraf vastgelegde hypotheses op onze eigen data; "
                        "pas een variant die op de toetshelft bewezen is, komt hier als regel. Tot die tijd staat alles klaar en staat hier niets.")
+    out["research"] = research_state(settings)   # milestone 13: the last research run per hypothesis, under the rules
     if conn is None:
         out["note"] = out.get("note") or "Er zijn nog geen gegevens."
         return out
@@ -1444,6 +1445,39 @@ def plays_view(conn: sqlite3.Connection | None, settings: Settings, now: float) 
 
 def sol_signed(x: Any, decimals: int = 4) -> str:
     return "onbekend" if x is None else (f"{float(x):+.{decimals}f} SOL").replace(".", ",")
+
+
+def research_state(settings: Settings) -> dict[str, Any]:
+    """Milestone 13: per pre-registered hypothesis the newest report's state (the chosen variant, the verdict, the unknown share on
+    the test half, the date), from out/research/latest.json; never the cases, never a path. Empty, and saying so, before the
+    first run."""
+    from ..research import hypotheses as hyps
+    from ..research.report import load_latest
+
+    latest = load_latest(settings)
+    rows = []
+    for hid in hyps.ORDER:
+        h = hyps.get(hid)
+        r = latest.get(hid)
+        if r is None:
+            rows.append({"hypothesis": hid, "title": h.title_nl, "round": 2 if hid in hyps.ROUND_TWO else 1, "state": "none", "verdict_label": "nog niet getoetst", "selected": None,
+                         "selected_label": None, "unknown_share": None, "unknown_label": "–", "cases": None, "ev_label": "–", "date": None, "date_label": "–", "variants": len(h.variants)})
+            continue
+        ts = data.iso_to_ts(r.get("generated_at"))
+        rows.append({"hypothesis": hid, "title": r.get("title") or h.title_nl, "round": 2 if hid in hyps.ROUND_TWO else 1,
+                     "state": "proven" if r.get("proven") else ("rejected" if r.get("selected") else "none"), "verdict_label": r.get("verdict") or "onbekend",
+                     "selected": r.get("selected"), "selected_label": r.get("selected_label"), "unknown_share": r.get("unknown_share"),
+                     "unknown_label": pct(r.get("unknown_share")) if r.get("unknown_share") is not None else "–", "cases": r.get("cases"),
+                     "ev_label": sol_signed(r.get("ev_sol")) if r.get("ev_sol") is not None else "–",
+                     "ci_label": (f"{sol_signed(r.get('ci_low_sol'))} tot {sol_signed(r.get('ci_high_sol'))}" if r.get("ci_low_sol") is not None else "–"),
+                     "date": r.get("generated_at"), "date_label": fmt_time(ts) if ts else "–", "days": len(r.get("days") or []), "variants": r.get("variants_tested"),
+                     "unknown_after_follow": r.get("unknown_share_after_follow"),
+                     "unknown_after_follow_label": pct(r.get("unknown_share_after_follow")) if r.get("unknown_share_after_follow") is not None else "–",
+                     "window_note": r.get("window_note")})
+    return {"rows": rows, "any": any(r["state"] != "none" for r in rows), "updated_label": max((r["date_label"] for r in rows if r["date"]), default="–"),
+            "definition": ("Elke maandag 07:00 UTC toetst het harnas alle vooraf vastgelegde hypotheses over de laatste 30 dagen (zolang er minder dagen zijn: zoveel als er zijn). "
+                           "Per hypothese staat hier de vooraf gekozen variant, het oordeel op de toetshelft, het aandeel onbekende uitkomsten en de datum. "
+                           "Alleen een bewezen variant kan een regel worden; niets hier is advies.")}
 
 
 def play_row(r: dict[str, Any], names: dict[str, tuple[str | None, str | None]], now: float) -> dict[str, Any]:

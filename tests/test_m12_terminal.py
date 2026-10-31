@@ -152,14 +152,15 @@ def test_terminal_and_plays_pages_render_for_a_visitor(live):
     assert m, "the configuration travels in a data attribute"
     cfg = json.loads(unescape(m.group(1)))
     assert [t["name"] for t in cfg["terminals"]] == ["Axiom", "Photon", "BullX", "GMGN"]
-    assert all(t["url"].startswith("https://") and "{mint}" in t["url"] and t["verified"] is False for t in cfg["terminals"])
+    assert all(t["url"].startswith("https://") and "{mint}" in t["url"] for t in cfg["terminals"])
+    assert {t["name"]: t["verified"] for t in cfg["terminals"]} == {"Axiom": False, "Photon": True, "BullX": False, "GMGN": True}   # milestone 13: two patterns confirmed by hand
     assert {p["id"] for p in cfg["presets"]} == {"nieuw", "momentum", "bijna", "organisch", "thema", "makers"}
     assert [c["id"] for c in cfg["columns"]] == [c[0] for c in terminal.COLUMNS] and len(cfg["columns"]) == 17
     assert cfg["links"] == {"pumpfun": "https://pump.fun/coin/{mint}", "dexscreener": "https://dexscreener.com/solana/{mint}", "solscan": "https://solscan.io/token/{mint}"}
     assert cfg["stream"] == "/api/public/stream" and cfg["snapshot"] == "/api/public/terminal" and cfg["pulse_s"] == 15 and cfg["follow_max"] == 50
     assert cfg["creates_window_s"] == 1800
     for needle in ('id="t-body"', 'id="t-filters"', 'data-preset="organisch"', 'data-preset="bijna"', 'id="t-follow"', 'id="t-plays"', 'id="d-note"', 'id="t-sound"',
-                   "1 tot 5", "config/plays.json is leeg", "docs/UNVERIFIED.md", "Axiom, Photon, BullX, GMGN", 'data-sort="buyers"', 'data-col="x"', "kopieer het mint-adres"):
+                   "1 tot 5", "config/plays.json is leeg", "docs/UNVERIFIED.md", "Axiom, BullX", 'data-sort="buyers"', 'data-col="x"', "kopieer het mint-adres"):
         assert needle in html, needle
     assert html.count("<th ") == 17
     st2, h2, body2 = client.req("GET", "/terminal", {"If-None-Match": _headers(h)["etag"]})
