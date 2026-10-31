@@ -14,8 +14,10 @@
   "sampling": {
     "interval_s": 300,
     "dexscreener_batch": 30,
-    "max_mints_per_run": 600,
-    "track_window_s": 90000
+    "max_mints_per_run": 2000,
+    "track_window_s": 90000,
+    "time_budget_s": 150,
+    "_comment": "Milestone 13: max_mints_per_run 600 -> 2000 so every subject of the window (observe decisions plus graduations of the last 25 hours; about 1,100 on the VPS on 31 Oct 2026, 428 over the old cap per run) is sampled every run; newest anchor first when a bound bites. time_budget_s bounds the sampling step (67 requests of 30 mints at the DexScreener gate of 200 per minute take about 40 s); the mints left when it passes are counted as skipped (time_budget). Fidelity, not a method change: more samples under method_version m1.0."
   },
   "sol_usd": {
     "cache_s": 60,
@@ -42,8 +44,9 @@
     ]
   },
   "tracker": {
-    "_comment": "Tracker fidelity (milestone 5, point 4): a graduation counts as tracker-covered when its mcap_samples rows in the winner window are never more than max_sample_gap_s apart (the tracker runs every 300 s; 600 s allows one missed run). A graduation whose stored outcome says 'no winner' but that is NOT tracker-covered is reported as 'uitkomst onbekend' (a peak between sparse samples may have been missed), never as 'geen winnaar'. A graduation that IS a winner stays a winner (sparse samples cannot invent a peak). The outcomes rows themselves are unchanged (method_version m1.0).",
-    "max_sample_gap_s": 600
+    "_comment": "Tracker fidelity (milestone 5, point 4): a graduation counts as tracker-covered when its mcap_samples rows in the winner window are never more than max_sample_gap_s apart (the tracker runs every 300 s; 600 s allows one missed run). A graduation whose stored outcome says 'no winner' but that is NOT tracker-covered is reported as 'uitkomst onbekend' (a peak between sparse samples may have been missed), never as 'geen winnaar'. A graduation that IS a winner stays a winner (sparse samples cannot invent a peak). The outcomes rows themselves are unchanged (method_version m1.0). Milestone 13: run_budget_s is the time budget of a whole `fart measure track` run against the unit's TimeoutStartSec=240: the sampling gets sampling.time_budget_s, the creator statistics at most 60 s of what is left and the candle queue the rest; the step durations of the last run are in kv measure.track.last and in `fart status`.",
+    "max_sample_gap_s": 600,
+    "run_budget_s": 220
   },
   "week": {
     "_comment": "fart measure week: a rolling window of `days` UTC days ending at --end (default yesterday), written to out/recall/week-<end>.md|json. The Monday 06:30 UTC run covers the whole Monday-Sunday calendar week. Confidence intervals: block bootstrap with days as blocks (a NIET GEDEKT day is not a block and never counts as a day with zero winners), `draws` draws, fixed `seed`, two-sided `alpha`; with fewer than min_days covered days or fewer than min_winners winners the report says 'te weinig data' instead of an interval.",
@@ -154,5 +157,26 @@
       0,
       1
     ]
+  },
+  "follow": {
+    "_comment": "Milestone 13: following signals (fart/plays/follow.py, run by the plays daemon every tick). A coin that meets a follow trigger of fart/research/hypotheses.py (FOLLOW_TRIGGERS: >= 10 unique buyers in 5 min for H1/H4/H5/H7, a theme coin with trades for H3, a curve of 60 SOL for H2), a coin on which an active play rule fired and a coin with an observe decision of the engine is followed for follow_s (24 h): outside the trade stream and before graduation its BondingCurve account is polled through getMultipleAccounts (<= max_addresses_per_call addresses per call, 20 CU per call on the Alchemy page of 31 Oct 2026) every fast_interval_s in the first fast_window_s after the first signal and every slow_interval_s after that; a coin with an open trade-stream subscription gets a watch poll every stream_interval_s only. daily_cu_share is the share of RPC_DAILY_BUDGET_CU the polls may use per UTC day (above it: refused, booked as blocked follow_daily_share); when the last hour exceeds the share's hourly envelope the fast interval degrades along degraded_intervals_s (60 -> 120 -> 300 s) and recovers under half of it. max_followed bounds the coins polled per tick (newest signal first); a curve unchanged for unchanged_slow_after_s goes to the slow interval; a missing or undecodable account closes the row after missing_closes_after polls. require_keyed_rpc: the polls need RPC_HTTP_URL (the public endpoint has no CU accounting). No new .env name; nothing here changes a rule file.",
+    "enabled": true,
+    "require_keyed_rpc": true,
+    "follow_s": 86400,
+    "max_followed": 1500,
+    "fast_interval_s": 60,
+    "fast_window_s": 7200,
+    "slow_interval_s": 300,
+    "stream_interval_s": 300,
+    "degraded_intervals_s": [
+      60,
+      120,
+      300
+    ],
+    "daily_cu_share": 0.1,
+    "max_addresses_per_call": 100,
+    "max_calls_per_tick": 10,
+    "unchanged_slow_after_s": 7200,
+    "missing_closes_after": 3
   }
 }

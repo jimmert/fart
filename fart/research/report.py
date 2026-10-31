@@ -78,7 +78,8 @@ def render_markdown(r: dict[str, Any]) -> str:
         f"# Onderzoeksrapport {h['id']} · {h['title']}",
         "",
         f"Gegenereerd {r.get('generated_at')} · rules_version van de code {r.get('rules_version')} · venster {cfg['days'][0]} t/m {cfg['days'][-1]} ({len(cfg['days'])} dagen)"
-        + (" · **BEPERKT TOT %s MUNTEN (rooktest)**" % _n(cfg["limit_coins"]) if cfg.get("limit_coins") else ""),
+        + (" · **BEPERKT TOT %s MUNTEN (rooktest)**" % _n(cfg["limit_coins"]) if cfg.get("limit_coins") else "")
+        + (f" · **{cfg['window_note']}**" if cfg.get("window_note") else ""),
         "",
         "## Vooraf vastgelegde hypothese",
         "",
@@ -101,8 +102,9 @@ def render_markdown(r: dict[str, Any]) -> str:
         f"uitstap eveneens {cfg['exit_delay_s']:.0f} s na het moment waarop de regel vuurt.",
         f"- Kosten: curvefee {_dec(cfg['curve_fee_bps'] / 100, 2)}% per kant, priority fee {_dec(cfg['costs']['priority_fee_sol'], 4)} SOL per transactie, prijsimpact uit de curve; na graduatie "
         f"PumpSwap-fee {_dec(cfg['costs']['pumpswap_fee_bps'] / 100, 2)}% en impact uit de DexScreener-liquiditeit (85 SOL aangenomen als die ontbreekt, gemarkeerd).",
-        f"- Zonder prijspad tot de uitstap is de uitkomst **onbekend** en telt apart; een signaal zonder trade om op in te stappen binnen 10 minuten is **geen vulling**. "
+        f"- Zonder prijspad tot de uitstap is de uitkomst **onbekend** en telt apart; een signaal zonder punt om op in te stappen binnen 10 minuten is **geen vulling**. "
         "Geen van beide telt ooit als winst of verlies.",
+        _points_line(cfg, st),
         f"- Intervallen: blokbootstrap met de UTC-dagen als blokken, {_n(cfg['bootstrap']['draws'])} trekkingen, vaste seed {cfg['bootstrap']['seed']}, alpha {_dec(cfg['bootstrap']['alpha'], 2)}.",
         f"- Walk-forward: parameters gekozen op de eerste helft van de dagen ({', '.join(cfg['selection_days'])}), getoetst op de tweede helft "
         f"({', '.join(cfg['test_days']) or 'GEEN: te weinig dagen'}). Bewezen = ondergrens van het 95%-interval van de verwachte waarde na kosten > 0 op de toetshelft, "
@@ -140,8 +142,8 @@ def render_markdown(r: dict[str, Any]) -> str:
         if others:
             lines += ["", f"Andere varianten met een positieve ondergrens op de toetshelft (niet vooraf gekozen, dus geen bewijs, wel ter inzage): {', '.join(others)}."]
     lines += ["", "## Alle varianten", "", "Per variant de keuzehelft, de toetshelft en het hele venster. Een lege toetshelft betekent te weinig dagen. Onbekend en geen vulling staan er altijd bij.", ""]
-    lines += ["| variant | instap | uitstap | keuze: EV / n | toets: EV [interval] / n / onbekend / lead | heel venster: EV / trefkans / mediaan / p10 / p90 / max. drawdown / n | oordeel |",
-              "|---|---|---|---|---|---|---|"]
+    lines += ["| variant | instap | uitstap | keuze: EV / n | toets: EV [interval] / n / onbekend / lead | heel venster: EV / trefkans / mediaan / p10 / p90 / max. drawdown / n | vulling instap · uitstap (trade / poll / sample / candle) | oordeel |",
+              "|---|---|---|---|---|---|---|---|"]
     for v in r["variants"]:
         s, t, f = v["selection"], v["test"], v["full"]
         lines.append(
@@ -149,7 +151,20 @@ def render_markdown(r: dict[str, Any]) -> str:
             f"{_sol(t.get('ev_sol'))} {_ci(t.get('ci'))} / {_n(t.get('cases'))} / {_n(t.get('unknown'))} / {_min(t.get('lead_median_s'))} | "
             f"{_sol(f.get('ev_sol'))} / {_pct(f.get('hit_rate'), signed=False)} / {_pct(f.get('median_pct'))} / {_pct(f.get('p10_pct'))} / {_pct(f.get('p90_pct'))} / "
             f"{_sol_abs(f.get('max_drawdown_sol'))} / {_n(f.get('cases'))} (onb. {_n(f.get('unknown'))}, geen vulling {_n(f.get('no_fill'))}) | "
+            f"{_sources(f.get('fill_sources'))} | "
             f"{'**BEWEZEN**' if v['verdict'].get('proven') else ('gekozen, niet bewezen' if v['variant'] == sel else 'afgewezen')} |")
+    split_rows = [v for v in r["variants"] if v.get("follow_split")]
+    if split_rows:
+        since = split_rows[0]["follow_split"].get("since")
+        lines += ["", f"## Signalen vóór en ná de start van het volgen (mijlpaal 13, sinds {utc_iso(since) if since else 'onbekend'})", "",
+                  "Oudere signalen krijgen geen prijspad met terugwerkende kracht: de polls van de curve bestaan pas sinds de uitrol. De twee helften laten zien wat het volgen aan "
+                  "het onbekend-aandeel verandert; alleen de signalen van ná de start zeggen iets over de doelstelling (onder 20% onbekend).", "",
+                  "| variant | vóór: signalen / gevallen / onbekend (aandeel) / EV | ná: signalen / gevallen / onbekend (aandeel) / EV | ná: vulling instap · uitstap |", "|---|---|---|---|"]
+        for v in split_rows:
+            fs = v["follow_split"]
+            b, a = fs.get("before") or {}, fs.get("after") or {}
+            lines.append(f"| `{v['variant']}` | {_n(b.get('signals'))} / {_n(b.get('cases'))} / {_n(b.get('unknown'))} ({_pct(b.get('unknown_share'), signed=False)}) / {_sol(b.get('ev_sol'))} | "
+                         f"{_n(a.get('signals'))} / {_n(a.get('cases'))} / {_n(a.get('unknown'))} ({_pct(a.get('unknown_share'), signed=False)}) / {_sol(a.get('ev_sol'))} | {_sources(a.get('fill_sources'))} |")
     groups = r.get("groups") or []
     if groups:
         lines += ["", "## Per instapgroep (heel venster, alle uitstapregels samen)", "", "| groep | signalen | gevallen | onbekend | geen vulling | EV per trade | trefkans | mediaan | lead mediaan | capaciteit (5% impact) |",
@@ -173,16 +188,27 @@ def render_markdown(r: dict[str, Any]) -> str:
         lines += ["", "| inzet | gevallen | EV per trade | EV % | trefkans | mediane prijsimpact bij instap |", "|---:|---:|---:|---:|---:|---:|"]
         for d in sens.get("size") or []:
             lines.append(f"| {_dec(d['size_sol'], 1)} SOL | {_n(d['cases'])} | {_sol(d['ev_sol'])} | {_pct(d['ev_pct'])} | {_pct(d['hit_rate'], signed=False)} | {_pct(d['entry_impact_median'], signed=False)} |")
+        if sens.get("sources"):
+            lines += ["", "Bron van de punten (mijlpaal 13): dezelfde signalen op het pad met en zonder de polls van de curve. Het verschil is wat de polls veranderen; "
+                      "een dev-verkoop is alleen op een trade-punt zichtbaar, dus `devsell`-uitstappen vuren nooit op een poll.", "",
+                      "| punten | signalen | gevallen | onbekend (aandeel) | geen vulling | EV per trade | EV % | trefkans | mediaan | vulling instap · uitstap |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|"]
+            for d in sens["sources"]:
+                lines.append(f"| {d['label']} | {_n(d.get('signals'))} | {_n(d.get('cases'))} | {_n(d.get('unknown'))} ({_pct(d.get('unknown_share'), signed=False)}) | {_n(d.get('no_fill'))} | "
+                             f"{_sol(d.get('ev_sol'))} | {_pct(d.get('ev_pct'))} | {_pct(d.get('hit_rate'), signed=False)} | {_pct(d.get('median_pct'))} | {_sources(d.get('fill_sources'))} |")
     if r.get("cases_truncated"):
         lines += ["", f"De JSON naast dit rapport bewaart de eerste {_n(len(r.get('cases') or []))} van {_n(r.get('cases_total'))} gevallen; de cijfers hierboven zijn over alle gevallen berekend.", ""]
     lines += ["", "## Onbekend en geen vulling", "",
-              "Een uitkomst is onbekend als het prijspad eindigt voordat een uitstapregel kon vullen (de munt verliet de watchlist, geen samples na graduatie, geen candles). "
-              "Geen vulling: binnen 10 minuten na het signaal plus de vertraging was er geen trade om op in te stappen. Beide staan in elke tabel hierboven en tellen nooit mee als resultaat.", ""]
+              "Een uitkomst is onbekend als het prijspad eindigt voordat een uitstapregel kon vullen (de munt verliet de watchlist zonder gevolgd te worden, geen polls, geen samples na "
+              "graduatie, geen candles). Geen vulling: binnen 10 minuten na het signaal plus de vertraging was er geen punt om op in te stappen. Beide staan in elke tabel hierboven en "
+              "tellen nooit mee als resultaat. Sinds mijlpaal 13 krijgt een gevolgde munt punten uit de goedkoopste toereikende bron (trade, poll van de curve, sample, candle); de "
+              "betekenis van onbekend en geen vulling is niet veranderd, alleen het pad werd langer.", ""]
     exits = r.get("exit_reasons") or {}
     if exits:
         lines += ["Uitstapredenen over alle gevallen van het hele venster: " + ", ".join(f"{k} {v}" for k, v in exits.items()) + ".", ""]
     lines += ["## Eerlijkheid", "",
-              "- Dit rapport is een terugrekening op onze eigen data: de trades die de radar zag (elke nieuwe munt zijn eerste 5 minuten, daarna de gevolgde munten), de prijssamples van de tracker en de candles van B.5. Wat de radar niet zag, is er niet.",
+              "- Dit rapport is een terugrekening op onze eigen data: de trades die de radar zag (elke nieuwe munt zijn eerste 5 minuten, daarna de gevolgde munten), de polls van de curve "
+              "van de gevolgde munten (mijlpaal 13; de bron van elk vulpunt staat per variant in de tabel), de prijssamples van de tracker en de candles van B.5. Wat de radar niet zag, is er niet. "
+              "Een dev-verkoop is alleen op een trade-punt zichtbaar: een poll ziet de reserves, niet wie handelde.",
               "- De regels zijn vóór de run vastgelegd (fart/research/hypotheses.py); de keuze van de variant gebeurt op de keuzehelft, het oordeel op de toetshelft. Een variant die op de toetshelft toevallig goed uitkomt zonder vooraf gekozen te zijn is geen bewijs.",
               "- Elke getoetste variant staat in de tabel, ook de afgewezen. Een 'bewezen' regel is een meting over een korte periode met brede intervallen, geen belofte; de Plays-laag meet haar vanaf de promotie opnieuw, op papier, met dezelfde kosten.",
               "- Dit rapport is geen advies. Het platform plaatst nooit een order.", ""]
@@ -192,6 +218,34 @@ def render_markdown(r: dict[str, Any]) -> str:
 def _entry_label(v: dict[str, Any]) -> str:
     e = v.get("entry") or {}
     return ", ".join(f"{k}={val}" for k, val in e.items()) or "–"
+
+
+SOURCE_ORDER = ("curve", "poll", "sample", "candle")
+SOURCE_NL = {"curve": "trade", "poll": "poll", "sample": "sample", "candle": "candle"}
+
+
+def _sources(fs: dict[str, Any] | None) -> str:
+    """`trade 80% · poll 15% · sample 5%; uitstap trade 60% · poll 40%` from the fill-source counts of a metrics block."""
+    if not fs:
+        return "–"
+
+    def one(counts: dict[str, int] | None) -> str:
+        counts = counts or {}
+        total = sum(int(v) for v in counts.values())
+        if not total:
+            return "–"
+        return " · ".join(f"{SOURCE_NL.get(k, k)} {round(100 * int(counts[k]) / total)}%" for k in SOURCE_ORDER if counts.get(k)) or "–"
+
+    return f"{one(fs.get('entry'))}; uitstap {one(fs.get('exit'))}"
+
+
+def _points_line(cfg: dict[str, Any], st: dict[str, Any]) -> str:
+    n = cfg.get("poll_points_in_window")
+    since = cfg.get("follow_started_at")
+    if since is None:
+        return "- Prijspad: trades, de graduatie, samples en candles; de polls van de curve (mijlpaal 13) bestonden nog niet in dit venster: elk signaal rekent op het pad van de stroom alleen."
+    return (f"- Prijspad: trades, de polls van de curve van de gevolgde munten ({_n(n)} poll-punten in het venster; het volgen begon {utc_iso(since)}), de graduatie, samples en candles. "
+            "Een instap of uitstap mag op een poll-punt vullen (de curve is altijd tegenpartij); een dev-verkoop is alleen op een trade-punt zichtbaar.")
 
 
 
@@ -205,6 +259,59 @@ def finalize(result: dict[str, Any], now: float) -> dict[str, Any]:
     return result
 
 
+def summarize(result: dict[str, Any]) -> dict[str, Any]:
+    """The compact state of one report for `latest.json`, `/plays` and `fart status`: the hypothesis, the chosen variant, the
+    verdict, the test-half figures, the unknown share and the date; never the cases."""
+    sel = result.get("selected")
+    row = next((v for v in result.get("variants") or [] if v["variant"] == sel), None) if sel else None
+    t = (row or {}).get("test") or {}
+    cfg = result.get("config") or {}
+    fs = ((row or {}).get("follow_split") or {}).get("after") or {}
+    return {"name": result.get("name"), "hypothesis": (result.get("hypothesis") or {}).get("id"), "title": (result.get("hypothesis") or {}).get("title"),
+            "generated_at": result.get("generated_at"), "days": cfg.get("days"), "days_requested": cfg.get("days_requested"), "window_note": cfg.get("window_note"),
+            "selected": sel, "selected_label": (row or {}).get("label"), "proven": bool(result.get("selected_proven")),
+            "verdict": ("bewezen" if result.get("selected_proven") else ("niet bewezen" if sel else "geen variant gekozen")),
+            "cases": t.get("cases"), "signals": t.get("signals"), "unknown": t.get("unknown"), "unknown_share": t.get("unknown_share"), "ev_sol": t.get("ev_sol"),
+            "ci_low_sol": (t.get("ci") or {}).get("low"), "ci_high_sol": (t.get("ci") or {}).get("high"), "hit_rate": t.get("hit_rate"), "lead_median_s": t.get("lead_median_s"),
+            "variants_tested": cfg.get("variants_tested"), "unknown_share_after_follow": fs.get("unknown_share"), "signals_after_follow": fs.get("signals"),
+            "follow_started_at": cfg.get("follow_started_at")}
+
+
+LATEST_FILE = "latest.json"
+
+
+def update_latest(settings: Settings, result: dict[str, Any]) -> Path:
+    """`out/research/latest.json`: per hypothesis the summary of its newest report (written atomically next to the reports)."""
+    d = report_dir(settings)
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / LATEST_FILE
+    try:
+        cur = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except (OSError, ValueError):
+        cur = {}
+    if not isinstance(cur, dict):
+        cur = {}
+    hyp = cur.setdefault("hypotheses", {}) if isinstance(cur.get("hypotheses"), dict) else cur.__setitem__("hypotheses", {}) or cur["hypotheses"]
+    summ = summarize(result)
+    hyp[str(summ["hypothesis"])] = summ
+    cur["updated_at"] = result.get("generated_at")
+    atomic_write_json(p, cur)
+    return p
+
+
+def load_latest(settings: Settings) -> dict[str, Any]:
+    """The summaries per hypothesis in the pre-registered order (`hyps.ORDER`); an empty dict without reports."""
+    p = report_dir(settings) / LATEST_FILE
+    try:
+        cur = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    hyp = cur.get("hypotheses") if isinstance(cur, dict) else None
+    if not isinstance(hyp, dict):
+        return {}
+    return {hid: hyp[hid] for hid in hyps.ORDER if hid in hyp}
+
+
 def write_report(settings: Settings, result: dict[str, Any], now: float) -> tuple[Path, Path]:
     result = finalize(result, now)
     d = report_dir(settings)
@@ -213,6 +320,7 @@ def write_report(settings: Settings, result: dict[str, Any], now: float) -> tupl
     md = d / f"{result['name']}.md"
     atomic_write_json(js, result)
     atomic_write_text(md, render_markdown(result))
+    update_latest(settings, result)
     return md, js
 
 
@@ -226,7 +334,7 @@ def list_reports(settings: Settings) -> list[dict[str, Any]]:
             r = json.loads(p.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(r, dict) or r.get("kind") not in ("research", "autopsy"):
+        if not isinstance(r, dict) or r.get("kind") not in ("research", "autopsy") or p.name == LATEST_FILE:
             continue
         out.append({"name": p.stem, "kind": r.get("kind"), "hypothesis": (r.get("hypothesis") or {}).get("id") if r.get("kind") == "research" else None,
                     "generated_at": r.get("generated_at"), "days": (r.get("config") or {}).get("days") or r.get("days"), "selected": r.get("selected"),

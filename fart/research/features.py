@@ -68,6 +68,67 @@ class Trade:
 TRADE_COLUMNS = "mint, slot, block_time, received_at, buyer, is_buy, sol, tokens, virtual_sol, virtual_token"
 
 
+@dataclass
+class PollPoint:
+    """One poll of the BondingCurve account (milestone 13, `path_points` with source 'poll'): the reserves at our clock `t`.
+    `complete` marks a graduated curve (its reserves are then zero: the account carries no price any more)."""
+    t: float
+    virtual_sol: int | None
+    virtual_token: int | None
+    real_sol: int | None = None
+    real_token: int | None = None
+    complete: bool = False
+    slot: int | None = None
+    source: str = "poll"
+
+    @classmethod
+    def from_row(cls, r: Any) -> "PollPoint":
+        return cls(float(r["t"]), None if r["virtual_sol"] is None else int(r["virtual_sol"]), None if r["virtual_token"] is None else int(r["virtual_token"]),
+                   None if r["real_sol"] is None else int(r["real_sol"]), None if r["real_token"] is None else int(r["real_token"]), bool(r["complete"]),
+                   None if r["slot"] is None else int(r["slot"]), str(r["source"] or "poll"))
+
+    @property
+    def has_state(self) -> bool:
+        return bool(self.virtual_sol and self.virtual_token) and not self.complete
+
+
+def load_points(conn: sqlite3.Connection, mint: str) -> list[PollPoint]:
+    """The poll points of a coin in time order; an empty list when the table does not exist yet (a database before v10)."""
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='path_points'").fetchone() is None:
+        return []
+    return [PollPoint.from_row(r) for r in conn.execute("SELECT t, source, virtual_sol, virtual_token, real_sol, real_token, complete, slot FROM path_points WHERE mint=? ORDER BY t", (mint,))]
+
+
+def apply_poll_state(f: dict[str, Any], points: list[PollPoint], as_of: float, params: Any) -> dict[str, Any]:
+    """Milestone 13: the curve state of the replay features (`replay_features`) is the last TRADE's state; when a poll of the
+    BondingCurve account knowable at `as_of` is newer than that trade, the state fields (price, market cap, graduation
+    progress, curve SOL, the reserves) come from the poll instead. `curve_source` says which ('trade' | 'poll' | None). The
+    window features (buyers, SOL, counts, the largest buyer's share) stay what the trades say: a poll sees no trade. H2 may
+    observe its crossing on such a point, in the harness and live alike."""
+    from ..chain.curve import CurveState, graduation_progress
+
+    f["curve_source"] = None if f.get("virtual_sol") is None else "trade"
+    newest: PollPoint | None = None
+    for p in points:
+        if p.t <= as_of and p.has_state and (newest is None or p.t > newest.t):
+            newest = p
+    if newest is None:
+        return f
+    last_trade_t = as_of - float(f["last_trade_age_s"]) if f.get("last_trade_age_s") is not None else None
+    if last_trade_t is not None and newest.t <= last_trade_t:
+        return f
+    st = CurveState(int(newest.virtual_sol), int(newest.virtual_token), newest.real_sol, newest.real_token)
+    f["price_sol"] = st.price_sol(params)
+    f["mcap_sol"] = round(st.mcap_sol(params), 4)
+    f["graduation_progress"] = round(graduation_progress(st, params), 4)
+    f["curve_sol"] = round(st.real_sol_estimate(params) / params.sol_unit, 3)
+    f["virtual_sol"] = int(newest.virtual_sol)
+    f["virtual_token"] = int(newest.virtual_token)
+    f["last_state_age_s"] = round(as_of - newest.t, 1)
+    f["curve_source"] = "poll"
+    return f
+
+
 def load_trades(conn: sqlite3.Connection, mint: str, as_of: float | None = None, until_received: float | None = None) -> list[Trade]:
     """A coin's trades in event-time order; with `as_of` only the rows knowable then (the harness replays a coin once
     with every trade and applies the as-of itself per tick, so it passes None and `until_received`)."""

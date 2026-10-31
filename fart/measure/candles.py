@@ -79,17 +79,22 @@ def store(conn: sqlite3.Connection, pool: str, candles: list[dict[str, Any]], no
     return n
 
 
-def fetch_due(conn: sqlite3.Connection, budget: Budget, cfg: dict[str, Any], now: float, request: Callable[..., Any] = request_json) -> dict[str, Any]:
-    """One bounded run: at most `max_fetches_per_run` due jobs, the gate asked first, the result written per job."""
+def fetch_due(conn: sqlite3.Connection, budget: Budget, cfg: dict[str, Any], now: float, request: Callable[..., Any] = request_json,
+              deadline: float | None = None) -> dict[str, Any]:
+    """One bounded run: at most `max_fetches_per_run` due jobs, the gate asked first, the result written per job. Milestone 13:
+    `deadline` (a `time.perf_counter()` value) ends the run early; the jobs left wait for the next run and are counted."""
     max_n = int(cfg.get("max_fetches_per_run", 20))
     limit = int(cfg.get("limit", 90))
     after_s = float(cfg.get("after_graduation_s", 3600))
     max_attempts = int(cfg.get("max_attempts", 3))
     timeout_s = float(cfg.get("timeout_s", 10))
-    stats = {"due": 0, "fetched": 0, "candles": 0, "errors": 0, "blocked": 0, "gave_up": 0, "empty": 0}
+    stats = {"due": 0, "fetched": 0, "candles": 0, "errors": 0, "blocked": 0, "gave_up": 0, "empty": 0, "time_budget": 0}
     jobs = conn.execute("SELECT mint, pool, graduated_at, attempts FROM candle_jobs WHERE done=0 AND due_at <= ? ORDER BY due_at LIMIT ?", (now, max_n)).fetchall()
     stats["due"] = int(conn.execute("SELECT COUNT(*) FROM candle_jobs WHERE done=0 AND due_at <= ?", (now,)).fetchone()[0])
-    for j in jobs:
+    for k, j in enumerate(jobs):
+        if deadline is not None and time.perf_counter() > deadline:
+            stats["time_budget"] = len(jobs) - k
+            break
         if not budget.peek("geckoterminal", "ohlcv").allowed:
             stats["blocked"] += 1
             db.write_tx(conn, lambda c: db.counter_bump_daily(c, KV_BLOCKED, 1, now), what="candles.blocked")
@@ -133,13 +138,13 @@ def fetch_due(conn: sqlite3.Connection, budget: Budget, cfg: dict[str, Any], now
     return stats
 
 
-def run(conn: sqlite3.Connection, budget: Budget, settings: Any, now: float, request: Callable[..., Any] = request_json) -> dict[str, Any]:
+def run(conn: sqlite3.Connection, budget: Budget, settings: Any, now: float, request: Callable[..., Any] = request_json, deadline: float | None = None) -> dict[str, Any]:
     cfg = (settings.config("measure") or {}).get("candles") or {}
     if not cfg.get("enabled", True):
         return {"enabled": False}
     t0 = time.perf_counter()
     added = db.write_tx(conn, lambda c: enqueue(c, now, float(cfg.get("after_graduation_s", 3600))), what="candles.enqueue")
-    stats = fetch_due(conn, budget, cfg, now, request)
+    stats = fetch_due(conn, budget, cfg, now, request, deadline=deadline)
     db.write_tx(conn, lambda c: db.kv_set(c, KV_LAST_RUN, str(now), now), what="candles.kv")
     out = {"enabled": True, "enqueued": added, **stats, "seconds": round(time.perf_counter() - t0, 2)}
     log.info("candles.done", **out)

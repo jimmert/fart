@@ -37,7 +37,8 @@
   status                 health, budgets, counts (works on an empty database); since milestone 10 also the last duration per
                          public view of the website (logs/web-views.json, written by fart web); since milestone 11 the duration
                          of every step of the engine's last completed tick and the number of slow ticks (kv engine.tick_last,
-                         engine.tick_slow, written by the engine itself)
+                         engine.tick_slow, written by the engine itself); since milestone 13 the tracker's step durations and the
+                         coverage of the last 24 hours' graduations (`tracker run:`) and the follow step (`follow:`)
   coverage --hours N     per-hour creates/grads/gaps
   web                    daemon: the read-only website on FART_WEB_BIND (127.0.0.1:8792) behind the shared Caddy: the public
                          dashboard, observations, reports, method and tools pages plus /api/public/* (FART_WEB_PUBLIC=1, the
@@ -49,14 +50,18 @@
   research run --hypothesis H [--days N] [--end D] [--delay S] [--size SOL] [--limit N]
                          milestone 12: the backtest harness on our own data for one pre-registered hypothesis (H1..H7; `--hypothesis all`
                          runs them in the pre-registered order); writes out/research/<date>-<H>.md|json (Dutch, every variant, the
-                         rejected included); reads the database, writes only under out/research/
+                         rejected included); reads the database, writes only under out/research/. Milestone 13: the paths include the
+                         polls of the followed coins and every report says where its fills came from
   research autopsy [--days N] [--end D]
                          the organic winners' first five minutes next to the non-winners (out/research/<date>-autopsy.md|json)
   research promote H VARIANT [--report NAME]
                          write a PROVEN variant of a report into config/plays.json as a new rule version; refuses anything not proven
   research list          the hypotheses with their grids and the reports written so far
   plays [--once]         daemon: the plays layer (15 s loop): tests the rules of config/plays.json on the live data, paper positions,
-                         outcomes after costs, one Telegram alert per play to the owner (kind play, 6 per hour); idles without a rule
+                         outcomes after costs, one Telegram alert per play to the owner (kind play, 6 per hour); idles without a rule.
+                         Milestone 13: it also follows every signal (fart/plays/follow.py): the pre-registered follow triggers, the
+                         plays and the observe decisions, with polls of the BondingCurve accounts through getMultipleAccounts within
+                         their own share of the daily CU cap (needs the keyed RPC); `fart status` shows the `follow:` line
 """
 from __future__ import annotations
 
@@ -237,11 +242,17 @@ def cmd_status(settings, as_json: bool) -> int:
                 "today": conn.execute("SELECT COUNT(*) FROM migrations WHERE coin_unknown=1 AND received_at >= ?", (day_start(t),)).fetchone()[0]}
             out["schema_v4_cleanup"] = json.loads(kv["schema.v4.cleanup"]) if kv.get("schema.v4.cleanup") else None
             out["schema_v5_cleanup"] = json.loads(kv["schema.v5.cleanup"]) if kv.get("schema.v5.cleanup") else None
-            # milestone 5: the tracker's skipped mints and the engine's rules fingerprint
+            # milestone 5: the tracker's skipped mints and the engine's rules fingerprint; milestone 13: the last run's step durations and the
+            # live coverage of the last 24 hours' graduations (the rule of the day and week reports)
+            from .measure import outcomes as _outcomes
+
+            mcfg_status = settings.config("measure")
             out["tracker"] = {"skipped_total": int(kv.get("measure.track.skipped", "0") or 0),
                               "skipped_today": int(kv.get(f"measure.track.skipped.{day_key(t)}", "0") or 0),
                               "skipped_last": json.loads(kv["measure.track.skipped.last"]) if kv.get("measure.track.skipped.last") else None,
-                              "max_mints_per_run": settings.config("measure")["sampling"].get("max_mints_per_run")}
+                              "max_mints_per_run": mcfg_status["sampling"].get("max_mints_per_run"),
+                              "last_run": _outcomes.last_run(conn),
+                              "coverage_24h": _outcomes.graduation_coverage_24h(conn, t, float((mcfg_status.get("tracker") or {}).get("max_sample_gap_s", 600)))}
             out["rules_fingerprints"] = {k[len("engine.rules_fingerprint."):]: v for k, v in kv.items() if k.startswith("engine.rules_fingerprint.")}
             out["week_report_last_end_day"] = kv.get("measure.week.last_end_day")
             out["global_check"] = {"status": kv.get("chain.global.status"), "checked_at": utc_iso(float(kv["chain.global.checked_at"])) if kv.get("chain.global.checked_at") else None,
@@ -284,6 +295,10 @@ def cmd_status(settings, as_json: bool) -> int:
             out["candles"] = _candles.status(conn, t)
             out["creator_stats"] = _creators.status(conn, t)
             out["plays"] = _plays.status(conn, settings, t)
+            # milestone 13: the follow step (followed coins, polls, CU share, degradation, the source of the last point)
+            from .plays import follow as _follow
+
+            out["follow"] = _follow.status(conn, settings, t)
         finally:
             conn.close()
     from .research.report import list_reports
@@ -379,6 +394,7 @@ def cmd_status(settings, as_json: bool) -> int:
     tr = out.get("tracker") or {}
     print(f"  tracker: skipped mints total={tr.get('skipped_total', 0)} today={tr.get('skipped_today', 0)} (measure.track.skipped; max_mints_per_run {tr.get('max_mints_per_run')})"
           + (f"  last={json.dumps(tr['skipped_last'])}" if tr.get("skipped_last") else ""))
+    print("  " + tracker_run_line(tr, now()))
     if out.get("rules_fingerprints"):
         print("  rules fingerprints (engine): " + ", ".join(f"{k}={str(v)[:19]}" for k, v in sorted(out["rules_fingerprints"].items())))
     if out.get("week_report_last_end_day"):
@@ -474,6 +490,10 @@ def m12_lines(out: dict[str, Any]) -> list[str]:
                      + f"; {hb}; open {p['open']}, closed {p['closed']} (pnl {float(p.get('pnl_sol_closed') or 0):+.4f} SOL), unknown {p['unknown']}, no fill {p['no_fill']}; alerts today {p['alerts_today']}")
     reps = out.get("research_reports") or []
     lines.append("research: " + (", ".join(f"{r['name']} (gekozen {r.get('selected')}, bewezen {'ja' if r.get('selected_proven') else 'nee'})" for r in reps) if reps else "no reports yet (fart research run --hypothesis H5 --days 3)"))
+    if out.get("follow") is not None:
+        from .plays.follow import status_line as _follow_line
+
+        lines.append(_follow_line(out["follow"]))
     return lines
 
 
@@ -524,6 +544,32 @@ def engine_tick_line(et: dict[str, Any]) -> str:
     state = "" if last.get("ok", True) else " FAILED"
     return (f"engine tick: last {_secs(last.get('tick_s'))}{state}{' SLOW' if last.get('slow') else ''} ({steps}; {counts}; as_of "
             + ("?" if age is None else f"{age} s ago") + f"); {slow}")
+
+
+def tracker_run_line(tr: dict[str, Any], t: float) -> str:
+    """Milestone 13: `tracker run: last 71 s ago, 68 s (sample 42 s: 1,090 mints/37 req/1,021 stored; outcomes 3 s: 12; creator_stats
+    11 s; candles 9 s; budget 220 s); graduations of the last 24 h with a sample every 10 min: 93% (812 of 873)`."""
+    last = tr.get("last_run")
+    cov = tr.get("coverage_24h") or {}
+    cov_txt = ("graduations of the last 24 h with a sample every %d min: " % round(float(cov.get("max_gap_s", 600)) / 60)
+               + ("no graduations yet" if not cov.get("graduations") else f"{round(100 * float(cov['share']))}% ({cov['covered']:,} of {cov['graduations']:,})"))
+    if not isinstance(last, dict):
+        return "tracker run: no step durations recorded yet (kv measure.track.last, written by fart measure track since milestone 13); " + cov_txt
+    sec = last.get("seconds") or {}
+    smp = last.get("sampled") or {}
+    cs = last.get("creator_stats") or {}
+    cd = last.get("candles") or {}
+    try:
+        age = f"{round(max(0.0, t - float(last.get('at'))))} s ago"
+    except (TypeError, ValueError):
+        age = "?"
+    parts = [f"sample {_secs(sec.get('sample'))}: {int(smp.get('requested') or 0):,} mints/{int(smp.get('calls') or 0)} req/{int(smp.get('stored') or 0):,} stored"
+             + (f", time budget cut {int(smp.get('time_budget') or 0):,}" if smp.get("time_budget") else "") + (f", gate blocked {smp.get('blocked')}" if smp.get("blocked") else ""),
+             f"outcomes {_secs(sec.get('outcomes'))}: {last.get('outcomes')}",
+             f"creator_stats {_secs(sec.get('creator_stats'))}" + (f": {cs.get('creators_updated')} updated" if cs.get("creators_updated") is not None else "") + (" (error)" if cs.get("error") else ""),
+             f"candles {_secs(sec.get('candles'))}" + (f": {cd.get('fetched')} fetched" if cd.get("fetched") is not None else "") + (f", {cd.get('time_budget')} deferred" if cd.get("time_budget") else "") + (" (error)" if cd.get("error") else ""),
+             f"budget {_secs(last.get('run_budget_s'))}"]
+    return (f"tracker run: last {age}, {_secs(sec.get('total'))}{' OVER BUDGET' if last.get('over_budget') else ''} (" + "; ".join(parts) + f"); subjects {int(last.get('subjects') or 0):,}; " + cov_txt)
 
 
 WEB_VIEWS_FILE = "web-views.json"

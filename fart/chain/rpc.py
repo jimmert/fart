@@ -69,6 +69,26 @@ class RpcClient:
             return res.get("value")
         return None
 
+    def get_multiple_accounts_base64(self, addresses: list[str]) -> tuple[int | None, list[Any]]:
+        """`getMultipleAccounts` (at most 100 addresses per call, the RPC's bound) -> (the answer's slot, one value per
+        address in order: the account dict or None when the account does not exist). Milestone 13: the follow step polls
+        the BondingCurve accounts of the followed coins with it; one call is one ledger row (`getMultipleAccounts`)."""
+        addrs = [str(a) for a in addresses]
+        if not addrs:
+            return None, []
+        if len(addrs) > 100:
+            raise ValueError("getMultipleAccounts takes at most 100 addresses per call")
+        res = self.call("getMultipleAccounts", [addrs, {"encoding": "base64", "commitment": "confirmed"}])
+        if not isinstance(res, dict):
+            return None, [None] * len(addrs)
+        ctx = res.get("context") if isinstance(res.get("context"), dict) else {}
+        slot = ctx.get("slot")
+        vals = res.get("value")
+        if not isinstance(vals, list):
+            return (int(slot) if isinstance(slot, int) else None), [None] * len(addrs)
+        vals = list(vals)[: len(addrs)] + [None] * max(0, len(addrs) - len(vals))
+        return (int(slot) if isinstance(slot, int) else None), vals
+
     def get_slot(self) -> int | None:
         res = self.call("getSlot", [{"commitment": "confirmed"}])
         return int(res) if isinstance(res, int) else None

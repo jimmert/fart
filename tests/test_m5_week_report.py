@@ -404,13 +404,13 @@ def test_tracker_counts_skipped_mints_and_status_shows_them(settings, conn, monk
     tr = oc.Tracker(conn, settings, budget, clock=Clock(T0))
     stats = tr.run()
     # 7 subjects, 4 fit the run (3 over the cap); of the 4, the first batch of 2 got no pair and the second batch was blocked
-    assert stats["skipped"] == {"over_cap": 3, "dexscreener": 2} and stats["sampled"]["blocked"] == 1 and stats["sampled"]["skipped"] == 2
+    assert stats["skipped"] == {"over_cap": 3, "dexscreener": 2, "time_budget": 0} and stats["sampled"]["blocked"] == 1 and stats["sampled"]["skipped"] == 2   # milestone 13 adds the time-budget reason
     assert db.kv_get(conn, "measure.track.skipped") == "5" and db.kv_get(conn, f"measure.track.skipped.{db.day_of(T0)}") == "5"
-    assert json.loads(db.kv_get(conn, "measure.track.skipped.last")) == {"at": T0, "over_cap": 3, "dexscreener": 2}
+    assert json.loads(db.kv_get(conn, "measure.track.skipped.last")) == {"at": T0, "over_cap": 3, "dexscreener": 2, "time_budget": 0}
     conn.close()
     assert main(["--root", str(settings.root), "--quiet", "status"]) == 0
     out = capsys.readouterr().out
-    assert "tracker: skipped mints total=5 today=0 (measure.track.skipped; max_mints_per_run 600)" in out  # today = the real clock's day
+    assert "tracker: skipped mints total=5 today=0 (measure.track.skipped; max_mints_per_run 2000)" in out  # today = the real clock's day; the cap is 2,000 since milestone 13
     assert main(["--root", str(settings.root), "--quiet", "--json", "status"]) == 0
     data = json.loads(capsys.readouterr().out)
     assert data["tracker"]["skipped_total"] == 5 and data["tracker"]["skipped_last"]["over_cap"] == 3

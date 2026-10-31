@@ -36,7 +36,7 @@ from .util import day_key
 
 log = get_logger("db")
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 BUSY_TIMEOUT_MS = 15000
 WRITE_RETRY_ATTEMPTS = 3
@@ -848,6 +848,68 @@ def _migrate_v9(conn: sqlite3.Connection) -> None:
 
 
 MIGRATIONS[9] = _migrate_v9
+
+
+# ----- schema version 10 (milestone 13) ------------------------------------------------------------
+# Two new tables next to the engine, no change to any existing table, no cleanup; every statement is idempotent. Neither is
+# read by the engine or by the frozen rule files: the plays daemon writes them (`fart/plays/follow.py`), the research harness,
+# the plays layer, the terminal feed and `fart status` read them.
+# * `followed`: one row per coin the plays daemon follows for 24 hours after its first signal (a pre-registered follow trigger
+#   of fart/research/hypotheses.py::FOLLOW_TRIGGERS, an active play rule, or an observe decision of the engine): when it
+#   started (`since`, the signal time), why (`reason`, the triggers in the order they fired), until when (`until`), its state
+#   (active | graduated | done | closed), the bonding-curve address, the poll schedule (`next_poll_at`, `interval_s`), the
+#   last poll and the last point's source, the counters (polls, errors, misses) and when the reserves last changed.
+# * `path_points`: the price points the follow step adds between the trades: one row per poll of the BondingCurve account
+#   (`source` 'poll') with the virtual and real reserves, the `complete` flag and the slot of the answer. Together with the
+#   trades, the tracker samples and the candles they form the price path of `fart/research/harness.py::price_path`. A missing
+#   poll stays missing: nothing here is interpolated.
+SCHEMA_V10_SQL = [
+    """CREATE TABLE IF NOT EXISTS followed(
+        mint          TEXT PRIMARY KEY,
+        since         REAL NOT NULL,
+        reason        TEXT,
+        until         REAL NOT NULL,
+        state         TEXT NOT NULL,
+        curve         TEXT,
+        next_poll_at  REAL,
+        interval_s    REAL,
+        last_poll_at  REAL,
+        last_point_t  REAL,
+        last_source   TEXT,
+        polls         INTEGER NOT NULL DEFAULT 0,
+        errors        INTEGER NOT NULL DEFAULT 0,
+        misses        INTEGER NOT NULL DEFAULT 0,
+        changed_at    REAL,
+        graduated_at  REAL,
+        closed_reason TEXT,
+        created_at    REAL NOT NULL,
+        updated_at    REAL NOT NULL,
+        json          TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS followed_state ON followed(state, next_poll_at)",
+    "CREATE INDEX IF NOT EXISTS followed_since ON followed(since)",
+    """CREATE TABLE IF NOT EXISTS path_points(
+        mint          TEXT NOT NULL,
+        t             REAL NOT NULL,
+        source        TEXT NOT NULL,
+        virtual_sol   INTEGER,
+        virtual_token INTEGER,
+        real_sol      INTEGER,
+        real_token    INTEGER,
+        complete      INTEGER,
+        slot          INTEGER,
+        PRIMARY KEY(mint, t, source)
+    ) WITHOUT ROWID""",
+    "CREATE INDEX IF NOT EXISTS path_points_t ON path_points(t)",
+]
+
+
+def _migrate_v10(conn: sqlite3.Connection) -> None:
+    for stmt in SCHEMA_V10_SQL:
+        conn.execute(stmt)
+
+
+MIGRATIONS[10] = _migrate_v10
 
 
 def _apply_pragmas(conn: sqlite3.Connection, readonly: bool) -> None:

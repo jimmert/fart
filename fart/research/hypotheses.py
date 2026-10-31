@@ -345,6 +345,51 @@ H6 = Hypothesis(
 )
 
 
+# ----- Milestone 13: the follow triggers -----------------------------------------------------------------------------------
+# A coin is FOLLOWED (fart/plays/follow.py: 24 hours of price points from the cheapest sufficient source, so every signal of
+# every pre-registered hypothesis gets a measurable outcome) from the first tick at which it meets the widest entry condition
+# of a hypothesis family. The triggers are fixed here, next to the hypotheses, and evaluated by the plays daemon on the same
+# `Ctx` the predicates see; they decide what is measured, never what is traded.
+FOLLOW_MIN_BUYERS = H5_MIN_BUYERS      # the engine's early-buyers threshold: the widest first-minutes entry (H5 / H7 base rule; H1 needs more; H4 is judged on these coins)
+FOLLOW_CURVE_SOL = 60.0                # H2 fires at the 75 SOL crossing; following from 60 SOL gives the crossing itself a path
+
+
+@dataclass(frozen=True)
+class FollowTrigger:
+    id: str
+    label_nl: str
+    hypotheses: tuple[str, ...]
+    fires: Callable[[Ctx], bool]
+    horizon_s: float                   # how long after the create the trigger is evaluated
+    needs_theme: bool = False
+
+
+def _follow_early_buyers(ctx: Ctx) -> bool:
+    return not ctx.graduated and ctx.age_s <= 300.0 + 60.0 and int(ctx.f.get("unique_buyers_5m") or 0) >= FOLLOW_MIN_BUYERS
+
+
+def _follow_theme(ctx: Ctx) -> bool:
+    return not ctx.graduated and ctx.theme is not None and int(ctx.f.get("trades_total") or 0) >= 1
+
+
+def _follow_curve(ctx: Ctx) -> bool:
+    cur = ctx.f.get("curve_sol")
+    return not ctx.graduated and cur is not None and float(cur) >= FOLLOW_CURVE_SOL
+
+
+FOLLOW_TRIGGERS: tuple[FollowTrigger, ...] = (
+    FollowTrigger("early_buyers", f"minstens {FOLLOW_MIN_BUYERS} unieke kopers in 5 minuten, in de eerste 5 minuten (H1, H4, H5, H7)", ("H1", "H4", "H5", "H7"), _follow_early_buyers, 360.0),
+    FollowTrigger("theme", "een thema-munt met trades (H3)", ("H3",), _follow_theme, 7200.0, needs_theme=True),
+    FollowTrigger("curve60", f"een curve van minstens {FOLLOW_CURVE_SOL:.0f} SOL, nog niet gegradueerd (H2)", ("H2",), _follow_curve, 86400.0),
+)
+FOLLOW_REASONS_NL = {t.id: t.label_nl for t in FOLLOW_TRIGGERS}
+FOLLOW_REASONS_NL.update({"play": "een actieve play-regel vuurde", "observe": "een observe-beslissing van de engine"})
+
+
+def follow_trigger(tid: str) -> FollowTrigger | None:
+    return next((t for t in FOLLOW_TRIGGERS if t.id == tid), None)
+
+
 HYPOTHESES: dict[str, Hypothesis] = {h.id: h for h in (H4, H5, H1, H3, H7, H2, H6)}
 ORDER = ["H4", "H5", "H1", "H3", "H7", "H2", "H6"]
 

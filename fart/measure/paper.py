@@ -109,9 +109,9 @@ def points_from_rows(rows) -> list[TradePoint]:
 # price path of a coin in one go, the plays daemon feeds it the new trades of every tick and keeps its state in the
 # `plays` row between ticks. Both get the same fills, the same costs and the same exits by construction.
 #
-# Price path: a list of `PricePoint`s in time order. On the curve a point carries the virtual reserves after a trade and
-# the fill is `buy_quote` / `sell_quote` (the curve fee of config/pumpfun.json, 1%, and the curve's own impact are inside
-# the quotes). After graduation a point carries a price in SOL per token (a DexScreener sample or a GeckoTerminal candle)
+# Price path: a list of `PricePoint`s in time order. On the curve a point carries the virtual reserves after a trade (kind
+# curve) or as the BondingCurve account showed them between the trades (kind poll, milestone 13) and the fill is `buy_quote`
+# / `sell_quote` (the curve fee of config/pumpfun.json, 1%, and the curve's own impact are inside the quotes). After graduation a point carries a price in SOL per token (a DexScreener sample or a GeckoTerminal candle)
 # and the SOL side of the pool's liquidity when the sample had it; the fill then pays `pumpswap_fee_bps` and the
 # constant-product impact V / (1 + V / Y) with Y the SOL side of the pool (an assumed 85 SOL, flagged, when the sample had
 # no liquidity). Every transaction pays `priority_fee_sol`. The human delay: a signal at t fills at the first point at or
@@ -130,10 +130,15 @@ TOKEN_UNIT = 1_000_000
 ASSUMED_POOL_SOL = 85.0        # the SOL side of a fresh PumpSwap pool; used (and flagged) when a sample carries no liquidity
 
 
+CURVE_KINDS = ("curve", "poll")   # the kinds that carry virtual reserves: a fill on them is a quote against the curve
+
+
 @dataclass
 class PricePoint:
-    """One point of a coin's price path. `kind`: curve (virtual reserves after a trade), sample (a DexScreener market cap
-    sample), candle (a GeckoTerminal 1-minute close). `price_sol` is SOL per whole token (derived for curve points).
+    """One point of a coin's price path. `kind`: curve (virtual reserves after a trade), poll (milestone 13: the virtual
+    reserves read from the BondingCurve account between the trades; the curve is always the counterparty, so an entry or an
+    exit may fill on it, but a poll sees no trade: `dev_sell` is never set on one), sample (a DexScreener market cap sample),
+    candle (a GeckoTerminal 1-minute close). `price_sol` is SOL per whole token (derived for curve and poll points).
     `liquidity_sol` is the SOL side of the pool for the post-graduation impact; `dev_sell` marks a sell by the creator;
     `graduation` marks the graduation (the last curve point before the migration)."""
     t: float
@@ -146,7 +151,7 @@ class PricePoint:
     graduation: bool = False
 
     def state(self) -> CurveState | None:
-        if self.kind == "curve" and self.virtual_sol and self.virtual_token:
+        if self.kind in CURVE_KINDS and self.virtual_sol and self.virtual_token:
             return CurveState(int(self.virtual_sol), int(self.virtual_token))
         return None
 
@@ -229,6 +234,7 @@ class Fill:
     impact: float | None      # price impact fraction of this fill
     venue: str                # curve | pool
     impact_src: str | None = None   # for pool fills: liquidity | assumed_85_sol
+    point_kind: str | None = None   # milestone 13: the kind of the point the fill happened on (curve | poll | sample | candle)
 
 
 def pool_sell(tokens: int, price_sol: float, liquidity_sol: float | None, fee_bps: int) -> tuple[float, float, float, str]:
@@ -325,7 +331,7 @@ class Position:
         p = cls(float(d["signal_t"]), float(d["size_sol"]), params, ExitRules.from_dict(d.get("rules")), Costs(**(d.get("costs") or {})),
                 float(d.get("entry_delay_s", 20.0)), d.get("exit_delay_s"), float(d.get("max_entry_wait_s", 600.0)))
         p.status = str(d.get("status", "signal"))
-        p.fills = [Fill(**f) for f in d.get("fills") or []]
+        p.fills = [Fill(**{k: v for k, v in f.items() if k in Fill.__dataclass_fields__}) for f in d.get("fills") or []]  # type: ignore[attr-defined]
         p.entry = next((f for f in p.fills if f.kind == "buy"), None)
         p.held = int(d.get("held") or 0)
         p.peak = d.get("peak")
@@ -434,7 +440,7 @@ class Position:
             self.status = "no_fill"
             self.exit_reason = "no_tokens"
             return
-        f = Fill(pt.t, "buy", "entry", int(tokens), self.size_sol, spot, fill_price, fee, impact, venue, src)
+        f = Fill(pt.t, "buy", "entry", int(tokens), self.size_sol, spot, fill_price, fee, impact, venue, src, pt.kind)
         self.fills.append(f)
         self.entry = f
         self.held = int(tokens)
@@ -455,7 +461,7 @@ class Position:
         if tokens <= 0:
             return
         net, fee, impact, venue, src = self._sell_value(pt, tokens, spot)
-        self.fills.append(Fill(pt.t, "sell", reason, int(tokens), net, spot, (net / (tokens / TOKEN_UNIT)) if tokens else 0.0, fee, impact, venue, src))
+        self.fills.append(Fill(pt.t, "sell", reason, int(tokens), net, spot, (net / (tokens / TOKEN_UNIT)) if tokens else 0.0, fee, impact, venue, src, pt.kind))
         self.held -= int(tokens)
         self.sold_sol += net
         self.fees_sol += fee + self.costs.priority_fee_sol

@@ -1,0 +1,69 @@
+{
+ "captured_at": "2026-10-31T10:44:37Z",
+ "rpc": "https://api.mainnet-beta.solana.com",
+ "program": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+ "idl": "github.com/pump-fun/pump-public-docs idl/pump.json, read 31 Oct 2026",
+ "note": "Real accounts fetched from the public Solana RPC in the sandbox on 31 Oct 2026 (getAccountInfo, base64). The live cases carry the last TradeEvent of the same mint (decoded from the transaction's self-CPI payload, fart/chain/tx.py); a completed case shows a graduated curve: complete=true and every reserve zeroed.",
+ "cases": [
+  {
+   "kind": "completed",
+   "mint": "CSGpbt6CiLxmDGKUSHEQZgTen12hQpVddfoE5SbQpump",
+   "bonding_curve": "9YHD9kcgvB63vwWQ9AokZ4n5gwtAkoUadxXKmujeQjzz",
+   "account": {
+    "data_b64": "F7f4N2DYrGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAxqR+jQMAAcEDxCFed/NxUqqwomHU21c3dTwMVoPLWiNT/73/vAbvAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACvPOMCAAAAAGV1kgQAAAAAAACsI/wGAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+    "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    "lamports": 126647332,
+    "slot": 463656713,
+    "space": 166
+   },
+   "migration": {
+    "signature": "2E5T35sNHE3JNkMby4JP5RVNSQwSPqByZZi1RL1USd8zYEsbhEJ6sFXuqBRqAePDwzsRspF1atxBzykTq7kByPms",
+    "slot": 463656559,
+    "block_time": 1793442862,
+    "event": "CompletePumpAmmMigrationEvent",
+    "fields": {
+     "mint": "CSGpbt6CiLxmDGKUSHEQZgTen12hQpVddfoE5SbQpump",
+     "mint_amount": 206900000000000,
+     "sol_amount": 84990359656,
+     "bonding_curve": "9YHD9kcgvB63vwWQ9AokZ4n5gwtAkoUadxXKmujeQjzz",
+     "timestamp": 1793442862,
+     "pool": "2sDHq38gTmHULK7tMzBCJjEy1vfw8QizaN6cmp8JHEjq"
+    }
+   }
+  },
+  {
+   "kind": "live",
+   "mint": "F2FFXvqfDyrH35dKN3q7nHZMd7kZgS4HnFofw7YMpump",
+   "bonding_curve": "6hDCMEY9rJkN19L3eQftFDKa41ZrFJy8AyWJYcjL79z3",
+   "account": {
+    "data_b64": "F7f4N2DYrGCnua5LX3cDAECyga4HAAAApyGc/814AgBABl6yAAAAAACAxqR+jQMAADjN+lDtDQg766/JE/G8CTyGly+SOMvg7Xvv2pAN8Jd9AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACgJgcEAAAAAMunYAYAAAAAAACsI/wGAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+    "owner": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+    "lamports": 3168575163,
+    "slot": 463659389,
+    "space": 166
+   },
+   "trade": {
+    "signature": "7Urm5G2dvaRbf5hCCtn23pje9p5RgwsFrZ6oAMshK8uwT87Hit6AifiKm8fajsegjMH5cTcUJP882hkNtrAw6RC",
+    "slot": 463659317,
+    "block_time": 1793443449,
+    "fields": {
+     "mint": "F2FFXvqfDyrH35dKN3q7nHZMd7kZgS4HnFofw7YMpump",
+     "sol_amount": 22250254,
+     "token_amount": 657555717939,
+     "is_buy": false,
+     "user": "Ggvou8xG5t6KMsVBQm4WPfKhSci7wDuzuF6bfyurKZdo",
+     "timestamp": 1793443449,
+     "virtual_sol_reserves": 32992506432,
+     "virtual_token_reserves": 975676105472423,
+     "real_sol_reserves": 2992506432,
+     "real_token_reserves": 695776105472423,
+     "fee_basis_points": 95,
+     "creator": "4pjzwF1soykwuXSK1K56SP6CzjAiqqVYs6c9B7V6TQkc",
+     "creator_fee_basis_points": 30
+    },
+    "layout": "TradeEvent/partial/35of35"
+   },
+   "note": "the curve's latest signature at the time of the account read was this trade; the account's slot is at or after the trade's slot"
+  }
+ ]
+}
